@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/silica-agent}"
+cd "$ROOT"
+changed_rust=$(git diff --name-only --diff-filter=ACM HEAD -- '*.rs')
+if [ -n "$changed_rust" ]; then
+  # The upstream baseline predates this rustfmt release and is not globally clean under it.
+  # Keep the autonomous change narrow: only files it touched must satisfy pinned rustfmt.
+  # shellcheck disable=SC2086
+  rustfmt --edition 2024 --check $changed_rust
+fi
+cargo test -p photocraft-aisetup --lib --tests
+cargo test -p photocraft-aigen --lib --tests
+# Rust 1.95 introduced two lints that the recorded upstream baseline does not pass.
+# Keep them visible as explicit debt while denying every other warning.
+cargo clippy -p photocraft-aisetup -p photocraft-aigen --all-targets -- \
+  -D warnings -A clippy::collapsible_match -A clippy::nonminimal_bool
+cargo xtask layers
