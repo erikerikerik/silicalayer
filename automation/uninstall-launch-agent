@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+LABEL=net.silicalayer.local-agent
+DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+if [ -f "$DEST" ]; then
+  mv "$DEST" "$HOME/.Trash/$LABEL.plist.$(date +%Y%m%d%H%M%S)"
+fi
+printf 'Uninstalled %s\n' "$LABEL"

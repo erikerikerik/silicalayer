@@ -7,6 +7,7 @@ target/
 /log
 /secrets
 /temp
+/.silica-agent/
 /book/output
 /craft-fonts
 *.log
