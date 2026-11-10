@@ -437,7 +437,7 @@ fn fetch_step(env: &Env, job: &Job, layout: &Layout, shared: &Shared, index: usi
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
-    let marker = Marker { version: job.manifest.comfy.version.clone(), variant: job.choices.variant.clone(), sha256: asset.sha256.clone() };
+    let marker = Marker::managed(runtime::RuntimePlatform::WindowsPortable, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
     let python = job.manifest.comfy.python.split('/').fold(PathBuf::new(), |p, part| p.join(part));
     let finish = |staging: &Path| {
         // An archive that unpacks without the Python it is started with is not an engine.

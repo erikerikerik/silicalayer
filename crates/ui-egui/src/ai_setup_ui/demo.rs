@@ -486,7 +486,7 @@ pub fn pretend_installed(app: &PhotocraftApp, dir: &Path) -> Option<std::path::P
     let root = dir.join("engine").join(&version);
     std::fs::create_dir_all(root.join("python_embeded")).ok()?;
     std::fs::write(root.join("python_embeded").join("python.exe"), vec![0u8; 4000]).ok()?;
-    runtime::write_marker(&root, &runtime::Marker { version: version.clone(), variant: "nvidia".into(), sha256: "ab".into() }).ok()?;
+    runtime::write_marker(&root, &runtime::Marker::managed(runtime::RuntimePlatform::WindowsPortable, &version, "nvidia", &"a".repeat(64))).ok()?;
     for key in manifest.files.keys() {
         let (folder, name) = split_key(key)?;
         std::fs::create_dir_all(dir.join("models").join(folder)).ok()?;

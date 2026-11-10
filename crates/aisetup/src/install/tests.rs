@@ -293,7 +293,7 @@ fn a_clean_machine_ends_with_an_engine_its_models_and_a_test_image() {
     assert!(layout.script.is_file() && layout.model_paths.is_file());
     assert_eq!(
         runtime::read_marker(&layout.engine_root).unwrap(),
-        Marker { version: "0.43.0".into(), variant: "nvidia".into(), sha256: rig.manifest.comfy.assets["nvidia"].sha256.clone() }
+        Marker::managed(runtime::RuntimePlatform::WindowsPortable, "0.43.0", "nvidia", &rig.manifest.comfy.assets["nvidia"].sha256,)
     );
     assert!(!layout.archive.exists() && !part_of(&layout.archive).exists());
     // The models: each file whole, under its final name.

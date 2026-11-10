@@ -433,7 +433,7 @@ mod native {
         let root = rig.dir.path().join("engine").join("0.39.0");
         std::fs::create_dir_all(root.join("python_embeded")).unwrap();
         std::fs::write(root.join("python_embeded").join("python.exe"), vec![0u8; 5000]).unwrap();
-        runtime::write_marker(&root, &runtime::Marker { version: "0.39.0".into(), variant: "nvidia".into(), sha256: "ab".into() }).unwrap();
+        runtime::write_marker(&root, &runtime::Marker::managed(runtime::RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))).unwrap();
         let record = SetupState {
             phase: Phase::Done,
             choices: Choices {
@@ -565,7 +565,6 @@ mod native {
         let e = rig.run("ai.setup.openModelFolder", json!({"folder": mine.to_string_lossy()})).unwrap_err().to_string();
         assert!(e.contains("plugged in"), "{e}");
         std::fs::rename(&elsewhere, &mine).unwrap();
-
     }
 
     #[test]

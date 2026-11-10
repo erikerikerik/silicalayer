@@ -16,15 +16,54 @@ use crate::{Error, Result};
 /// (ComfyUI Desktop's), so nothing collides with a ComfyUI the user installs themselves.
 pub const FIRST_PORT: u16 = 8190;
 
+/// The current marker format version.
+const MARKER_FORMAT_VERSION: u32 = 1;
+
 /// What the marker file in an engine folder records.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Marker {
+    /// The marker schema, distinct from the ComfyUI version.
+    pub format_version: u32,
+    /// The runtime family this directory contains.
+    pub platform: RuntimePlatform,
     /// The ComfyUI version.
     pub version: String,
     /// The build (`nvidia`, …) and the sha256 of the archive it was unpacked from.
     pub variant: String,
     pub sha256: String,
+}
+
+impl Marker {
+    pub fn managed(platform: RuntimePlatform, version: &str, variant: &str, sha256: &str) -> Marker {
+        Marker { format_version: MARKER_FORMAT_VERSION, platform, version: version.to_string(), variant: variant.to_string(), sha256: sha256.to_string() }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyMarker {
+    version: String,
+    variant: String,
+    sha256: String,
+}
+
+fn is_valid_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_known_variant(platform: RuntimePlatform, variant: &str) -> bool {
+    match platform {
+        RuntimePlatform::WindowsPortable => matches!(variant, "nvidia" | "nvidia_cu126" | "amd" | "intel"),
+        RuntimePlatform::MacosArm64 => variant == "macos_arm64",
+    }
+}
+
+fn valid_marker(marker: &Marker) -> bool {
+    marker.format_version == MARKER_FORMAT_VERSION
+        && !marker.version.trim().is_empty()
+        && is_known_variant(marker.platform, &marker.variant)
+        && is_valid_sha256(&marker.sha256)
 }
 
 fn disk(path: &Path, what: &str, e: &std::io::Error) -> Error {
@@ -33,7 +72,10 @@ fn disk(path: &Path, what: &str, e: &std::io::Error) -> Error {
 
 /// Write the marker into `dir` (the staging folder, before it becomes the engine).
 pub fn write_marker(dir: &Path, marker: &Marker) -> Result<()> {
-    let text = serde_json::to_string_pretty(marker).map_err(|e| Error::Disk(e.to_string()))?;
+    if !valid_marker(marker) {
+        return Err(Error::Config("refusing to write an invalid managed-runtime marker".into()));
+    }
+    let text = serde_json::to_string_pretty(&marker).map_err(|e| Error::Disk(e.to_string()))?;
     let path = dir.join(MARKER);
     std::fs::write(&path, text).map_err(|e| disk(&path, "write", &e))
 }
@@ -44,7 +86,24 @@ pub fn read_marker(root: &Path) -> Option<Marker> {
     if std::fs::metadata(&path).ok()?.len() > 64 * 1024 {
         return None;
     }
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    if value.get("formatVersion").is_some() {
+        let marker: Marker = serde_json::from_value(value).ok()?;
+        return valid_marker(&marker).then_some(marker);
+    }
+    let legacy: LegacyMarker = serde_json::from_value(value).ok()?;
+    let marker = Marker {
+        format_version: MARKER_FORMAT_VERSION,
+        platform: RuntimePlatform::WindowsPortable,
+        version: legacy.version,
+        variant: legacy.variant,
+        sha256: legacy.sha256,
+    };
+    valid_marker(&marker).then_some(marker)
 }
 
 /// A YAML double-quoted scalar: any path survives it, whatever characters it has.
@@ -164,9 +223,11 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
 }
 
 /// Launch platforms as known to this setup: Windows portable build and macOS ARM64 managed runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RuntimePlatform {
     /// Windows portable build (the current implementation).
+    #[default]
     WindowsPortable,
     /// macOS ARM64 managed runtime (defined for future platform support; CPU mode is explicit).
     MacosArm64,
@@ -480,6 +541,80 @@ mod tests {
         assert_eq!(size_of(&vae), 4);
         assert_eq!((size_of(&vae.join("a.safetensors")), size_of(&dir.path().join("missing"))), (1, 0));
     }
+    #[test]
+    fn current_marker_round_trips_with_version_and_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&engine).unwrap();
+        let marker = Marker::managed(RuntimePlatform::MacosArm64, "0.43.0", "macos_arm64", &"a".repeat(64));
+        write_marker(&engine, &marker).unwrap();
+        let text = std::fs::read_to_string(engine.join(MARKER)).unwrap();
+        assert!(text.contains("\"formatVersion\": 1") && text.contains("\"platform\": \"macosArm64\""));
+        assert_eq!(read_marker(&engine), Some(marker));
+    }
+
+    #[test]
+    fn legacy_windows_marker_migrates_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&engine).unwrap();
+        let legacy = serde_json::json!({
+            "version": "0.39.0",
+            "variant": "nvidia",
+            "sha256": "a".repeat(64),
+        });
+        std::fs::write(engine.join(MARKER), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(read_marker(&engine), Some(Marker::managed(RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))));
+    }
+
+    #[test]
+    fn ambiguous_or_hostile_markers_are_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&engine).unwrap();
+        let marker = engine.join(MARKER);
+        let valid = |changes: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "formatVersion": 1,
+                "platform": "windowsPortable",
+                "version": "0.43.0",
+                "variant": "nvidia",
+                "sha256": "a".repeat(64),
+            });
+            for (key, replacement) in changes.as_object().unwrap() {
+                value[key] = replacement.clone();
+            }
+            value
+        };
+        for value in [
+            serde_json::json!({}),
+            valid(serde_json::json!({"formatVersion": 2})),
+            valid(serde_json::json!({"platform": "linuxX64"})),
+            valid(serde_json::json!({"version": ""})),
+            valid(serde_json::json!({"variant": "voodoo"})),
+            valid(serde_json::json!({"sha256": "ab"})),
+        ] {
+            std::fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(read_marker(&engine).is_none(), "{value}");
+        }
+        std::fs::write(&marker, vec![b' '; 64 * 1024 + 1]).unwrap();
+        assert!(read_marker(&engine).is_none());
+    }
+
+    #[test]
+    fn installed_engines_reads_only_trusted_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let engines = dir.path().join("engine");
+        let trusted = engines.join("0.39.0");
+        let notes = engines.join("notes");
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        write_marker(&trusted, &Marker::managed(RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))).unwrap();
+        std::fs::write(notes.join(MARKER), b"{}").unwrap();
+        let installed = installed_engines(&engines);
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].0, trusted);
+    }
 
     #[test]
     fn removing_takes_only_what_the_setup_installed() {
@@ -489,9 +624,9 @@ mod tests {
         let theirs = engines.join("my notes");
         std::fs::create_dir_all(ours.join("python_embeded")).unwrap();
         std::fs::create_dir_all(&theirs).unwrap();
-        std::fs::create_dir_all(engines.join("0.40.0.unpacking")).unwrap();
         std::fs::write(ours.join("python_embeded").join("python.exe"), vec![0u8; 1000]).unwrap();
-        write_marker(&ours, &Marker { version: "0.39.0".into(), variant: "nvidia".into(), sha256: "ab".into() }).unwrap();
+        write_marker(&ours, &Marker::managed(RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))).unwrap();
+        std::fs::create_dir_all(engines.join("0.40.0.unpacking")).unwrap();
         std::fs::write(theirs.join("keep.txt"), b"mine").unwrap();
         std::fs::write(engines.join("ComfyUI_windows_portable_nvidia.7z.part"), vec![0u8; 500]).unwrap();
         std::fs::write(engines.join("holiday.7z"), b"mine too").unwrap();
