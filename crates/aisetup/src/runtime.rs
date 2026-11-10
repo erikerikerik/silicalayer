@@ -164,8 +164,7 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
 }
 
 /// Launch platforms as known to this setup: Windows portable build and macOS ARM64 managed runtime.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimePlatform {
     /// Windows portable build (the current implementation).
     WindowsPortable,
@@ -174,25 +173,12 @@ pub enum RuntimePlatform {
 }
 
 impl RuntimePlatform {
-    /// The script to run in the engine folder: main.py with platform-specific flags.
-    fn script(&self) -> String {
-        match self {
-            RuntimePlatform::WindowsPortable => "ComfyUI/main.py".into(),
-            RuntimePlatform::MacosArm64 => "main.py".into(),
-        }
-    }
-
     /// The arguments for the platform: whether `--windows-standalone-build` is needed.
-    fn extra_args(&self) -> Vec<String> {
+    fn extra_args(self) -> &'static [&'static str] {
         match self {
-            RuntimePlatform::WindowsPortable => vec!["--windows-standalone-build".into()],
-            RuntimePlatform::MacosArm64 => Vec::new(),
+            RuntimePlatform::WindowsPortable => &["--windows-standalone-build"],
+            RuntimePlatform::MacosArm64 => &[],
         }
-    }
-
-    /// The CPU argument: `--cpu` when enabled, empty otherwise.
-    fn cpu_arg(&self, cpu: bool) -> String {
-        if cpu { "--cpu".into() } else { String::new() }
     }
 }
 
@@ -206,20 +192,20 @@ pub fn launch(manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
 
 /// Build the ComfyUI launch command for a given platform. This is a pure function that accepts
 /// the runtime platform explicitly (for future macOS support) and constructs the command line.
-pub fn build_launch_command(platform: RuntimePlatform, _manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let script = platform.script();
+pub fn build_launch_command(platform: RuntimePlatform, manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
+    let script = manifest.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
     let mut args = vec![
         // Python's `-s`: the user's own site-packages stay out of the engine.
         "-s".to_string(),
         script,
     ];
     // Windows portable builds need this flag; macOS managed runtime does not.
-    args.extend(platform.extra_args());
+    args.extend(platform.extra_args().iter().map(|arg| (*arg).to_string()));
     args.push("--disable-auto-launch".into());
     args.push("--extra-model-paths-config".into());
     args.push(layout.model_paths.to_string_lossy().into_owned());
     if cpu {
-        args.push(platform.cpu_arg(cpu));
+        args.push("--cpu".into());
     }
     Launch { python: layout.python.to_string_lossy().into_owned(), folder: layout.engine_root.to_string_lossy().into_owned(), args: join_args(&args) }
 }
@@ -551,22 +537,18 @@ mod tests {
         let layout = layout(dir.path());
         let m = manifest();
 
-        // Windows portable (current behavior, should be unchanged)
-        let windows_launch = launch(m, &layout, false);
-        assert!(windows_launch.args.contains("--windows-standalone-build"));
-        assert!(!windows_launch.args.contains("--cpu"));
+        let script = m.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let model_paths = layout.model_paths.to_string_lossy().into_owned();
 
-        let cpu_windows_launch = launch(m, &layout, true);
-        assert!(cpu_windows_launch.args.contains("--cpu"));
+        // Windows portable remains the public default and keeps its standalone-build flag.
+        let windows = split_args(&launch(m, &layout, false).args);
+        assert_eq!(windows, ["-s", script.as_str(), "--windows-standalone-build", "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
 
-        // macOS ARM64: defined but not currently used by `launch()`
-        let macos_launch = build_launch_command(RuntimePlatform::MacosArm64, m, &layout, false);
-        assert!(!macos_launch.args.contains("--windows-standalone-build"), "macOS should not have --windows-standalone-build");
-
-        let cpu_macos_launch = build_launch_command(RuntimePlatform::MacosArm64, m, &layout, true);
-        assert!(cpu_macos_launch.args.contains("--cpu"));
-
-        // macOS launch without args still has -s and main.py
-        assert!(macos_launch.args.starts_with("-s main.py"), "macOS should start with -s main.py");
+        // The future macOS runtime uses the same pinned script and quoted paths without the
+        // Windows-only flag. CPU mode adds exactly one explicit argument on either platform.
+        let macos = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, false).args);
+        assert_eq!(macos, ["-s", script.as_str(), "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
+        let macos_cpu = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, true).args);
+        assert_eq!((macos_cpu.len(), macos_cpu.last().map(String::as_str)), (macos.len() + 1, Some("--cpu")));
     }
 }
