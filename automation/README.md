@@ -1,11 +1,11 @@
 # Local autonomous development
 
-This directory runs one bounded SilicaLayer task at a time on the reference Apple Silicon Mac. It uses OpenCode only with the loopback Ollama provider. Paid and remote providers, web access, subagents, external-directory access, and interactive questions are denied in `opencode.json`.
+This directory runs one bounded SilicaLayer task at a time on the reference Apple Silicon Mac. It uses OpenCode only with a self-hosted Ollama model or a private Strata model reached through Tailscale. Paid providers, web access, subagents, external-directory access, interactive questions, and model shell commands are denied in `opencode.json`.
 
 The worker deliberately separates inference from compilation. Supervisor policy, task definitions, and CI are protected from model edits:
 
-1. OpenCode reads and edits with Ollama loaded.
-2. The worker unloads the model.
+1. OpenCode reads and edits with the configured self-hosted model.
+2. The worker unloads a Mac-local Ollama model; a remote Strata model consumes no build memory on the Mac.
 3. Cargo formats, checks, and tests with the memory available.
 4. A fresh OpenCode session repairs a failure, up to the retry limit.
 5. A fresh review session inspects the diff; the gates run again.
@@ -29,7 +29,9 @@ The launch agent runs every 30 minutes and after login. Install it only after `p
 
 ## Environment overrides
 
-- `SILICA_MODEL` (default `qwen3.5:9b`; the 27B model exhausted Metal memory on the 24 GB reference Mac)
+- `SILICA_MODEL` (defaults to `qwen3.5:9b` for Ollama and the qualified UD-IQ4_XS model for Strata; the local 27B Ollama model exhausted Metal memory on the 24 GB reference Mac)
+- `SILICA_PROVIDER` (`ollama` by default; `strata` selects the private remote backend)
+- `SILICA_STRATA_BASE_URL` (required for Strata; an explicit Tailscale IPv4 URL on port 8080)
 - `SILICA_MAX_REPAIRS` (default `3`, maximum `5`)
 - `SILICA_MAX_FAILED_RUNS` (default `1`, range `1`–`3`; exhausted runs quarantine the task)
 - `SILICA_AGENT_TIMEOUT` and `SILICA_GATE_TIMEOUT` (default `3600` seconds, maximum `7200`)
@@ -38,3 +40,5 @@ The launch agent runs every 30 minutes and after login. Install it only after `p
 - `SILICA_MIN_FREE_GB` (default `80`)
 
 No setting enables release publication, signing, notarization, secret access, destructive Git, or paid APIs. The worker accepts only `automation/*` or `silicalayer/*` branches and an exact private SilicaLayer origin URL.
+
+Machine-specific backend values may be kept in ignored `.silica-agent/backend.conf` as `SILICA_PROVIDER`, `SILICA_MODEL`, and `SILICA_STRATA_BASE_URL`. The file is parsed as data, never sourced as shell code, and OpenCode is denied access to `.silica-agent/**`.

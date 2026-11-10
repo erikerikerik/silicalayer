@@ -19,3 +19,6 @@ cargo test -p photocraft-aigen --lib --tests
 cargo clippy -p photocraft-aisetup -p photocraft-aigen --all-targets -- \
   -D warnings -A clippy::collapsible_match -A clippy::nonminimal_bool
 cargo xtask layers
+# The narrow crate checks have missed integration breakage in the native app before.
+# Build the actual product before the supervisor accepts or commits a task.
+cargo build -p photocraft
