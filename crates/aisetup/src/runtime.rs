@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{FOLDERS, LEGACY_FOLDERS, Manifest, split_key};
 use crate::plan::{Layout, MARKER, PART};
 pub use crate::plan::{has_model_folders, models_root};
+pub use crate::platform::RuntimePlatform;
 use crate::{Error, Result};
 
 /// The first port tried for the engine. Not 8188 (the portable build's default) and not 8000
@@ -220,27 +221,6 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
         names.sort();
     }
     out
-}
-
-/// Launch platforms as known to this setup: Windows portable build and macOS ARM64 managed runtime.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RuntimePlatform {
-    /// Windows portable build (the current implementation).
-    #[default]
-    WindowsPortable,
-    /// macOS ARM64 managed runtime (defined for future platform support; CPU mode is explicit).
-    MacosArm64,
-}
-
-impl RuntimePlatform {
-    /// The arguments for the platform: whether `--windows-standalone-build` is needed.
-    fn extra_args(self) -> &'static [&'static str] {
-        match self {
-            RuntimePlatform::WindowsPortable => &["--windows-standalone-build"],
-            RuntimePlatform::MacosArm64 => &[],
-        }
-    }
 }
 
 /// How the installed engine is started: the portable build's own command line (its

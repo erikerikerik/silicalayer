@@ -9,6 +9,7 @@ use photocraft_aigen::Launch;
 use serde::{Deserialize, Serialize};
 
 use crate::human_bytes;
+use crate::platform::{RuntimePlatform, RuntimeTarget};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,6 +278,16 @@ pub fn merge_gpus(system: Vec<Gpu>, smi: Vec<Gpu>) -> Vec<Gpu> {
     out
 }
 
+impl Os {
+    /// Whether the OS reports an Apple Silicon Mac: the architecture is
+    /// exactly `arm64`, as the macOS collector reports it. The comparison is
+    /// exact and case-sensitive — a malformed or foreign value that merely
+    /// resembles `arm64` does not count.
+    pub fn is_apple_silicon(&self) -> bool {
+        self.architecture == "arm64"
+    }
+}
+
 impl Probe {
     /// The card the engine would use: the one with the most memory among the best-supported
     /// vendor present (NVIDIA, then AMD, then Intel).
@@ -313,6 +324,24 @@ impl Probe {
             Vendor::Intel => ("intel", false),
             Vendor::Other => ("nvidia", false),
         }
+    }
+
+    /// The runtime target this machine's facts select, if any: the Windows
+    /// portable GPU runtime when this is a 64-bit Windows host (same variant
+    /// and qualification as [`Probe::variant`] reports), or the Apple Silicon
+    /// macOS runtime on a 64-bit `arm64` host. A target is a selection, not
+    /// an install permission: `macos_arm64` has no installer yet and stays
+    /// unqualified. Older Intel Macs, 32-bit hosts and malformed facts select
+    /// nothing.
+    pub fn runtime_target(&self) -> Option<RuntimeTarget> {
+        if self.os.windows && self.os.sixty_four_bit {
+            let (variant, qualified) = self.variant();
+            return Some(RuntimeTarget::new(RuntimePlatform::WindowsPortable, variant, qualified));
+        }
+        if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
+            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, false));
+        }
+        None
     }
 
     /// The drive with the most room.
@@ -759,6 +788,73 @@ mod tests {
         assert!(with("AMD Radeon RX 7900 XTX", "31.0").usable_gpu().is_some() && with("NVIDIA GeForce RTX 3060", "591.59").usable_gpu().is_some());
         // Installing stays possible (on the processor): the system is fine, only the card is missing.
         assert!(vm.can_install());
+    }
+
+    #[test]
+    fn the_runtime_target_follows_the_host_and_the_card() {
+        let mut p = probe();
+        let target = p.runtime_target().expect("a 64-bit Windows host selects a target");
+        assert!(matches!(target.platform(), RuntimePlatform::WindowsPortable) && target.is_windows() && !target.is_macos_arm64());
+        assert_eq!((target.variant(), target.is_qualified()), ("nvidia", true));
+        // An older NVIDIA driver still selects Windows, with the CUDA 12.6 variant.
+        p.gpus[0].driver = "552.22".into();
+        let target = p.runtime_target().expect("older drivers still select a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("nvidia_cu126", true));
+        // AMD and Intel select the same platform with their own variants, unqualified.
+        p.gpus[0] = Gpu { vendor: Vendor::Amd, vram_mb: Some(12288), driver: "31.0".into(), name: "AMD Radeon RX 7900 XT".into() };
+        let target = p.runtime_target().expect("AMD still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("amd", false));
+        p.gpus[0] = Gpu { vendor: Vendor::Intel, vram_mb: Some(2048), driver: "31.0".into(), name: "Intel(R) Arc(TM) A770".into() };
+        let target = p.runtime_target().expect("Intel still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("intel", false));
+        // The variant and qualification are exactly what `variant()` reports: one source of truth.
+        let (variant, qualified) = p.variant();
+        let target = p.runtime_target().expect("Windows still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), (variant, qualified));
+    }
+
+    #[test]
+    fn the_runtime_target_selects_apple_silicon_unqualified() {
+        let p = Probe {
+            os: Os { name: "macOS".into(), version: "26.1".into(), architecture: "arm64".into(), sixty_four_bit: true, ..Os::default() },
+            ..Probe::default()
+        };
+        let target = p.runtime_target().expect("Apple Silicon selects a target");
+        assert!(matches!(target.platform(), RuntimePlatform::MacosArm64) && target.is_macos_arm64() && !target.is_windows());
+        assert_eq!(target.variant(), "macos_arm64");
+        // A selection, not an install permission: macOS stays unqualified and un-installable.
+        assert!(!target.is_qualified());
+        assert!(!p.can_install());
+    }
+
+    #[test]
+    fn the_runtime_target_never_selects_an_unsupported_mac_or_host() {
+        let mut p = Probe {
+            os: Os { name: "macOS".into(), version: "12.7".into(), architecture: "x86_64".into(), sixty_four_bit: true, ..Os::default() },
+            ..Probe::default()
+        };
+        assert!(p.runtime_target().is_none(), "an Intel Mac must not select a target");
+        p.os = Os { name: "macOS".into(), architecture: "arm64".into(), sixty_four_bit: false, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "arm64 without a 64-bit OS is an incomplete fact and must not select");
+        p.os = Os { name: "macOS".into(), architecture: "ARM64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "the architecture comparison is exact");
+        p.os = Os { name: "macOS".into(), architecture: " x86-64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "a malformed architecture must not select");
+        p.os = Os { name: "macOS".into(), architecture: "arm".into(), ..Os::default() };
+        assert!(p.runtime_target().is_none(), "a 32-bit architecture must not select");
+        p.os = Os { name: "Linux".into(), architecture: "arm64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "other operating systems select nothing");
+        // A default, unrun probe answers nothing.
+        assert!(Probe::default().runtime_target().is_none());
+    }
+
+    #[test]
+    fn apple_silicon_recognition_is_exact() {
+        assert!(Os { architecture: "arm64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "ARM64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "arm".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "x86_64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: String::new(), ..Os::default() }.is_apple_silicon());
     }
 
     #[test]

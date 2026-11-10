@@ -7,6 +7,8 @@
 //!   sha256, and the model files (each listed once, shared between models) with their size,
 //!   checksum and licence.
 //! - [`probe`]: what the machine has (system, graphics card, free space, an existing ComfyUI).
+//! - [`platform`]: the managed-runtime platform a host's facts select, shared by the probe and
+//!   the runtime.
 //! - [`plan`]: a pure function from the manifest, the user's choices and what is on disk to the
 //!   ordered list of steps. Every step can tell whether it is already done, so resuming, adding
 //!   a model later and repairing are all "plan again and run what is left".
@@ -37,6 +39,7 @@ pub mod hf;
 pub mod install;
 pub mod manifest;
 pub mod plan;
+pub mod platform;
 pub mod probe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
@@ -48,6 +51,7 @@ pub mod vcrt;
 
 pub use manifest::Manifest;
 pub use plan::{Choices, Plan, Route, Step};
+pub use platform::{RuntimePlatform, RuntimeTarget};
 pub use probe::Probe;
 pub use state::SetupState;
 
