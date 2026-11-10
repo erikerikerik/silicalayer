@@ -163,22 +163,63 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
     out
 }
 
+/// Launch platforms as known to this setup: Windows portable build and macOS ARM64 managed runtime.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum RuntimePlatform {
+    /// Windows portable build (the current implementation).
+    WindowsPortable,
+    /// macOS ARM64 managed runtime (defined for future platform support; CPU mode is explicit).
+    MacosArm64,
+}
+
+impl RuntimePlatform {
+    /// The script to run in the engine folder: main.py with platform-specific flags.
+    fn script(&self) -> String {
+        match self {
+            RuntimePlatform::WindowsPortable => "ComfyUI/main.py".into(),
+            RuntimePlatform::MacosArm64 => "main.py".into(),
+        }
+    }
+
+    /// The arguments for the platform: whether `--windows-standalone-build` is needed.
+    fn extra_args(&self) -> Vec<String> {
+        match self {
+            RuntimePlatform::WindowsPortable => vec!["--windows-standalone-build".into()],
+            RuntimePlatform::MacosArm64 => Vec::new(),
+        }
+    }
+
+    /// The CPU argument: `--cpu` when enabled, empty otherwise.
+    fn cpu_arg(&self, cpu: bool) -> String {
+        if cpu { "--cpu".into() } else { String::new() }
+    }
+}
+
 /// How the installed engine is started: the portable build's own command line (its
 /// `run_nvidia_gpu.bat`), without the browser it would open, with the models folder added.
 /// `cpu`: on the processor, as its `run_cpu.bat` does, for a PC without a graphics card it can use.
 pub fn launch(manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let script = manifest.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let platform = RuntimePlatform::WindowsPortable; // current default: backwards compatible
+    build_launch_command(platform, manifest, layout, cpu)
+}
+
+/// Build the ComfyUI launch command for a given platform. This is a pure function that accepts
+/// the runtime platform explicitly (for future macOS support) and constructs the command line.
+pub fn build_launch_command(platform: RuntimePlatform, _manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
+    let script = platform.script();
     let mut args = vec![
         // Python's `-s`: the user's own site-packages stay out of the engine.
         "-s".to_string(),
         script,
-        "--windows-standalone-build".into(),
-        "--disable-auto-launch".into(),
-        "--extra-model-paths-config".into(),
-        layout.model_paths.to_string_lossy().into_owned(),
     ];
+    // Windows portable builds need this flag; macOS managed runtime does not.
+    args.extend(platform.extra_args());
+    args.push("--disable-auto-launch".into());
+    args.push("--extra-model-paths-config".into());
+    args.push(layout.model_paths.to_string_lossy().into_owned());
     if cpu {
-        args.push("--cpu".into());
+        args.push(platform.cpu_arg(cpu));
     }
     Launch { python: layout.python.to_string_lossy().into_owned(), folder: layout.engine_root.to_string_lossy().into_owned(), args: join_args(&args) }
 }
@@ -502,5 +543,30 @@ mod tests {
         remove_models(m, dir.path(), &installed, &[]).unwrap();
         assert_eq!(list_models(dir.path()), BTreeMap::from([("vae".to_string(), vec!["mine.safetensors".to_string()])]));
         assert_eq!(remove_models(m, &dir.path().join("missing"), &installed, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn build_launch_command_platforms_build_distinct_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let m = manifest();
+
+        // Windows portable (current behavior, should be unchanged)
+        let windows_launch = launch(m, &layout, false);
+        assert!(windows_launch.args.contains("--windows-standalone-build"));
+        assert!(!windows_launch.args.contains("--cpu"));
+
+        let cpu_windows_launch = launch(m, &layout, true);
+        assert!(cpu_windows_launch.args.contains("--cpu"));
+
+        // macOS ARM64: defined but not currently used by `launch()`
+        let macos_launch = build_launch_command(RuntimePlatform::MacosArm64, m, &layout, false);
+        assert!(!macos_launch.args.contains("--windows-standalone-build"), "macOS should not have --windows-standalone-build");
+
+        let cpu_macos_launch = build_launch_command(RuntimePlatform::MacosArm64, m, &layout, true);
+        assert!(cpu_macos_launch.args.contains("--cpu"));
+
+        // macOS launch without args still has -s and main.py
+        assert!(macos_launch.args.starts_with("-s main.py"), "macOS should start with -s main.py");
     }
 }
