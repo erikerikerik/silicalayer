@@ -1,6 +1,14 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "ollama/qwen3.5:9b",
+  "providers": {
+    "ollama": {
+      "settings": {
+        "headerTimeout": 900000,
+        "chunkTimeout": 900000
+      }
+    }
+  },
   "permissions": [
     { "action": "read", "resource": "*", "effect": "allow" },
     { "action": "read", "resource": "*.env", "effect": "deny" },
