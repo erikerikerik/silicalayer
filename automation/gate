@@ -5,12 +5,16 @@ PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local
 export PATH
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/silica-agent}"
 cd "$ROOT"
-changed_rust=$(git diff --name-only --diff-filter=ACM HEAD -- '*.rs')
+changed_rust=$(
+  git diff --name-only --diff-filter=ACM HEAD -- '*.rs'
+  git ls-files --others --exclude-standard -- '*.rs'
+)
 if [ -n "$changed_rust" ]; then
   # The upstream baseline predates this rustfmt release and is not globally clean under it.
   # Keep the autonomous change narrow: only files it touched must satisfy pinned rustfmt.
+  # Do not let a changed module root make rustfmt recurse into untouched baseline modules.
   # shellcheck disable=SC2086
-  rustfmt --edition 2024 --check $changed_rust
+  rustfmt --edition 2024 --check --config skip_children=true $changed_rust
 fi
 cargo test -p photocraft-aisetup --lib --tests
 cargo test -p photocraft-aigen --lib --tests
