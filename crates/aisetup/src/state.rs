@@ -7,7 +7,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::plan::Choices;
+use crate::plan::{Choices, Route};
+
+/// The setup-state format written by this version of the app. Records before this field existed
+/// are version 0 and are migrated by [`SetupState::parse`].
+pub const VERSION: u32 = 1;
+
+/// Who owns the ComfyUI runtime. This concerns the runtime only, never the whole models folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeOwnership {
+    /// No trustworthy ownership statement was read.
+    #[default]
+    Unknown,
+    /// The app installed and marked its private runtime.
+    Managed,
+    /// The runtime belongs to the user and must never be removed by the app.
+    External,
+}
+
+impl RuntimeOwnership {
+    fn from_route(route: Route) -> RuntimeOwnership {
+        match route {
+            Route::Managed => RuntimeOwnership::Managed,
+            Route::Existing => RuntimeOwnership::External,
+        }
+    }
+}
 
 /// How far a setup got.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,10 +51,14 @@ pub enum Phase {
     Done,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SetupState {
     pub phase: Phase,
+    /// The on-disk format version.
+    pub version: u32,
+    /// Who owns the runtime described by this record.
+    pub ownership: RuntimeOwnership,
     /// What the user chose, so the setup can be continued without asking again.
     pub choices: Choices,
     /// The port the engine was given.
@@ -43,18 +73,49 @@ pub struct SetupState {
     pub offered: bool,
 }
 
+impl Default for SetupState {
+    fn default() -> SetupState {
+        SetupState {
+            phase: Phase::None,
+            version: VERSION,
+            ownership: RuntimeOwnership::Unknown,
+            choices: Choices::default(),
+            port: 0,
+            comfy_version: String::new(),
+            installed: Vec::new(),
+            error: String::new(),
+            offered: false,
+        }
+    }
+}
+
 impl SetupState {
     /// Is there a setup to continue?
     pub fn interrupted(&self) -> bool {
         matches!(self.phase, Phase::Installing | Phase::Paused | Phase::Failed)
     }
 
-    /// Read a saved record. A missing, damaged or absurdly large file is no record.
+    /// Read a saved record. A missing, damaged, future-version or absurdly large file is no
+    /// record. Version 0 is the legacy unversioned format; its route supplies ownership.
     pub fn parse(text: &str) -> SetupState {
         if text.len() > 1 << 20 {
             return SetupState::default();
         }
-        let mut state: SetupState = serde_json::from_str(text).unwrap_or_default();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return SetupState::default() };
+        if !value.is_object() {
+            return SetupState::default();
+        }
+        let legacy = value.get("version").is_none();
+        if !legacy && value.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(VERSION)) {
+            return SetupState::default();
+        }
+        let Ok(mut state) = serde_json::from_value::<SetupState>(value) else { return SetupState::default() };
+        if legacy {
+            state.version = VERSION;
+            state.ownership = RuntimeOwnership::from_route(state.choices.route);
+        } else if state.ownership == RuntimeOwnership::Unknown {
+            return SetupState::default();
+        }
         // The server's file list is of the moment it was read, not something to resume from.
         state.choices.server_files = None;
         state.error = state.error.chars().take(2000).collect();
@@ -64,6 +125,10 @@ impl SetupState {
 
     pub fn to_json(&self) -> String {
         let mut state = self.clone();
+        state.version = VERSION;
+        if state.ownership == RuntimeOwnership::Unknown {
+            state.ownership = RuntimeOwnership::from_route(state.choices.route);
+        }
         state.choices.server_files = None;
         serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".into())
     }
@@ -107,11 +172,11 @@ pub use native::{load, save};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Route;
 
     fn state() -> SetupState {
         SetupState {
             phase: Phase::Installing,
+            ownership: RuntimeOwnership::Managed,
             choices: Choices {
                 route: Route::Managed,
                 models: vec!["qwen-image-2-1".into()],
@@ -123,9 +188,8 @@ mod tests {
             },
             port: 8190,
             comfy_version: "0.39.0".into(),
-            installed: vec![],
-            error: String::new(),
             offered: true,
+            ..SetupState::default()
         }
     }
 
@@ -133,11 +197,31 @@ mod tests {
     fn a_record_round_trips_without_what_is_only_of_the_moment() {
         let s = state();
         let back = SetupState::parse(&s.to_json());
+        assert_eq!((back.version, back.ownership), (VERSION, RuntimeOwnership::Managed));
         assert_eq!(back.choices.server_files, None);
         assert_eq!(SetupState { choices: Choices { server_files: None, ..s.choices.clone() }, ..s.clone() }, back);
         assert!(back.interrupted());
         assert!(!SetupState { phase: Phase::Done, ..s.clone() }.interrupted() && !SetupState::default().interrupted());
         assert!(SetupState { phase: Phase::Paused, ..s.clone() }.interrupted() && SetupState { phase: Phase::Failed, ..s }.interrupted());
+    }
+
+    #[test]
+    fn legacy_records_migrate_route_to_runtime_ownership() {
+        let legacy = |route| format!(r#"{{"phase":"installing","choices":{{"route":"{route}"}},"port":8190}}"#);
+        let managed = SetupState::parse(&legacy("managed"));
+        let external = SetupState::parse(&legacy("existing"));
+        assert_eq!((managed.version, managed.ownership, managed.phase), (VERSION, RuntimeOwnership::Managed, Phase::Installing));
+        assert_eq!((external.version, external.ownership, external.phase), (VERSION, RuntimeOwnership::External, Phase::Installing));
+    }
+
+    #[test]
+    fn current_malformed_and_future_records_fail_closed() {
+        let malformed = r#"{"version":1,"phase":"installing","ownership":"somebodyElse","choices":{}}"#;
+        let future = r#"{"version":99,"phase":"installing","ownership":"managed","choices":{}}"#;
+        assert_eq!(SetupState::parse(malformed), SetupState::default());
+        assert_eq!(SetupState::parse(future), SetupState::default());
+        let external = SetupState { choices: Choices { route: Route::Existing, ..Choices::default() }, ..SetupState::default() };
+        assert_eq!(SetupState::parse(&external.to_json()).ownership, RuntimeOwnership::External);
     }
 
     #[test]
@@ -149,11 +233,10 @@ mod tests {
         for junk in ["", "null", "[]", "42", "{\"phase\":\"flying\"}", "{\"port\":-1}", "{\"choices\":7}", "\0\0\0"] {
             assert_eq!(SetupState::parse(junk), SetupState::default(), "{junk}");
         }
-        // Unknown keys of a later version are ignored; missing ones take their defaults.
-        let later = SetupState::parse(r#"{"phase":"done","future":1,"choices":{"models":["a"],"later":true}}"#);
+        let later = SetupState::parse(r#"{"version":1,"ownership":"managed","phase":"done","future":1,"choices":{"models":["a"],"later":true}}"#);
         assert_eq!((later.phase, later.choices.models, later.port), (Phase::Done, vec!["a".to_string()], 0));
         assert_eq!(SetupState::parse(&" ".repeat((1 << 20) + 1)), SetupState::default());
-        let long = SetupState { error: "x".repeat(10_000), installed: vec!["m".into(); 5000], ..SetupState::default() };
+        let long = SetupState { error: "x".repeat(10_000), installed: vec!["m".into(); 5000], ..state() };
         let back = SetupState::parse(&long.to_json());
         assert_eq!((back.error.len(), back.installed.len()), (2000, 1000));
     }
@@ -165,7 +248,7 @@ mod tests {
         let path = dir.path().join("settings").join("ai-setup.json");
         assert_eq!(load(&path), SetupState::default());
         save(&path, &state()).unwrap();
-        assert_eq!(load(&path).phase, Phase::Installing);
+        assert_eq!((load(&path).phase, load(&path).ownership), (Phase::Installing, RuntimeOwnership::Managed));
         save(&path, &SetupState { phase: Phase::Done, ..state() }).unwrap();
         assert_eq!(load(&path).phase, Phase::Done);
         assert!(!dir.path().join("settings").join("ai-setup.json.new").exists());
