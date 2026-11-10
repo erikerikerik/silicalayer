@@ -5,9 +5,12 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 STATE="$ROOT/.silica-agent"
 LOGS="$STATE/logs"
 COMPLETED="$STATE/completed"
+QUARANTINED="$STATE/quarantined"
+FAILURES="$STATE/failures"
 LOCK="$STATE/lock"
 MODEL=${SILICA_MODEL:-qwen3.5:9b}
 MAX_REPAIRS=${SILICA_MAX_REPAIRS:-3}
+MAX_FAILED_RUNS=${SILICA_MAX_FAILED_RUNS:-1}
 AGENT_TIMEOUT=${SILICA_AGENT_TIMEOUT:-3600}
 GATE_TIMEOUT=${SILICA_GATE_TIMEOUT:-3600}
 PUSH=${SILICA_PUSH:-0}
@@ -22,6 +25,26 @@ checkpoint() {
   tmp="$STATE/checkpoint.tmp.$$"
   printf 'task=%s\nphase=%s\nattempt=%s\nhead=%s\nupdated=%s\n' "$TASK_NAME" "$1" "${2:-0}" "$(git -C "$ROOT" rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
   mv "$tmp" "$STATE/checkpoint"
+}
+task_failure() {
+  reason=$1
+  mkdir -p "$FAILURES" "$QUARANTINED"
+  count_file="$FAILURES/$TASK_NAME"
+  previous=$(sed -n '1p' "$count_file" 2>/dev/null || true)
+  case "$previous" in *[!0-9]*|'') previous=0;; esac
+  count=$((previous + 1))
+  tmp="$count_file.tmp.$$"
+  printf '%s\n' "$count" > "$tmp"
+  mv "$tmp" "$count_file"
+  if [ "$count" -ge "$MAX_FAILED_RUNS" ]; then
+    tmp="$QUARANTINED/$TASK_NAME.tmp.$$"
+    printf 'task=%s\nfailed_runs=%s\nreason=%s\nupdated=%s\n' "$TASK_NAME" "$count" "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+    mv "$tmp" "$QUARANTINED/$TASK_NAME"
+    checkpoint quarantined "$count"
+    die "$TASK_NAME quarantined after $count failed run(s): $reason"
+  fi
+  checkpoint failed "$count"
+  die "$TASK_NAME failed run $count of $MAX_FAILED_RUNS: $reason"
 }
 acquire_lock() {
   if mkdir "$LOCK" 2>/dev/null; then
@@ -58,6 +81,8 @@ preflight() {
   [ "$free_kb" -ge $((MIN_FREE_GB * 1024 * 1024)) ] || die "less than ${MIN_FREE_GB} GiB is free"
   case "$MAX_REPAIRS" in *[!0-9]*|'') die "SILICA_MAX_REPAIRS must be an integer";; esac
   [ "$MAX_REPAIRS" -le 5 ] || die "SILICA_MAX_REPAIRS may not exceed 5"
+  case "$MAX_FAILED_RUNS" in *[!0-9]*|'') die "SILICA_MAX_FAILED_RUNS must be an integer";; esac
+  [ "$MAX_FAILED_RUNS" -ge 1 ] && [ "$MAX_FAILED_RUNS" -le 3 ] || die "SILICA_MAX_FAILED_RUNS must be between 1 and 3"
   case "$AGENT_TIMEOUT:$GATE_TIMEOUT" in *[!0-9:]*) die "timeouts must be integer seconds";; esac
   [ "$AGENT_TIMEOUT" -le 7200 ] && [ "$GATE_TIMEOUT" -le 7200 ] || die "timeouts may not exceed 7200 seconds"
   case "$PUSH" in 0|1) :;; *) die "SILICA_PUSH must be 0 or 1";; esac
@@ -77,7 +102,7 @@ next_task() {
   for file in "$ROOT"/automation/tasks/*.md; do
     [ -f "$file" ] || return 1
     name=$(basename "$file" .md)
-    if [ ! -f "$COMPLETED/$name" ]; then
+    if [ ! -f "$COMPLETED/$name" ] && [ ! -f "$QUARANTINED/$name" ]; then
       TASK_FILE=$file
       TASK_NAME=$name
       return 0
@@ -99,11 +124,11 @@ run_gate() {
 }
 secret_scan() {
   if git -C "$ROOT" diff --cached -U0 | grep -E '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,})' >/dev/null; then
-    die "possible secret detected in staged diff"
+    task_failure "possible secret detected in staged diff"
   fi
 }
 one_run() {
-  mkdir -p "$LOGS" "$COMPLETED"
+  mkdir -p "$LOGS" "$COMPLETED" "$QUARANTINED" "$FAILURES"
   acquire_lock
   trap 'unload_model; rm -f "$LOCK/pid" 2>/dev/null || true; rmdir "$LOCK" 2>/dev/null || true' EXIT HUP INT TERM
   preflight
@@ -114,7 +139,7 @@ one_run() {
   dirty=$(git -C "$ROOT" status --porcelain)
   if [ -z "$dirty" ]; then
     prompt=$(printf 'Read AGENTS.md, automation/GOVERNANCE.md, all SilicaLayer governing documents available in this checkout, and %s. Implement only that bounded task. Do not run builds or tests; the supervisor does that after unloading the model. Do not commit, push, access the network, use secrets, change CI, release, publish, or ask questions. Keep the tree buildable and stop after the smallest tested-by-design change.' "$TASK_FILE")
-    run_agent implement "$prompt" "$RUN_LOG/implement.jsonl" 0 || die "implementation session failed; see $RUN_LOG"
+    run_agent implement "$prompt" "$RUN_LOG/implement.jsonl" 0 || task_failure "implementation session failed; see $RUN_LOG"
   else
     if [ ! -f "$STATE/checkpoint" ] || ! grep -Fqx "task=$TASK_NAME" "$STATE/checkpoint"; then
       die "dirty tree is not associated with the active checkpoint; refusing to stage it"
@@ -123,7 +148,7 @@ one_run() {
   fi
   unload_model
   if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
-    die "agent changed supervisor policy, task definitions, or CI"
+    task_failure "agent changed supervisor policy, task definitions, or CI"
   fi
   attempt=0
   while :; do
@@ -131,25 +156,25 @@ one_run() {
     if run_gate "$RUN_LOG/gate-$attempt.log"; then
       break
     fi
-    [ "$attempt" -lt "$MAX_REPAIRS" ] || die "gate failed after $MAX_REPAIRS repairs; see $RUN_LOG"
+    [ "$attempt" -lt "$MAX_REPAIRS" ] || task_failure "gate failed after $MAX_REPAIRS repairs; see $RUN_LOG"
     attempt=$((attempt + 1))
     tail -c 24000 "$RUN_LOG/gate-$((attempt - 1)).log" > "$RUN_LOG/failure-tail.log"
     prompt=$(printf 'The bounded task is %s. The supervisor tests failed; inspect %s and the current diff, identify the root cause, and make the smallest repair. Do not run builds/tests, commit, push, access the network, use secrets, weaken checks, or broaden scope. Stop after editing.' "$TASK_FILE" "$RUN_LOG/failure-tail.log")
-    run_agent repair "$prompt" "$RUN_LOG/repair-$attempt.jsonl" "$attempt" || die "repair session failed; see $RUN_LOG"
+    run_agent repair "$prompt" "$RUN_LOG/repair-$attempt.jsonl" "$attempt" || task_failure "repair session failed; see $RUN_LOG"
     unload_model
     if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
-      die "repair changed supervisor policy, task definitions, or CI"
+      task_failure "repair changed supervisor policy, task definitions, or CI"
     fi
   done
   prompt=$(printf 'Independently review the current uncommitted diff for the task in %s. Check correctness, security, recoverability, architecture, tests, and scope against AGENTS.md. Fix only confirmed issues in the diff. Do not run builds/tests, commit, push, access the network, use secrets, or broaden scope. If no issue exists, make no edit.' "$TASK_FILE")
-  run_agent review "$prompt" "$RUN_LOG/review.jsonl" 0 || die "review session failed; see $RUN_LOG"
+  run_agent review "$prompt" "$RUN_LOG/review.jsonl" 0 || task_failure "review session failed; see $RUN_LOG"
   unload_model
   if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
-    die "review changed supervisor policy, task definitions, or CI"
+    task_failure "review changed supervisor policy, task definitions, or CI"
   fi
   checkpoint final-gate 0
-  run_gate "$RUN_LOG/final-gate.log" || die "post-review gate failed; see $RUN_LOG"
-  [ -n "$(git -C "$ROOT" status --porcelain)" ] || die "task produced no change"
+  run_gate "$RUN_LOG/final-gate.log" || task_failure "post-review gate failed; see $RUN_LOG"
+  [ -n "$(git -C "$ROOT" status --porcelain)" ] || task_failure "task produced no change"
   git -C "$ROOT" add -A
   secret_scan
   git -C "$ROOT" diff --cached --check
@@ -159,12 +184,36 @@ one_run() {
     git -C "$ROOT" push --set-upstream origin "$branch"
   fi
   : > "$COMPLETED/$TASK_NAME"
+  rm -f "$FAILURES/$TASK_NAME" "$QUARANTINED/$TASK_NAME"
   checkpoint complete 0
   say "completed $TASK_NAME (push=$PUSH)"
+}
+
+status() {
+  printf '%s\n' 'SilicaLayer local supervisor'
+  if [ -f "$STATE/checkpoint" ]; then
+    cat "$STATE/checkpoint"
+  else
+    printf '%s\n' 'checkpoint=none'
+  fi
+  if [ -f "$LOCK/pid" ]; then
+    worker_pid=$(sed -n '1p' "$LOCK/pid")
+    if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null; then
+      printf 'worker_pid=%s\n' "$worker_pid"
+    else
+      printf 'worker_pid=stale:%s\n' "$worker_pid"
+    fi
+  else
+    printf '%s\n' 'worker_pid=none'
+  fi
+  printf 'completed=%s\n' "$(find "$COMPLETED" -type f -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  printf 'quarantined=%s\n' "$(find "$QUARANTINED" -type f -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  git -C "$ROOT" status --short --branch
 }
 
 case ${1:-once} in
   preflight) mkdir -p "$STATE"; TASK_NAME=preflight; preflight;;
   once) one_run;;
-  *) die "usage: automation/silica-agent [preflight|once]";;
+  status) status;;
+  *) die "usage: automation/silica-agent [preflight|once|status]";;
 esac
