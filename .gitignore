@@ -1,0 +1,14 @@
+*~
+/plan/
+/target
+target/
+/dist
+/corpus
+/log
+/secrets
+/temp
+/.silica-agent/
+/book/output
+/craft-fonts
+*.log
+__pycache__/

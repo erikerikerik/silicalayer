@@ -1,0 +1,3132 @@
+use super::*;
+use photocraft_aigen::{Request, Response, Settings, Transport};
+use photocraft_doc::AiPicture;
+use photocraft_engine::Session;
+use std::sync::{Arc, Mutex};
+
+/// A ComfyUI that lists two model files per folder and renders a green square.
+struct Fake;
+
+impl Transport for Fake {
+    fn send(&self, r: &Request) -> photocraft_aigen::Result<Response> {
+        let body = if r.url.ends_with("/prompt") {
+            br#"{"prompt_id":"p1"}"#.to_vec()
+        } else if r.url.contains("/history/") {
+            br#"{"p1":{"outputs":{"9":{"images":[{"filename":"o.png","subfolder":"","type":"temp"}]}},"status":{"completed":true}}}"#.to_vec()
+        } else if r.url.contains("/view?") {
+            let img = photocraft_codecs::Image::from_u8(8, 8, photocraft_codecs::ChannelLayout::Rgba, [0u8, 255, 0, 255].repeat(64)).unwrap();
+            photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &Default::default()).unwrap()
+        } else if r.url.ends_with("/upload/image") {
+            br#"{"name":"uploaded.png","subfolder":"","type":"input"}"#.to_vec()
+        } else if r.url.ends_with("/models/diffusion_models") {
+            br#"["z_image_turbo_bf16.safetensors","flux1-dev.safetensors","qwen_image_edit_2511_bf16.safetensors"]"#.to_vec()
+        } else if r.url.contains("/models/") {
+            br#"["ae.safetensors","qwen_3_4b.safetensors"]"#.to_vec()
+        } else {
+            return Ok(Response { status: 404, body: Vec::new() });
+        };
+        Ok(Response { status: 200, body })
+    }
+}
+
+/// An app with the fake server and no models: each test lists its own, not the recommended
+/// ones a new installation starts with.
+fn app() -> PhotocraftApp {
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+    app.session.ai.transport = Some(Arc::new(Fake));
+    app.run("prefs.set", json!({"path": "integrations.ai.models", "value": []})).unwrap();
+    // Local AI works here (the fake server renders), and the panel has already asked it: each
+    // test lists its own models, whatever files the server has. What is offered when is
+    // `only_models_that_can_run_are_offered`'s.
+    app.ui.ai_setup.local_worked = true;
+    app.ui.ai_gen.server_asked = 0.0;
+    app
+}
+
+fn add_model(app: &mut PhotocraftApp, model: Model) {
+    let mut models = app.session.prefs().integrations.ai.models.clone();
+    models.push(model);
+    app.run("prefs.set", json!({"path": "integrations.ai.models", "value": models})).unwrap();
+}
+
+fn z_image(id: &str) -> Model {
+    Model { id: id.into(), ..Family::ZImage.preset() }
+}
+
+/// Draw the panel for a few frames (fonts load on the first).
+fn draw_panel(app: &mut PhotocraftApp) {
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    for _ in 0..3 {
+        ctx.run_ui(Default::default(), |ui| panel(app, ui, true)).textures_delta.clear();
+        ctx.run_ui(Default::default(), |ui| panel(app, ui, false)).textures_delta.clear();
+    }
+}
+
+/// Draw every page of the Generative AI section over the dialog's draft for a few frames.
+fn draw_section(f: &mut Map<String, Value>) {
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let before = f.get(PAGE).cloned();
+    for page in PAGES.iter().map(|(key, _)| *key).cycle().take(PAGES.len() * 3) {
+        f.insert(PAGE.into(), json!(page));
+        ctx.run_ui(Default::default(), |ui| {
+            let mut values = f.get("values").cloned().unwrap();
+            let obj = values.get_mut("integrations").and_then(Value::as_object_mut).unwrap();
+            prefs_section(ui, obj, f, 480.0);
+            f.insert("values".into(), values);
+        })
+        .textures_delta
+        .clear();
+    }
+    // Leave the dialog on the page it was on (drawing the local page may ask to read the server).
+    match before {
+        Some(page) => f.insert(PAGE.into(), page),
+        None => f.remove(PAGE),
+    };
+    f.remove(ACTION);
+}
+
+fn dialog_fields(app: &mut PhotocraftApp) -> (u64, Map<String, Value>) {
+    let id = open_settings(app, "");
+    (id, app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields.clone())
+}
+
+#[test]
+fn the_window_menu_item_shows_the_tab_and_reports_it() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    assert!(crate::menus::is_live(PANEL));
+    assert!(crate::menu_catalog::CATALOG.iter().any(|m| m.3 == PANEL && m.1 == "AI Gen" && m.0 == ["Window"]));
+    app.ui.panels.properties = false;
+    assert_eq!(checked(&app, PANEL), Some(false));
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert!(app.ui.panels.properties);
+    assert_eq!(app.ui.dock_tabs.properties, TAB);
+    assert_eq!(checked(&app, PANEL), Some(true));
+    // Another tab of the group in front: the item is unchecked, and choosing it brings AI Gen back.
+    app.ui.dock_tabs.properties = 0;
+    assert_eq!(checked(&app, PANEL), Some(false));
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert_eq!((app.ui.panels.properties, app.ui.dock_tabs.properties), (true, TAB));
+    // A collapsed group is expanded.
+    app.ui.dock.set_collapsed(crate::dock::Group::Properties, true);
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert!(!app.ui.dock.is_collapsed(crate::dock::Group::Properties));
+    // Showing: the item hides the group, like the other Window › <panel> items.
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert!(!app.ui.panels.properties);
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({"show": true})).unwrap();
+    assert!(app.ui.panels.properties);
+    assert_eq!(crate::dock::Group::Properties.tabs(true).get(TAB), Some(&"AI Gen"));
+}
+
+#[test]
+fn themes_that_float_properties_get_a_floating_panel() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.ui.theme = crate::theme::ThemeKind::Studio;
+    let before = (app.ui.panels.properties, app.ui.dock_tabs.properties);
+    assert_eq!(checked(&app, PANEL), Some(false));
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert!(app.ui.ai_gen.floating);
+    assert_eq!(checked(&app, PANEL), Some(true));
+    // The dock is left alone.
+    assert_eq!((app.ui.panels.properties, app.ui.dock_tabs.properties), before);
+    PhotocraftApp::setup_context(&ctx, crate::theme::ThemeKind::Studio);
+    for _ in 0..3 {
+        ctx.run_ui(Default::default(), |ui| window(&mut app, ui.ctx())).textures_delta.clear();
+    }
+    crate::menus::invoke(&mut app, &ctx, PANEL, json!({})).unwrap();
+    assert!(!app.ui.ai_gen.floating);
+}
+
+#[test]
+fn the_panel_draws_in_every_state() {
+    // No models, no document.
+    let mut app = app();
+    draw_panel(&mut app);
+    // Models but no document; a stale model id falls back to the first model offered, which is
+    // the first cloud model: the panel lists those before the local ones.
+    add_model(&mut app, Model { enabled: false, ..z_image("off") });
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "gpt".into(), ..Model::cloud(Provider::Openai, "GPT Image 1.5", "gpt-image-1.5", true) });
+    add_model(&mut app, Model { id: "nb".into(), ..Model::cloud(Provider::Gemini, "Nano Banana 2", "gemini-3.1-flash-image-preview", false) });
+    // Cloud models are offered once their key is there.
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    app.session.ai.set_key(Provider::Gemini, "g-test");
+    app.ui.ai_gen.model = "gone".into();
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.model, "gpt");
+    // With a document and a selection, for a local, an OpenAI and a Gemini model.
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.run("select.rect", json!({"x": 4, "y": 4, "width": 20, "height": 10})).unwrap();
+    for id in ["z", "gpt", "nb"] {
+        app.ui.ai_gen.model = id.into();
+        app.ui.ai_gen.alpha = true;
+        draw_panel(&mut app);
+        // The choice is remembered across models; one without alpha just doesn't use it.
+        assert!(app.ui.ai_gen.alpha, "{id}");
+    }
+    assert_eq!(target_size(&app), Some((20, 10, true)));
+    assert_eq!(render_size(&z_image("z"), 500, 500), (1008, 1008));
+}
+
+#[test]
+fn openai_models_show_an_estimate_and_the_last_billed_cost() {
+    let mut app = app();
+    app.run("file.new", json!({"width": 600, "height": 600})).unwrap();
+    let flare = Model { quality: "medium".into(), ..Model::cloud(Provider::Openai, "GPT Image 2.5 Flare", "gpt-image-2.5-flare", true) };
+    let (text, tip) = price_note(&app, &flare);
+    assert_eq!(text, "Est. cost ≈ $0.041–$0.053 (medium)");
+    assert!(tip.contains("GPT Image 2.5"));
+    // A published size of a model with published prices: exact, no ≈.
+    let old = Model { quality: "high".into(), ..Model::cloud(Provider::Openai, "GPT Image 1.5", "gpt-image-1.5", true) };
+    assert_eq!(price_note(&app, &old).0, "Est. cost $0.133 (high)");
+    // A quality without published figures says so instead of guessing.
+    let max = Model { quality: "max".into(), ..flare.clone() };
+    assert!(price_note(&app, &max).0.starts_with("No published price; $30 / 1M output tokens"));
+    // The billed cost of the last generation follows it; a result without one clears it.
+    finished(&mut app, &json!({"layer": 1, "cost": 0.0534}));
+    assert!(price_note(&app, &flare).0.ends_with("· last $0.053"));
+    for junk in [json!({"cost": null}), json!({"cost": "free"}), json!({"cost": -1.0}), json!(null)] {
+        finished(&mut app, &junk);
+        assert_eq!(app.ui.ai_gen.last_cost, None, "{junk}");
+    }
+    assert!(crate::dock::Group::Properties.scrolls_itself(TAB));
+}
+
+#[test]
+fn generate_is_blocked_until_it_can_run() {
+    let mut app = app();
+    let z = z_image("z");
+    add_model(&mut app, z.clone());
+    assert!(generate_blocked(&app, &z).unwrap().contains("Open a document"));
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    assert!(generate_blocked(&app, &z).unwrap().contains("prompt"));
+    app.ui.ai_gen.prompt = "a green field".into();
+    assert_eq!(generate_blocked(&app, &z), None);
+    let cloud = Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false);
+    if app.session.ai.key(Provider::Openai).is_empty() {
+        assert!(generate_blocked(&app, &cloud).unwrap().contains("API key"));
+    }
+    app.session.ai.transport = None;
+    assert!(generate_blocked(&app, &z).unwrap().contains("desktop app"));
+}
+
+#[test]
+fn generating_from_the_panel_adds_a_layer() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    app.ui.ai_gen.model = "z".into();
+    app.ui.ai_gen.prompt = "a green field".into();
+    let before = app.session.active().unwrap().doc.layers.len();
+    let r = generate(&mut app).unwrap();
+    assert_eq!(r["model"], "z");
+    assert_eq!(app.session.active().unwrap().doc.layers.len(), before + 1);
+    // The panel's state is readable and drivable like the rest of the UI state.
+    let state = serde_json::to_value(&app.ui).unwrap();
+    assert_eq!(state["ai_gen"]["prompt"], "a green field");
+    let old: AiGenUi = serde_json::from_value(json!({"prompt": "x", "unknown": 1})).unwrap();
+    assert_eq!(old, AiGenUi { prompt: "x".into(), ..Default::default() });
+}
+
+#[test]
+fn the_settings_page_edits_the_draft() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    let (_, mut f) = dialog_fields(&mut app);
+    assert_eq!(f.get("section"), Some(&json!("generativeAi")));
+    draw_section(&mut f);
+    // Drawing changes nothing.
+    assert_eq!(f["values"]["integrations"]["ai"], serde_json::to_value(&app.session.prefs().integrations.ai).unwrap());
+    // Every family and cloud preset can be added, drawn and saved.
+    for family in Family::ALL {
+        let mut ai = f["values"]["integrations"]["ai"].as_object().cloned().unwrap();
+        push_model(&mut ai, &mut f, family.preset());
+        f["values"]["integrations"]["ai"] = Value::Object(ai);
+        draw_section(&mut f);
+    }
+    for m in Model::cloud_presets() {
+        let mut ai = f["values"]["integrations"]["ai"].as_object().cloned().unwrap();
+        push_model(&mut ai, &mut f, m);
+        f["values"]["integrations"]["ai"] = Value::Object(ai);
+        draw_section(&mut f);
+    }
+    crate::prefs_ui::confirm(&mut app, &f).unwrap();
+    let models = &app.session.prefs().integrations.ai.models;
+    assert_eq!(models.len(), 1 + Family::ALL.len() + Model::cloud_presets().len());
+    let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), models.len(), "ids are unique");
+    // A hostile draft is drawn without a panic.
+    for junk in [json!(null), json!([]), json!({"models": 7}), json!({"models": [1, "a", {"provider": "nope", "family": 3, "steps": "x"}], "comfyUrl": 9})] {
+        let mut f = f.clone();
+        f["values"]["integrations"]["ai"] = junk;
+        f.insert(SELECTED.into(), json!(99));
+        draw_section(&mut f);
+    }
+}
+
+#[test]
+fn the_gear_opens_manage_models_on_the_model_and_a_filter_selects_from_what_it_lists() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "gpt".into(), ..Model::cloud(Provider::Openai, "GPT Image 2.5 Flare", "gpt-image-2.5-flare", true) });
+    add_model(&mut app, z_image("z2"));
+    let fields = |app: &mut PhotocraftApp, model: &str| {
+        let id = open_settings(app, model);
+        app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields.clone()
+    };
+    let f = fields(&mut app, "gpt");
+    assert_eq!(
+        (f["section"].as_str(), f[PAGE].as_str(), f[FILTER].as_str(), f[SELECTED].as_u64()),
+        (Some("generativeAi"), Some("models"), Some("all"), Some(1))
+    );
+    let mut f = fields(&mut app, "z2");
+    assert_eq!((f[PAGE].as_str(), f[SELECTED].as_u64()), (Some("models"), Some(2)));
+    // Narrowed to Editing the list doesn't show Z-Image: it takes its first model, the cloud one.
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    f.insert(FILTER.into(), json!("edit"));
+    for _ in 0..2 {
+        ctx.run_ui(Default::default(), |ui| {
+            let mut values = f.get("values").cloned().unwrap();
+            prefs_section(ui, values.get_mut("integrations").and_then(Value::as_object_mut).unwrap(), &mut f, 480.0);
+            f.insert("values".into(), values);
+        })
+        .textures_delta
+        .clear();
+    }
+    assert_eq!((f[FILTER].as_str(), f[SELECTED].as_u64()), (Some("edit"), Some(1)));
+    // A filter that lists nothing says so, and selects nothing.
+    f.insert(FILTER.into(), json!("inpaint"));
+    ctx.run_ui(Default::default(), |ui| {
+        let mut values = f.get("values").cloned().unwrap();
+        prefs_section(ui, values.get_mut("integrations").and_then(Value::as_object_mut).unwrap(), &mut f, 480.0);
+    })
+    .textures_delta
+    .clear();
+    assert_eq!(f[SELECTED], 1, "the selection is kept for when the list shows it again");
+    // The local page reads a server on this machine once, without being asked.
+    let mut f = fields(&mut app, "z");
+    f.remove(ACTION);
+    ctx.run_ui(Default::default(), |ui| {
+        let mut values = f.get("values").cloned().unwrap();
+        prefs_section(ui, values.get_mut("integrations").and_then(Value::as_object_mut).unwrap(), &mut f, 480.0);
+    })
+    .textures_delta
+    .clear();
+    assert_eq!(f.get(ACTION), Some(&json!("peek")));
+    app.ui.ai_gen.server_files = None;
+    after_body(&mut app, &mut f);
+    assert!(f.get(FILES).is_some() && f.get(ACTION).is_none());
+    // What the dialog read is what the AI Gen panel goes by too: a model Scan Server adds there is
+    // offered without the panel having to look again.
+    assert_eq!(app.ui.ai_gen.server_files.as_ref().map(|files| json!(files)), f.get(FILES).cloned());
+    // An unknown page or filter falls back to the first; any height is one it can be drawn in.
+    f.insert(PAGE.into(), json!("nope"));
+    f.insert(FILTER.into(), json!("nope"));
+    draw_section(&mut f);
+    for height in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e9] {
+        ctx.run_ui(Default::default(), |ui| {
+            let mut values = f.get("values").cloned().unwrap();
+            prefs_section(ui, values.get_mut("integrations").and_then(Value::as_object_mut).unwrap(), &mut f, height);
+        })
+        .textures_delta
+        .clear();
+    }
+}
+
+/// A launcher that records what it was asked and "starts" at once.
+#[derive(Default)]
+struct FakeServer {
+    started: std::sync::atomic::AtomicBool,
+    ensured: Mutex<Vec<bool>>,
+}
+
+impl photocraft_aigen::LocalServer for FakeServer {
+    fn ensure(&self, _: &dyn Transport, settings: &Settings, _: &photocraft_aigen::Control<'_>) -> photocraft_aigen::Result<()> {
+        self.ensured.lock().unwrap().push(settings.comfy_autostart);
+        if settings.comfy_autostart {
+            self.started.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn stop(&self) -> bool {
+        self.started.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+    fn state(&self) -> photocraft_aigen::ServerState {
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) { photocraft_aigen::ServerState::Started } else { photocraft_aigen::ServerState::NotStarted }
+    }
+    fn find(&self, _: &dyn Transport, _: &str) -> photocraft_aigen::Result<photocraft_aigen::Launch> {
+        Ok(photocraft_aigen::Launch { python: "C:/comfy/.venv/Scripts/python.exe".into(), folder: "C:/comfy".into(), args: "main.py --enable-manager".into() })
+    }
+}
+
+#[test]
+fn the_server_page_finds_starts_and_stops_comfyui() {
+    let mut app = app();
+    let server = Arc::new(FakeServer::default());
+    app.session.ai.server = Some(server.clone());
+    let (_, mut f) = dialog_fields(&mut app);
+    // Find Installation fills the launch settings in and switches starting on.
+    f.insert(ACTION.into(), json!("find"));
+    after_body(&mut app, &mut f);
+    let ai = &f["values"]["integrations"]["ai"];
+    assert_eq!(ai["comfyLaunch"]["python"], "C:/comfy/.venv/Scripts/python.exe");
+    assert_eq!(ai["comfyLaunch"]["args"], "main.py --enable-manager");
+    assert_eq!(ai["comfyAutostart"], true);
+    // The result is reported under the button that was pressed.
+    assert_eq!(f[LAUNCH_STATUS]["error"], false);
+    assert!(f[LAUNCH_STATUS]["text"].as_str().unwrap().contains("Press OK"));
+    draw_section(&mut f);
+    // Opening the Manage Models page only looks: it must not start a server, or even ask to.
+    let asked = server.ensured.lock().unwrap().len();
+    f.insert(ACTION.into(), json!("peek"));
+    after_body(&mut app, &mut f);
+    assert_eq!(server.ensured.lock().unwrap().len(), asked);
+    assert_eq!(f[STARTED], false);
+    // With no server there, that look leaves a note about what will happen, not an error.
+    let up = app.session.ai.transport.take();
+    f.insert(ACTION.into(), json!("peek"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f[STATUS]["error"], false);
+    assert!(f[STATUS]["text"].as_str().unwrap().contains(crate::brand::display("PhotoCraft will start it")), "{}", f[STATUS]);
+    f["values"]["integrations"]["ai"]["comfyAutostart"] = json!(false);
+    f.insert(ACTION.into(), json!("peek"));
+    after_body(&mut app, &mut f);
+    assert!(f[STATUS]["text"].as_str().unwrap().contains("Engine page"), "{}", f[STATUS]);
+    // A long status wraps inside the page instead of running off it.
+    f.insert(STATUS.into(), json!({"error": true, "text": "word ".repeat(120)}));
+    draw_section(&mut f);
+    f["values"]["integrations"]["ai"]["comfyAutostart"] = json!(true);
+    app.session.ai.transport = up;
+    // Connect starts it (the draft says so), and says who did.
+    f.insert(ACTION.into(), json!("connect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(server.ensured.lock().unwrap().last(), Some(&true));
+    assert!(f[STATUS]["text"].as_str().unwrap().contains(crate::brand::display("started by PhotoCraft")), "{}", f[STATUS]);
+    after_body(&mut app, &mut f);
+    assert_eq!(f[STARTED], true);
+    draw_section(&mut f);
+    // Stop Server stops ours; a second press has nothing to stop and says so.
+    f.insert(ACTION.into(), json!("stop"));
+    after_body(&mut app, &mut f);
+    assert_eq!((f[STARTED].clone(), f[LAUNCH_STATUS]["error"].clone()), (json!(false), json!(false)));
+    f.insert(ACTION.into(), json!("stop"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f[LAUNCH_STATUS]["error"], true);
+    // The launch settings are saved with OK and survive a round trip.
+    crate::prefs_ui::confirm(&mut app, &f).unwrap();
+    let saved = &app.session.prefs().integrations.ai;
+    assert!(saved.comfy_autostart);
+    assert_eq!(saved.comfy_launch.folder, "C:/comfy");
+    // Without a launcher (web, tests) Find says so instead of failing oddly.
+    app.session.ai.server = None;
+    f.insert(ACTION.into(), json!("find"));
+    after_body(&mut app, &mut f);
+    assert!(f[LAUNCH_STATUS]["text"].as_str().unwrap().contains("desktop app"));
+    draw_section(&mut f);
+}
+
+#[test]
+fn scanning_repairs_a_model_set_up_as_the_wrong_architecture() {
+    /// A server with the Qwen Image 2.1 files.
+    struct Qwen;
+    impl Transport for Qwen {
+        fn send(&self, r: &Request) -> photocraft_aigen::Result<Response> {
+            let body: &[u8] = if r.url.ends_with("/models/diffusion_models") {
+                br#"["qwen_image_2.1_int8_convrot.safetensors"]"#
+            } else if r.url.ends_with("/models/text_encoders") {
+                br#"["qwen_2.5_vl_7b_fp8_scaled.safetensors","qwen3vl_8b_int8_convrot.safetensors"]"#
+            } else if r.url.ends_with("/models/vae") {
+                br#"["qwen_image_vae.safetensors","qwen_image_2.1_vae_bf16.safetensors"]"#
+            } else {
+                b"[]"
+            };
+            Ok(Response { status: 200, body: body.to_vec() })
+        }
+    }
+    let mut app = app();
+    app.session.ai.transport = Some(Arc::new(Qwen));
+    // As an older scan left it, with the user's own name and seed.
+    add_model(
+        &mut app,
+        Model { id: "q".into(), name: "my qwen".into(), seed: 7, unet: "qwen_image_2.1_int8_convrot.safetensors".into(), ..Family::QwenImage.preset() },
+    );
+    // Generating with it says what is wrong instead of failing in the sampler.
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    let e = app.run("ai.generate", json!({"prompt": "x", "model": "q"})).unwrap_err();
+    assert!(e.contains("Qwen Image 2.1 model") && e.contains("Scan Server"), "{e}");
+    // The panel says so under a disabled Generate, before anything is started.
+    app.ui.ai_gen.prompt = "x".into();
+    let broken = app.session.prefs().integrations.ai.models[0].clone();
+    assert!(generate_blocked(&app, &broken).unwrap().contains("Scan Server"));
+    // Scan Server fixes that entry in place: no second one beside it.
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    let models = f["values"]["integrations"]["ai"]["models"].as_array().unwrap().clone();
+    assert_eq!(models.len(), 1, "{models:?}");
+    assert_eq!((models[0]["id"].as_str(), models[0]["name"].as_str(), models[0]["seed"].as_i64()), (Some("q"), Some("my qwen"), Some(7)));
+    assert_eq!((models[0]["family"].as_str(), models[0]["clip"].as_str()), (Some("qwenImage21"), Some("qwen3vl_8b_int8_convrot.safetensors")));
+    assert_eq!(models[0]["vae"], "qwen_image_2.1_vae_bf16.safetensors");
+    assert!(f[STATUS]["text"].as_str().unwrap().contains("1 repaired"), "{}", f[STATUS]);
+    // A second scan has nothing left to do.
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f["values"]["integrations"]["ai"]["models"].as_array().unwrap().len(), 1);
+    assert!(!f[STATUS]["text"].as_str().unwrap().contains("repaired"));
+}
+
+#[test]
+fn the_page_divides_whatever_width_the_dialog_gives_it() {
+    let (list, field) = page_widths(540.0);
+    assert!((list - 216.0).abs() < 0.01 && field == 170.0, "{list} {field}");
+    let (list, field) = page_widths(830.0);
+    assert!(list > 300.0 && field > 300.0 && list + field + 160.0 <= 830.01, "{list} {field}");
+    for odd in [0.0, -5.0, f32::NAN, f32::INFINITY, 1e9] {
+        let (list, field) = page_widths(odd);
+        assert!((210.0..=340.0).contains(&list) && (170.0..=420.0).contains(&field), "{odd}: {list} {field}");
+    }
+}
+
+#[test]
+fn browse_fills_the_launch_settings_from_the_chosen_file() {
+    let mut app = app();
+    let (_, mut f) = dialog_fields(&mut app);
+    // Without a file dialog (tests, the web) Browse says so instead of doing nothing.
+    f.insert(ACTION.into(), json!("browseScript"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f[LAUNCH_STATUS]["error"], true);
+    // A chosen main.py sets the folder and the script, and asks for the other half.
+    picked(&mut f, "C:/nowhere/ComfyUI/main.py");
+    let launch = f["values"]["integrations"]["ai"]["comfyLaunch"].clone();
+    assert_eq!(launch["args"], "main.py");
+    assert!(launch["folder"].as_str().unwrap().replace('\\', "/").ends_with("nowhere/ComfyUI"));
+    assert!(f[LAUNCH_STATUS]["text"].as_str().unwrap().contains("Python"));
+    // Then the Python: both set, nothing else changed.
+    picked(&mut f, "C:/nowhere/ComfyUI/.venv/Scripts/python.exe");
+    let launch = f["values"]["integrations"]["ai"]["comfyLaunch"].clone();
+    assert!(launch["python"].as_str().unwrap().ends_with("python.exe"));
+    assert_eq!(launch["args"], "main.py");
+    assert_eq!(f[LAUNCH_STATUS]["error"], false);
+    assert!(f[LAUNCH_STATUS]["text"].as_str().unwrap().contains("Python and folder are set"));
+    draw_section(&mut f);
+    // With a dialog service the request asks for the right kind of file.
+    let asked: std::rc::Rc<std::cell::RefCell<Vec<crate::file_dialog::FileDialogRequest>>> = Default::default();
+    let log = asked.clone();
+    app.services.file_dialog = Some(Box::new(move |request, _, _| log.borrow_mut().push(request)));
+    f.insert(ACTION.into(), json!("browsePython"));
+    after_body(&mut app, &mut f);
+    let ctx = egui::Context::default();
+    app.poll_file_dialog(&ctx, None);
+    assert!(
+        matches!(asked.borrow().first(), Some(crate::file_dialog::FileDialogRequest::Open { multiple: false, extensions: Some(e), .. }) if e == &["exe"]),
+        "{:?}",
+        asked.borrow()
+    );
+}
+
+#[test]
+fn a_background_connect_reports_through_the_dialog() {
+    let mut app = app();
+    app.background_jobs = true;
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    assert!(f.get(JOB).is_some());
+    draw_section(&mut f);
+    // The job ends on its own thread; the dialog picks the result up when it has been applied.
+    for _ in 0..400 {
+        app.session.poll_jobs();
+        after_body(&mut app, &mut f);
+        if f.get(JOB).is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(f.get(JOB).is_none(), "the connect never finished");
+    assert_eq!(f[STATUS]["error"], false, "{}", f[STATUS]);
+    assert_eq!(f["values"]["integrations"]["ai"]["models"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn connect_reads_the_servers_files_and_detect_adds_its_models() {
+    let mut app = app();
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert(ACTION.into(), json!("connect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f[STATUS]["error"], false, "{}", f[STATUS]);
+    assert_eq!(f[FILES]["vae"], json!(["ae.safetensors", "qwen_3_4b.safetensors"]));
+    assert!(f["values"]["integrations"]["ai"]["models"].as_array().unwrap().is_empty());
+    draw_section(&mut f);
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    let models = f["values"]["integrations"]["ai"]["models"].as_array().unwrap().clone();
+    assert_eq!(models.len(), 3, "{models:?}");
+    assert_eq!(models[0]["unet"], "z_image_turbo_bf16.safetensors");
+    assert_eq!(models[0]["clip"], "qwen_3_4b.safetensors");
+    // The edit model is detected as one, not as a text-to-image model.
+    assert_eq!((&models[2]["unet"], &models[2]["family"]), (&json!("qwen_image_edit_2511_bf16.safetensors"), &json!("qwenEdit")));
+    // Detecting again adds nothing twice.
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f["values"]["integrations"]["ai"]["models"].as_array().unwrap().len(), 3);
+    draw_section(&mut f);
+    // A server that isn't there is reported in the dialog, not thrown.
+    app.session.ai.transport = None;
+    f.insert(ACTION.into(), json!("connect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f[STATUS]["error"], true);
+    draw_section(&mut f);
+}
+
+#[test]
+fn api_keys_are_saved_apart_from_the_preferences() {
+    let keys: Arc<Mutex<Option<String>>> = Arc::default();
+    let prefs: Arc<Mutex<Option<String>>> = Arc::default();
+    let (k1, k2, p1) = (keys.clone(), keys.clone(), prefs.clone());
+    let services = crate::Services {
+        load_ai_keys: Some(Box::new(move || k1.lock().unwrap().clone())),
+        save_ai_keys: Some(Box::new(move |s: &str| {
+            *k2.lock().unwrap() = Some(s.to_string());
+            Ok(())
+        })),
+        save_prefs: Some(Box::new(move |s: &str| {
+            *p1.lock().unwrap() = Some(s.to_string());
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let mut app = PhotocraftApp::new(Session::new(), services);
+    let (id, mut f) = dialog_fields(&mut app);
+    f[KEYS]["gemini"] = json!("g-secret-1");
+    draw_section(&mut f);
+    crate::prefs_ui::confirm(&mut app, &f).unwrap();
+    assert_eq!(app.session.ai.key(Provider::Gemini), "g-secret-1");
+    assert!(keys.lock().unwrap().as_deref().unwrap().contains("g-secret-1"));
+    assert!(!app.session.prefs_to_json().contains("g-secret"));
+    // The open dialog never holds a saved key, only that there is one.
+    if let Some(d) = app.ui.dialog_mut(id) {
+        d.fields = f.clone();
+    }
+    let (_, reopened) = dialog_fields(&mut app);
+    assert_eq!(reopened[KEYS]["geminiSaved"], true);
+    assert!(!Value::Object(reopened.clone()).to_string().contains("g-secret"));
+    // A new launch restores it from the keys file.
+    let k3 = keys.clone();
+    let mut again =
+        PhotocraftApp::new(Session::new(), crate::Services { load_ai_keys: Some(Box::new(move || k3.lock().unwrap().clone())), ..Default::default() });
+    load_keys(&mut again);
+    assert_eq!(again.session.ai.key(Provider::Gemini), "g-secret-1");
+    // Remove.
+    let mut f = reopened;
+    f[KEYS]["geminiRemove"] = json!(true);
+    crate::prefs_ui::confirm(&mut app, &f).unwrap();
+    assert!(!keys.lock().unwrap().as_deref().unwrap().contains("g-secret"));
+}
+
+#[test]
+fn a_long_reason_under_generate_fits_in_the_panel() {
+    let mut app = app();
+    // A model whose set-up can't run: the reason Generate is off is several lines long.
+    add_model(
+        &mut app,
+        Model {
+            id: "q".into(),
+            name: "qwen image 2.1 int8 convrot".into(),
+            unet: "qwen_image_2.1_int8_convrot.safetensors".into(),
+            // Ticked for inpainting, so a change offers it too.
+            inpaint: Some(true),
+            ..Family::QwenImage.preset()
+        },
+    );
+    app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+    app.ui.ai_gen.model = "q".into();
+    app.ui.ai_gen.prompt = "a long prompt\n".repeat(60);
+    let broken = app.session.prefs().integrations.ai.models[0].clone();
+    assert!(generate_blocked(&app, &broken).unwrap().len() > 150);
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    // Panels of several sizes, down to a short narrow one (the tabs, Prompt | Regions, the
+    // model, a two-line prompt, the Advanced heading, Generate and this reason): the notes
+    // always end inside.
+    for (w, h) in [(300.0, 420.0), (260.0, 360.0), (420.0, 700.0)] {
+        let mut overflow = 0.0f32;
+        for _ in 0..3 {
+            ctx.run_ui(Default::default(), |ui| {
+                let area = egui::Rect::from_min_size(ui.max_rect().min, vec2(w, h));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
+                // The content itself, as the dock group lays it out (there it scrolls only when
+                // even a two-line prompt box doesn't fit).
+                panel_body(&mut app, &mut child, Some(h));
+                overflow = child.min_rect().bottom() - area.bottom();
+            })
+            .textures_delta
+            .clear();
+        }
+        assert!(overflow <= 1.0, "{w}x{h}: the panel's content runs {overflow} points past its bottom");
+    }
+    // The same for a change, which has rows more (its tasks, the mask tools), and with the
+    // Advanced section open.
+    app.run("select.rect", json!({"x": 8, "y": 8, "width": 16, "height": 16})).unwrap();
+    app.ui.ai_gen.mode = Mode::Edit;
+    assert_eq!(technique(&app.ui.ai_gen, Some(&broken)), GenerationMode::Inpaint);
+    for (w, h, advanced) in [(300.0, 420.0, false), (260.0, 390.0, false), (300.0, 500.0, true)] {
+        app.ui.ai_gen.advanced = advanced;
+        let mut overflow = 0.0f32;
+        for _ in 0..3 {
+            ctx.run_ui(Default::default(), |ui| {
+                let area = egui::Rect::from_min_size(ui.max_rect().min, vec2(w, h));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
+                panel_body(&mut app, &mut child, Some(h));
+                overflow = child.min_rect().bottom() - area.bottom();
+            })
+            .textures_delta
+            .clear();
+        }
+        assert!(overflow <= 1.0, "change {w}x{h}: the panel's content runs {overflow} points past its bottom");
+    }
+}
+
+#[test]
+fn a_change_lists_the_models_that_edit_or_inpaint_and_keeps_its_own_choice() {
+    let mut app = app();
+    // Text-to-image models are not told where a selection is: they are offered for a change
+    // only when their inpainting box is ticked. FLUX.2 edits, and inpaints unless its box is
+    // unticked; the models made for inpainting are offered too, and in turn not to create.
+    add_model(&mut app, Model { id: "ernie".into(), ..Family::Ernie.preset() });
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "ticked".into(), inpaint: Some(true), ..Family::ZImage.preset() });
+    add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
+    add_model(&mut app, Model { id: "off".into(), inpaint: Some(false), ..Family::Flux2.preset() });
+    add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
+    add_model(&mut app, Model { id: "qwen".into(), ..Family::QwenInpaint.preset() });
+    let ids = |app: &PhotocraftApp| enabled_models(app).into_iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(ids(&app), ["ernie", "z", "ticked", "flux", "off"]);
+    app.ui.ai_gen.model = "ernie".into();
+    app.ui.ai_gen.mode = Mode::Edit;
+    assert_eq!(ids(&app), ["ticked", "flux", "off", "fill", "qwen"]);
+    draw_panel(&mut app);
+    // A change has its own model: choosing one leaves the model of Create alone.
+    assert_eq!((app.ui.ai_gen.edit_model.as_str(), app.ui.ai_gen.model.as_str()), ("ticked", "ernie"));
+    app.ui.ai_gen.edit_model = "fill".into();
+    draw_panel(&mut app);
+    assert_eq!((app.ui.ai_gen.chosen(), current_model(&app).map(|m| m.id.as_str())), ("fill", Some("fill")));
+    // Restyle lists the models that generate, and shares the model of Create.
+    app.ui.ai_gen.task = EditTask::Restyle;
+    assert_eq!(ids(&app), ["ernie", "z", "ticked", "flux", "off"]);
+    app.ui.ai_gen.mode = Mode::Create;
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.chosen(), "ernie");
+    // What the engine is asked for follows from the task and from what the model can do.
+    let model = |id: &str| app.session.prefs().integrations.ai.models.iter().find(|m| m.id == id).cloned().unwrap();
+    let mut ui = AiGenUi::default();
+    assert_eq!(technique(&ui, Some(&model("fill"))), GenerationMode::Txt2img);
+    ui.mode = Mode::Edit;
+    let asked = |ui: &AiGenUi| ["ticked", "flux", "off", "fill", "qwen"].map(|id| technique(ui, Some(&model(id))));
+    use GenerationMode::{Img2img, ImgEdit, Inpaint};
+    // An edit model is given an instruction, a model that only inpaints the selection as its mask.
+    assert_eq!(asked(&ui), [Inpaint, ImgEdit, ImgEdit, Inpaint, Inpaint]);
+    // The method is a choice only for a model that does both (FLUX.2 with its box on).
+    assert_eq!(["ticked", "flux", "off", "fill", "qwen"].map(|id| both_ways(&model(id))), [false, true, false, false, false]);
+    ui.method = Method::Fill;
+    assert_eq!(asked(&ui), [Inpaint, Inpaint, ImgEdit, Inpaint, Inpaint]);
+    assert_eq!(technique(&ui, None), ImgEdit, "no model to ask: as an instruction");
+    ui.task = EditTask::Restyle;
+    assert_eq!(asked(&ui), [Img2img; 5]);
+    // No model that can: the panel says so instead of offering a list of nothing.
+    let only = vec![Model { id: "ernie".into(), ..Family::Ernie.preset() }];
+    app.run("prefs.set", json!({"path": "integrations.ai.models", "value": only})).unwrap();
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.task = EditTask::Change;
+    assert!(ids(&app).is_empty() && current_model(&app).is_none());
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.mode, Mode::Edit);
+    assert!(generate(&mut app).unwrap_err().contains("No AI model"));
+    // The state names the tabs and tasks; the tabs of an earlier build, one per technique, load.
+    assert_eq!(serde_json::to_value(Mode::ALL).unwrap(), json!(["create", "edit"]));
+    assert_eq!(serde_json::to_value((EditTask::ALL, [Method::Instruct, Method::Fill])).unwrap(), json!([["change", "restyle"], ["instruct", "fill"]]));
+    for (saved, mode) in [("txt2img", Mode::Create), ("inpaint", Mode::Edit), ("img2img", Mode::Edit), ("imgEdit", Mode::Edit), ("edit", Mode::Edit)] {
+        let old: AiGenUi = serde_json::from_value(json!({"mode": saved, "inpaintModel": "gone"})).unwrap();
+        assert_eq!(old, AiGenUi { mode, ..Default::default() }, "{saved}");
+    }
+    let old: AiGenUi = serde_json::from_value(json!({"prompt": "x"})).unwrap();
+    assert_eq!((old.mode, old.task, old.method, old.strength, old.context), (Mode::Create, EditTask::Change, Method::Instruct, 1.0, 0.25));
+    let hostile = AiGenUi { strength: f64::NAN, context: -7.0, ..Default::default() };
+    assert_eq!((hostile.strength(), hostile.context()), (1.0, 0.0));
+}
+
+#[test]
+fn inpainting_from_the_panel_needs_a_selection_on_a_pixel_layer_and_adds_a_masked_layer() {
+    let mut app = app();
+    let z = Model { inpaint: Some(true), ..z_image("z") };
+    add_model(&mut app, z.clone());
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    // A model that inpaints and does not edit: a change with it is an inpainting.
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.prompt = "a pond".into();
+    // No selection: Generate is off and says what to do.
+    assert!(generate_blocked(&app, &z).unwrap().contains("needs a selection"));
+    assert_eq!(target_size(&app), Some((64, 48, false)));
+    draw_panel(&mut app);
+    app.run("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    assert_eq!(generate_blocked(&app, &z), None);
+    // The model renders the selection with a quarter of its edge of context on every side.
+    assert_eq!(target_size(&app), Some((24, 24, true)));
+    app.ui.ai_gen.context = 0.0;
+    assert_eq!(target_size(&app), Some((16, 16, true)));
+    app.ui.ai_gen.context = 0.5;
+    // An empty layer has nothing to repaint.
+    app.run("layer.new.layer", json!({})).unwrap();
+    assert!(generate_blocked(&app, &z).unwrap().contains("is empty inside the selection"));
+    draw_panel(&mut app);
+    app.run("edit.undo", json!({})).unwrap();
+    // A custom workflow ticked for inpainting but without an image to load can't.
+    let custom = Model {
+        family: Family::Custom,
+        name: "Mine".into(),
+        inpaint: Some(true),
+        workflow: r#"{"1":{"class_type":"X","inputs":{"t":"%prompt%"}}}"#.into(),
+        ..Model::default()
+    };
+    assert!(generate_blocked(&app, &custom).unwrap().contains("%image%"));
+    app.ui.ai_gen.strength = 0.6;
+    let before = app.session.active().unwrap().doc.layers.len();
+    draw_panel(&mut app);
+    let r = generate(&mut app).unwrap();
+    assert_eq!((r["mode"].as_str(), r["model"].as_str()), (Some("inpaint"), Some("z")));
+    assert_eq!(r["bounds"], json!([16, 8, 32, 32]));
+    let d = app.session.active().unwrap();
+    assert_eq!(d.doc.layers.len(), before + 1);
+    assert!(d.doc.layer(d.active_layer.unwrap()).unwrap().mask.is_some());
+    // The same button on the other tab is text to image, as before.
+    app.ui.ai_gen.mode = Mode::Create;
+    assert_eq!(generate(&mut app).unwrap()["mode"], "txt2img");
+}
+
+#[test]
+fn the_inpainting_box_follows_the_architecture_until_it_is_used() {
+    let mut app = app();
+    add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
+    add_model(&mut app, Model { id: "ernie".into(), ..Family::Ernie.preset() });
+    let (_, mut f) = dialog_fields(&mut app);
+    draw_section(&mut f);
+    // Drawing the settings stores no choice: the models keep following their architecture.
+    let models: Vec<Model> = serde_json::from_value(f["values"]["integrations"]["ai"]["models"].clone()).unwrap();
+    assert_eq!(models.iter().map(|m| (m.inpaint, m.can_inpaint())).collect::<Vec<_>>(), [(None, true), (None, false)]);
+}
+
+/// The height the docked panel asks for (`panel_docking`'s `dock_heights`) grows with the rows it
+/// shows, so its Generate button stays in view.
+#[test]
+fn the_panel_asks_for_room_for_its_generate_button() {
+    let mut app = app();
+    let base = wanted_height(&app);
+    assert!(base.is_finite() && base > crate::dock::Group::Properties.compact_height(), "{base}");
+    // A change has a row more: the mask tools (Edit's tasks take the place of Create's Prompt |
+    // Regions). Advanced, open, adds its own.
+    add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
+    app.ui.ai_gen.mode = Mode::Edit;
+    assert_eq!(wanted_height(&app), base + ROW);
+    app.ui.ai_gen.advanced = true;
+    // (The strength and context, the seed, and the LoRAs heading of a local model.)
+    assert_eq!(wanted_height(&app), base + 4.0 * ROW);
+    // A model that changes a picture both ways has the method to choose as well.
+    add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
+    app.ui.ai_gen.edit_model = "flux".into();
+    app.ui.ai_gen.method = Method::Fill;
+    assert_eq!(wanted_height(&app), base + 5.0 * ROW);
+    // Create: the seed, Alpha Channel and the LoRAs heading.
+    app.ui.ai_gen.mode = Mode::Create;
+    assert_eq!(wanted_height(&app), base + 3.0 * ROW);
+}
+
+#[test]
+fn the_list_says_what_each_model_is_used_for_and_can_be_narrowed_to_it() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "gpt".into(), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
+    add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
+    add_model(&mut app, Model { id: "qwen".into(), ..Family::QwenInpaint.preset() });
+    add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
+    // One page lists every model; the pages for local, inpainting and cloud models are gone.
+    assert_eq!(PAGES.map(|(key, title)| (key, title)), [("models", "Manage Models"), ("keys", "API Keys"), ("enhance", "Prompt Enhancement"), ("server", "Engine"), ("folders", "Model Folders")]);
+    let models = app.session.prefs().integrations.ai.models.clone();
+    let listed = |filter: Filter| models.iter().filter(|m| filter.shows(Some(m))).map(|m| m.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(listed(Filter::All), ["z", "gpt", "fill", "qwen", "flux"]);
+    assert_eq!(listed(Filter::Create), ["z", "gpt", "flux"]);
+    assert_eq!(listed(Filter::Edit), ["gpt", "flux"]);
+    assert_eq!(listed(Filter::Inpaint), ["fill", "qwen", "flux"]);
+    assert_eq!(
+        models.iter().map(|m| uses(m).join(", ")).collect::<Vec<_>>(),
+        ["Text to image", "Text to image, Editing", "Inpainting", "Inpainting", "Text to image, Editing, Inpainting"]
+    );
+    // Ticking Supports inpainting moves a model under that filter too.
+    assert!(Filter::Inpaint.shows(Some(&Model { inpaint: Some(true), ..z_image("z") })));
+    // An entry that doesn't read as a model is listed under All only, where it can be removed.
+    assert!(model_of(&json!({"provider": "nope"})).is_none() && model_of(&json!(7)).is_none());
+    assert!(Filter::All.shows(None) && Filter::ALL.into_iter().filter(|x| x.shows(None)).count() == 1);
+    for x in Filter::ALL {
+        assert_eq!(Filter::from_key(x.key()), x);
+        assert!(!x.title().is_empty() && !x.hint().is_empty());
+    }
+    assert_eq!(Filter::from_key("?"), Filter::All);
+    // The gear on a model opens the list with it selected, whatever it is used for.
+    let id = open_settings(&mut app, "qwen");
+    let mut f = app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields.clone();
+    assert_eq!((f[PAGE].as_str(), f[FILTER].as_str(), f[SELECTED].as_u64()), (Some("models"), Some("all"), Some(3)));
+    // Drawing under every filter keeps the models as they are (the ControlNet row included).
+    for x in Filter::ALL {
+        f.insert(FILTER.into(), json!(x.key()));
+        draw_section(&mut f);
+    }
+    let after: Vec<Model> = serde_json::from_value(f["values"]["integrations"]["ai"]["models"].clone()).unwrap();
+    assert_eq!(after, app.session.prefs().integrations.ai.models);
+    assert_eq!(after[3].controlnet, "Qwen-Image-InstantX-ControlNet-Inpainting.safetensors");
+    // Add Model offers everything in one menu, grouped: cloud models, the local architectures,
+    // and the three models of ComfyUI's inpainting templates.
+    let groups = add_presets();
+    assert_eq!(groups.iter().map(|(heading, _)| *heading).collect::<Vec<_>>(), ["Cloud", "Local", "Local, made for inpainting"]);
+    assert_eq!((groups[0].1.len(), groups[1].1.len()), (Model::cloud_presets().len(), Family::ALL.len() - 2));
+    assert!(groups[0].1.iter().all(|(_, m)| !m.provider.is_local()) && groups[1].1.iter().all(|(_, m)| m.provider.is_local() && !m.family.inpaint_only()));
+    assert_eq!(
+        groups[2].1.iter().map(|(title, _)| title.as_str()).collect::<Vec<_>>(),
+        ["FLUX.1 Fill Dev", "FLUX.1 Fill OneReward", "Qwen Image InstantX Inpainting"]
+    );
+    assert!(groups[2].1.iter().all(|(_, m)| m.can_inpaint() && !m.can_generate()));
+    // Nano Banana 2.1 and GPT Image 2 are among the cloud models on offer.
+    let offered: Vec<(&str, &str)> = groups[0].1.iter().map(|(title, m)| (title.as_str(), m.api_model.as_str())).collect();
+    assert!(
+        offered.contains(&("Nano Banana 2.1 (Google Gemini)", "gemini-nano-banana-2.1")) && offered.contains(&("GPT Image 2 (OpenAI)", "gpt-image-2")),
+        "{offered:?}"
+    );
+    // A scan adds the server's inpainting models next to its text-to-image ones.
+    let folders = json!({
+        "diffusion_models": ["z_image_turbo_bf16.safetensors", "flux1-fill-dev.safetensors", "qwen_image_fp8_e4m3fn.safetensors"],
+        "controlnet": ["Qwen-Image-InstantX-ControlNet-Inpainting.safetensors"],
+    });
+    let (_, mut fresh) = dialog_fields(&mut app);
+    *fresh.get_mut("values").and_then(|v| v.pointer_mut("/integrations/ai/models")).unwrap() = json!([]);
+    let (added, repaired, matched) = add_detected(&mut fresh, &folders);
+    let found: Vec<Model> = serde_json::from_value(fresh["values"]["integrations"]["ai"]["models"].clone()).unwrap();
+    assert_eq!((added, repaired, matched), (found.len(), 0, 0));
+    assert_eq!(found.iter().filter(|m| m.family.inpaint_only()).map(|m| m.family).collect::<Vec<_>>(), [Family::Flux1Fill, Family::QwenInpaint]);
+    // With no model that edits or inpaints, a change says how to get one (and draws).
+    app.run("prefs.set", json!({"path": "integrations.ai.models", "value": [z_image("z")]})).unwrap();
+    app.ui.ai_gen.mode = Mode::Edit;
+    assert!(enabled_models(&app).is_empty());
+    draw_panel(&mut app);
+}
+
+#[test]
+fn image_to_image_from_the_panel_picks_a_layer_or_another_document() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.task = EditTask::Restyle;
+    app.ui.ai_gen.prompt = "as a watercolour".into();
+    // The models that generate are offered; one made for inpainting is not.
+    assert_eq!(enabled_models(&app).into_iter().map(|m| m.id).collect::<Vec<_>>(), ["z"]);
+    let z = z_image("z");
+    // No document, then one with nothing in it: Generate is off and says what is missing.
+    draw_panel(&mut app);
+    app.run("file.new", json!({"width": 40, "height": 30, "background": "transparent"})).unwrap();
+    assert!(generate_blocked(&app, &z).unwrap().contains("needs a picture to start from"));
+    assert_eq!((img_source(&app), target_size(&app)), (None, None));
+    draw_panel(&mut app);
+    // A second document with an image: the first now has a source, the other document.
+    let empty_doc = app.session.active().unwrap().doc.id.0;
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let pictured = app.session.active().unwrap().doc.id.0;
+    let background = app.session.active().unwrap().active_layer.unwrap().0;
+    // Here the active layer has pixels: it is the source, redrawn over its own extent.
+    assert_eq!(img_source(&app), Some(SourceRef::Layer(background)));
+    assert_eq!((generate_blocked(&app, &z), target_size(&app)), (None, Some((64, 48, false))));
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.img_source, Some(SourceRef::Layer(background)));
+    // The other document is empty: it is no picture, and is not offered.
+    let offered = photocraft_engine::ai_cmds::img2img_sources(&app.session);
+    assert_eq!(offered.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [SourceRef::Layer(background)]);
+    assert!(offered[0].1.starts_with("Layer: "));
+    assert!(photocraft_engine::ai_cmds::img2img_plan(&app.session, Some(SourceRef::Document(empty_doc)), None).err().unwrap().contains("is empty"));
+    // A selection narrows the area, and masks the result.
+    app.run("select.rect", json!({"x": 8, "y": 4, "width": 20, "height": 10})).unwrap();
+    assert_eq!(target_size(&app), Some((20, 10, true)));
+    app.ui.ai_gen.img_strength = 0.4;
+    let before = app.session.active().unwrap().doc.layers.len();
+    draw_panel(&mut app);
+    let r = generate(&mut app).unwrap();
+    assert_eq!((r["mode"].as_str(), r["bounds"].clone()), (Some("img2img"), json!([8, 4, 20, 10])));
+    assert_eq!(app.session.active().unwrap().doc.layers.len(), before + 1);
+    // Back in the first document the chosen layer is not there: the panel falls back to what
+    // that document offers, the other document, and generating uses it.
+    let first = app.session.documents().iter().position(|d| d.doc.id.0 == empty_doc).unwrap();
+    app.run("document.activate", json!({"document": first})).unwrap();
+    assert_eq!(app.session.active().unwrap().doc.id.0, empty_doc);
+    assert_eq!(img_source(&app), Some(SourceRef::Document(pictured)));
+    assert_eq!(target_size(&app), Some((40, 30, false)));
+    draw_panel(&mut app);
+    let r = generate(&mut app).unwrap();
+    assert_eq!((r["mode"].as_str(), r["bounds"].clone()), (Some("img2img"), json!([0, 0, 40, 30])));
+    // The state reads and writes like the engine names a source; hostile values are tamed.
+    let state = serde_json::to_value(&app.ui.ai_gen).unwrap();
+    assert_eq!(state["imgSource"], json!({"document": pictured}));
+    let old: AiGenUi = serde_json::from_value(json!({"prompt": "x"})).unwrap();
+    assert_eq!((old.img_source, old.img_strength), (None, 0.6));
+    assert_eq!(AiGenUi { img_strength: f64::NAN, ..Default::default() }.img_strength(), 0.6);
+    // The dock gives the task its rows: the Source picker (Edit's tasks take the place of Create's row).
+    assert_eq!(
+        wanted_height(&app),
+        {
+            app.ui.ai_gen.mode = Mode::Create;
+            wanted_height(&app)
+        } + ROW
+    );
+}
+
+#[test]
+fn the_mask_tools_mark_what_to_repaint_from_the_panel() {
+    use crate::state::Tool;
+    let mut app = app();
+    add_model(&mut app, Model { inpaint: Some(true), ..z_image("z") });
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.prompt = "a boat".into();
+    // No document: the bar draws, disabled.
+    draw_panel(&mut app);
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    draw_panel(&mut app);
+    let z = Model { inpaint: Some(true), ..z_image("z") };
+    assert!(generate_blocked(&app, &z).unwrap().contains("mask tools under the prompt"));
+    // Outside the brush mode a stroke is the user's own: their colours, their eraser.
+    let mut stroke = json!({"points": [[1, 1]], "erase": true});
+    mask_stroke(&app, true, &mut stroke);
+    assert_eq!(stroke, json!({"points": [[1, 1]], "erase": true}));
+    // The brush: what the bar's button does.
+    app.run("ai.mask", json!({"paint": true})).unwrap();
+    app.ui.ai_gen.mask_brush = true;
+    app.ui.tool = Tool::Brush;
+    assert!(mask_brushing(&app));
+    draw_panel(&mut app);
+    assert!(app.ui.ai_gen.mask_brush, "the mode survives drawing");
+    // Now the Brush paints the mask in and the Eraser paints it out, whatever the colours are.
+    let mut add = json!({"points": [[20, 20], [40, 20]], "erase": false, "target": "quickMask", "size": 12});
+    mask_stroke(&app, false, &mut add);
+    assert_eq!((add["color"].as_str(), add["erase"].as_bool()), (Some("#ffffff"), Some(false)));
+    let mut take = json!({"points": [[20, 20]], "erase": true});
+    mask_stroke(&app, true, &mut take);
+    assert_eq!((take["color"].as_str(), take["erase"].as_bool()), (Some("#000000"), Some(false)));
+    app.run("paint.stroke", add).unwrap();
+    assert!(photocraft_engine::ai_cmds::inpaint_marked(&app.session));
+    assert_eq!(generate_blocked(&app, &z), None);
+    draw_panel(&mut app);
+    // The note sizes what will be rendered from the painted mask.
+    let (w, h, selection) = target_size(&app).unwrap();
+    assert!(w >= 28 && h >= 8 && !selection, "{w}x{h}");
+    // Generate turns the mask into the selection and the new layer's mask, and ends the mode.
+    let before = app.session.active().unwrap().doc.layers.len();
+    let r = generate(&mut app).unwrap();
+    assert_eq!(r["mode"], "inpaint");
+    let d = app.session.active().unwrap();
+    assert_eq!(d.doc.layers.len(), before + 1);
+    assert!(d.doc.quick_mask.is_none() && d.doc.selection.is_some() && d.doc.layer(d.active_layer.unwrap()).unwrap().mask.is_some());
+    draw_panel(&mut app);
+    assert!(!app.ui.ai_gen.mask_brush && !mask_brushing(&app));
+    // Quick Mask the user entered themselves is theirs: the panel's brush mode is not on.
+    app.run("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+    app.ui.ai_gen.mask_brush = true;
+    assert!(!mask_brushing(&app));
+    // The dock makes room for the bar (Edit's tasks take the place of Create's row).
+    assert_eq!(
+        wanted_height(&app),
+        {
+            app.ui.ai_gen.mode = Mode::Create;
+            wanted_height(&app)
+        } + ROW
+    );
+}
+
+#[test]
+fn editing_from_the_panel_picks_a_source_references_and_a_quality() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    add_model(&mut app, Model { id: "edit".into(), ..Family::QwenEdit.preset() });
+    add_model(&mut app, Model { id: "gpt-image-2".into(), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.prompt = "make the sky stormy".into();
+    // The models that edit are offered, local and cloud; one that only generates is not, and an
+    // edit model is offered nowhere else.
+    let ids = |app: &PhotocraftApp| enabled_models(app).into_iter().map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(ids(&app), ["gpt-image-2", "q21", "edit"]);
+    for (mode, task) in [(Mode::Create, EditTask::Change), (Mode::Edit, EditTask::Restyle)] {
+        (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (mode, task);
+        assert_eq!(ids(&app), ["gpt-image-2", "z", "q21"], "{mode:?} {task:?}");
+    }
+    (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (Mode::Edit, EditTask::Change);
+    let q21 = Model { id: "q21".into(), ..Family::QwenImage21.preset() };
+    // None chosen: Change runs Qwen Image 2.1, the recommended edit model, though a cloud model
+    // is listed first; Create runs the first.
+    app.ui.ai_gen.edit_model = String::new();
+    assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("q21"));
+    app.ui.ai_gen.mode = Mode::Create;
+    assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("gpt-image-2"));
+    app.ui.ai_gen.mode = Mode::Edit;
+    // No document, then one with nothing in it: Generate is off and says what is missing.
+    app.ui.ai_gen.edit_model = "q21".into();
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.edit_model, "q21", "a change keeps its own choice of model");
+    app.run("file.new", json!({"width": 40, "height": 30, "background": "transparent"})).unwrap();
+    assert!(generate_blocked(&app, &q21).unwrap().contains("Editing needs a picture"));
+    assert_eq!((edit_source(&app), target_size(&app)), (None, None));
+    draw_panel(&mut app);
+    // A model that can't edit says so (a state set from outside may name one).
+    assert!(generate_blocked(&app, &z_image("z")).is_some());
+    // A document with an image: its active layer is the source, the document itself is offered.
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let doc = app.session.active().unwrap().doc.id.0;
+    let background = app.session.active().unwrap().active_layer.unwrap().0;
+    assert_eq!(edit_source(&app), Some(SourceRef::Layer(background)));
+    assert_eq!((generate_blocked(&app, &q21), target_size(&app)), (None, Some((64, 48, false))));
+    let offered: Vec<SourceRef> = photocraft_engine::ai_cmds::edit_sources(&app.session).into_iter().map(|(s, _)| s).collect();
+    assert_eq!(offered, [SourceRef::Document(doc), SourceRef::Layer(background)]);
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.edit_source, Some(SourceRef::Layer(background)));
+    // A selection scopes the edit: the model is sent it with a quarter of its edge around it.
+    app.run("select.rect", json!({"x": 16, "y": 12, "width": 16, "height": 16})).unwrap();
+    assert_eq!(target_size(&app), Some((24, 24, true)));
+    // References: the document's own (ai.setReferences), sent when the prompt names none.
+    app.run("ai.setReferences", json!({"references": [{"document": doc}, {"layer": background}, {"document": doc}]})).unwrap();
+    draw_panel(&mut app);
+    assert_eq!(refs::kept(&app.session).len(), 3);
+    // Qwen Image Edit takes two: Generate says to name the ones to send.
+    app.ui.ai_gen.edit_model = "edit".into();
+    let edit = current_model(&app).cloned().unwrap();
+    assert!(generate_blocked(&app, &edit).unwrap().contains("takes fewer references"), "{:?}", generate_blocked(&app, &edit));
+    draw_panel(&mut app);
+    app.run("ai.setReferences", json!({"references": [{"keep": 0}, {"keep": 1}]})).unwrap();
+    app.ui.ai_gen.edit_model = "q21".into();
+    app.ui.ai_gen.edit_quality = GenerationQuality::Draft;
+    let before = app.session.active().unwrap().doc.layers.len();
+    let r = generate(&mut app).unwrap();
+    assert_eq!((r["mode"].as_str(), r["model"].as_str(), r["bounds"].clone()), (Some("imgEdit"), Some("q21"), json!([12, 8, 24, 24])));
+    assert_eq!(app.session.active().unwrap().doc.layers.len(), before + 1);
+    let made = {
+        let d = app.session.active().unwrap();
+        let layer = d.doc.layer(d.active_layer.unwrap()).unwrap();
+        assert!(layer.mask.is_some(), "the selection becomes the layer's mask");
+        layer.generation.clone().unwrap()
+    };
+    // The layer keeps its own document's layer as one (what a saved file keeps).
+    assert_eq!(made.references, [photocraft_doc::GenerationSource::Document(doc).into(), photocraft_doc::GenerationSource::Layer(background).into()]);
+    assert_eq!((made.quality, made.prompt.as_str()), (GenerationQuality::Draft, "make the sky stormy"));
+    // Load Prompt puts the edit's prompt and model back, and only those: the tab, source,
+    // references and quality stay as they are.
+    let layer = r["layer"].as_u64().unwrap();
+    (app.ui.ai_gen.prompt, app.ui.ai_gen.mode, app.ui.ai_gen.edit_model) = ("something else".into(), Mode::Create, "z".into());
+    let kept = app.ui.ai_gen.clone();
+    assert!(load_prompt(&mut app, layer));
+    assert_eq!(app.ui.ai_gen, AiGenUi { prompt: "make the sky stormy".into(), edit_model: "q21".into(), ..kept });
+    (app.ui.ai_gen.mode, app.ui.ai_gen.edit_model) = (Mode::Edit, "q21".into());
+    draw_panel(&mut app);
+    // A cloud model edits too (its quality is its own setting); so does every tab's draw.
+    app.ui.ai_gen.edit_model = "gpt-image-2".into();
+    draw_panel(&mut app);
+    // The state reads and writes like the engine names things; an old state has none of it, and
+    // references an old state kept are no longer the panel's.
+    let state = serde_json::to_value(&app.ui.ai_gen).unwrap();
+    assert_eq!((&state["editSource"], &state["editQuality"]), (&json!({"layer": background}), &json!("draft")));
+    let old: AiGenUi = serde_json::from_value(json!({"prompt": "x", "mode": "imgEdit", "editReferences": [{"layer": 3}]})).unwrap();
+    assert_eq!((old.mode, old.edit_source, old.edit_quality), (Mode::Edit, None, GenerationQuality::Standard));
+    // The dock gives the task its rows: the source, the chips and the mask tools (Edit's tasks
+    // take the place of Create's row); a chip open shows its name and picture too.
+    let tall = wanted_height(&app);
+    app.ui.ai_gen.editing_ref = Some(0);
+    assert_eq!(wanted_height(&app), tall + 2.0 * ROW);
+    app.ui.ai_gen.editing_ref = Some(5);
+    assert_eq!(wanted_height(&app), tall, "a chip that is gone is not open");
+    app.ui.ai_gen.mode = Mode::Create;
+    assert_eq!(tall, wanted_height(&app) + 3.0 * ROW);
+}
+
+#[test]
+fn references_are_named_chips_the_document_keeps() {
+    let mut app = app();
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    // A picture to change, a layer to refer to, and another document with a layer of its own.
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let here = app.session.active().unwrap().doc.id.0;
+    let background = app.session.active().unwrap().active_layer.unwrap().0;
+    app.run("layer.new.layer", json!({"name": "Max"})).unwrap();
+    app.run("select.rect", json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap();
+    app.run("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    app.run("select.deselect", json!({})).unwrap();
+    let max = app.session.active().unwrap().active_layer.unwrap().0;
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    let there = app.session.active().unwrap().doc.id.0;
+    app.run("layer.new.layer", json!({"name": "Luna"})).unwrap();
+    app.run("select.rect", json!({"x": 4, "y": 4, "width": 8, "height": 20})).unwrap();
+    app.run("edit.fill", json!({"color": "#0000ff"})).unwrap();
+    app.run("select.deselect", json!({})).unwrap();
+    let luna = app.session.active().unwrap().active_layer.unwrap().0;
+    assert!(app.session.set_active(0));
+    app.run("layer.select", json!({"layer": background})).unwrap();
+    (app.ui.ai_gen.mode, app.ui.ai_gen.task, app.ui.ai_gen.edit_model) = (Mode::Edit, EditTask::Change, "q21".into());
+    // The other document's layer is on offer, after its document.
+    let offered = refs::offered(&app.session);
+    let theirs = SourceRef::DocumentLayer { document: there, layer: luna };
+    let at = offered.iter().position(|(r, _)| *r == SourceRef::Document(there)).unwrap();
+    assert_eq!(offered[at + 1].0, theirs);
+    // Chips are named after their pictures, and names don't clash.
+    assert_eq!(photocraft_engine::ai_cmds::reference_name(&app.session, theirs), "Luna");
+    assert_eq!(
+        (refs::unique("Luna", &["luna", "Luna2"]), refs::unique("Luna", &["Max"]), refs::unique("", &[""])),
+        ("Luna3".into(), "Luna".into(), String::new())
+    );
+    assert_eq!(refs::unique(&"x".repeat(24), &[&"x".repeat(24)]).chars().count(), 24);
+    // Setting them from the panel: another document's layer is copied in, this one's is kept as
+    // a layer.
+    let entries = [
+        refs::Entry::New(theirs, "Luna".into()),
+        refs::Entry::New(SourceRef::DocumentLayer { document: here, layer: max }, "Max".into()),
+        refs::Entry::New(SourceRef::Document(there), String::new()),
+    ];
+    assert!(refs::set(&mut app, &entries, None));
+    let kept = refs::kept(&app.session);
+    assert!(matches!(kept[0].picture, AiPicture::Image { .. }) && kept[1].picture == AiPicture::Layer(max), "{kept:?}");
+    draw_panel(&mut app);
+    assert_eq!(refs::kept(&app.session).len(), 3);
+    // Generating sends the document's references; the engine sends the mentioned ones, the copy
+    // as it was kept.
+    app.ui.ai_gen.prompt = "@Luna sits beside @Max".into();
+    let q21 = current_model(&app).cloned().unwrap();
+    assert_eq!(generate_blocked(&app, &q21), None);
+    let r = generate(&mut app).unwrap();
+    assert_eq!(r["modelPrompt"], "Luna (image 2) sits beside Max (image 3)");
+    // Two alike can't be set: the document keeps its references as they were.
+    let twice = [refs::Entry::Keep(0, "Luna".into()), refs::Entry::Keep(1, "LUNA".into())];
+    assert!(!refs::set(&mut app, &twice, None));
+    assert_eq!(refs::kept(&app.session).len(), 3);
+    // The other document closed: the copy stays (it is this document's), as do the others.
+    assert!(app.session.close(1).is_some());
+    draw_panel(&mut app);
+    assert_eq!(refs::kept(&app.session).iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Luna", "Max", ""]);
+    // An open chip draws its name and picture; taking one out and undoing it are History steps.
+    app.ui.ai_gen.editing_ref = Some(1);
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.editing_ref, Some(1));
+    assert!(refs::set(&mut app, &[refs::Entry::Keep(1, "Max".into())], None));
+    assert_eq!(refs::kept(&app.session).len(), 1);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(refs::kept(&app.session).len(), 3);
+    // A rename typed letter by letter is one step.
+    for name in ["M", "Ma", "Mal"] {
+        assert!(refs::set(
+            &mut app,
+            &[refs::Entry::Keep(0, "Luna".into()), refs::Entry::Keep(1, name.into()), refs::Entry::Keep(2, String::new())],
+            Some("ai-ref-name-1".into())
+        ));
+    }
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(refs::kept(&app.session)[1].name, "Max");
+}
+
+/// The prompt names references with @: what it sends, how it shows them, and the names it offers.
+#[test]
+fn the_prompt_mentions_references_by_name_and_offers_them_after_an_at() {
+    // What the prompt sends: all of them while it mentions none, then those it mentions.
+    let names = ["Luna", "Max", ""];
+    use refs::Sent::{All, Mentioned, No};
+    assert_eq!(refs::sent("put image 4 behind them", &names), [(All, Some(2)), (All, Some(3)), (All, Some(4))]);
+    assert_eq!(refs::sent("@max hugs @Luna", &names), [(Mentioned, Some(2)), (Mentioned, Some(3)), (No, None)]);
+    assert_eq!(refs::sent("@Max waves", &names), [(No, None), (Mentioned, Some(2)), (No, None)]);
+    // The prompt shows a mention in the accent colour, on a tint; other @words stay plain.
+    let job = refs::prompt_job("@Luna meets @Bob", &["Luna", "Max"], egui::FontId::proportional(12.0), egui::Color32::WHITE, egui::Color32::BLUE, 100.0);
+    let colored: Vec<(&str, egui::Color32)> =
+        job.sections.iter().map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.color)).filter(|(t, _)| !t.is_empty()).collect();
+    assert_eq!(colored, [("@Luna", egui::Color32::BLUE), (" meets @Bob", egui::Color32::WHITE)]);
+    // Typing @ offers the names; Tab or a click puts the one taken in, and a space after it.
+    let names = ["Luna", "Max", "Lucas"];
+    assert_eq!(refs::completion_at("hug @", 5, &names), Some((4..5, vec![0, 1, 2])));
+    assert_eq!(refs::completion_at("hug @lu", 7, &names), Some((4..7, vec![0, 2])));
+    assert_eq!(refs::completion_at("hug @Luna", 9, &names), None, "typed out already");
+    assert_eq!(refs::completion_at("me@lu", 5, &names), None, "inside a word");
+    assert_eq!(refs::completion_at("@lu x", 3, &names), Some((0..3, vec![0, 2])));
+    assert_eq!(refs::completion_at("@lux", 3, &names), None, "the word goes on past the cursor");
+    assert_eq!(refs::completion_at("hug @zz", 7, &names), None);
+    assert_eq!(refs::completion_at("🦆 @L", 4, &names), Some(("🦆 ".len().."🦆 @L".len(), vec![0, 2])));
+    assert_eq!(refs::completion_at("x", 99, &names), None);
+    assert_eq!(refs::complete("hug @lu now", 4..7, "Luna"), ("hug @Luna now".into(), 9));
+    assert_eq!(refs::complete("hug @lu", 4..7, "Luna"), ("hug @Luna ".into(), 10));
+}
+
+#[test]
+fn a_painted_mask_scopes_a_change_by_instruction() {
+    let mut app = app();
+    let q21 = Model { id: "q21".into(), ..Family::QwenImage21.preset() };
+    add_model(&mut app, q21.clone());
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.prompt = "make it a pond".into();
+    app.ui.ai_gen.context = 0.0;
+    // An edit model: the change is an instruction, and nothing marked means the whole layer.
+    assert_eq!(technique(&app.ui.ai_gen, current_model(&app)), GenerationMode::ImgEdit);
+    assert_eq!((generate_blocked(&app, &q21), target_size(&app)), (None, Some((64, 48, false))));
+    // The mask tools are there for an instruction too: what is painted scopes the change.
+    app.run("ai.mask", json!({"paint": true})).unwrap();
+    app.ui.ai_gen.mask_brush = true;
+    app.ui.tool = crate::state::Tool::Brush;
+    app.run("paint.stroke", json!({"points": [[20, 20], [40, 20]], "size": 12, "hardness": 1.0, "color": "#ffffff", "target": "quickMask"})).unwrap();
+    draw_panel(&mut app);
+    assert!(app.ui.ai_gen.mask_brush, "the mode survives drawing");
+    let (w, h, marked) = target_size(&app).unwrap();
+    assert!(marked && (28..64).contains(&w) && (8..48).contains(&h), "{w}x{h}");
+    // Generate turns the mask into the selection and the new layer's mask, and ends the mode.
+    let before = app.session.active().unwrap().doc.layers.len();
+    let r = generate(&mut app).unwrap();
+    assert_eq!((r["mode"].as_str(), r["bounds"][2].as_u64(), r["bounds"][3].as_u64()), (Some("imgEdit"), Some(u64::from(w)), Some(u64::from(h))));
+    let d = app.session.active().unwrap();
+    assert_eq!(d.doc.layers.len(), before + 1);
+    assert!(d.doc.quick_mask.is_none() && d.doc.selection.is_some() && d.doc.layer(d.active_layer.unwrap()).unwrap().mask.is_some());
+    draw_panel(&mut app);
+    assert!(!app.ui.ai_gen.mask_brush && !mask_brushing(&app));
+}
+
+#[test]
+fn the_advanced_section_opens_the_settings_of_the_task_in_front() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
+    add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    add_model(&mut app, Model { id: "gpt".into(), inpaint: Some(true), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.run("select.rect", json!({"x": 16, "y": 12, "width": 16, "height": 16})).unwrap();
+    let rows = |app: &PhotocraftApp| {
+        let model = current_model(app);
+        advanced_rows(model, technique(&app.ui.ai_gen, model))
+    };
+    // Closed, it is its heading; open, the rows of the task: the seed, for a change also its
+    // strength or quality with the context, and the method when the model leaves that open.
+    let closed = wanted_height(&app);
+    app.ui.ai_gen.advanced = true;
+    app.ui.ai_gen.seed = Some(7);
+    // (Create: the seed and Alpha Channel.)
+    assert_eq!((rows(&app), wanted_height(&app)), (2, closed + 2.0 * ROW));
+    draw_panel(&mut app);
+    (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (Mode::Edit, EditTask::Restyle);
+    assert_eq!(rows(&app), 1);
+    draw_panel(&mut app);
+    app.ui.ai_gen.task = EditTask::Change;
+    for (id, method, want) in [
+        // (An instruction also has Alpha Channel; a fill paints what is there.)
+        ("flux", Method::Instruct, 4),
+        ("flux", Method::Fill, 3),
+        ("fill", Method::Instruct, 2),
+        ("q21", Method::Fill, 3),
+        ("gpt", Method::Instruct, 4),
+        ("gpt", Method::Fill, 3),
+    ] {
+        app.ui.ai_gen.edit_model = id.into();
+        app.ui.ai_gen.method = method;
+        assert_eq!(rows(&app), want, "{id} {method:?}");
+        draw_panel(&mut app);
+        // Drawing leaves what was chosen as it is, for a local and for a cloud model.
+        let ui = &app.ui.ai_gen;
+        assert_eq!(
+            (ui.edit_model.as_str(), ui.method, ui.strength, ui.context, ui.edit_quality, ui.seed),
+            (id, method, 1.0, 0.25, GenerationQuality::Standard, Some(7)),
+            "{id}"
+        );
+    }
+    // The heading is drawn closed as well, in the floating panel's layout too.
+    app.ui.ai_gen.advanced = false;
+    draw_panel(&mut app);
+}
+
+#[test]
+fn the_seed_of_the_last_image_can_be_kept() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    app.ui.ai_gen.prompt = "a green field".into();
+    // No seed asked for: the model's own setting, a new one each time. The panel remembers which.
+    let first = generate(&mut app).unwrap()["seed"].as_u64().unwrap();
+    assert_eq!((app.ui.ai_gen.seed, app.ui.ai_gen.last_seed), (None, Some(first)));
+    // Kept (the lock in Advanced): the next image renders with it, and its layer says so.
+    app.ui.ai_gen.seed = app.ui.ai_gen.last_seed;
+    let r = generate(&mut app).unwrap();
+    assert_eq!(r["seed"].as_u64(), Some(first));
+    let d = app.session.active().unwrap();
+    assert_eq!(d.doc.layer(d.active_layer.unwrap()).unwrap().generation.as_ref().map(|g| g.seed), Some(first));
+    // A typed seed: its digits; nothing typed, none; more than a seed holds, what was there.
+    assert_eq!((typed_seed("42", None), typed_seed(" 4 2x", Some(1)), typed_seed("-7", None)), (Some(42), Some(42), Some(7)));
+    assert_eq!((typed_seed("", Some(5)), typed_seed("seed", Some(5))), (None, None));
+    assert_eq!(typed_seed(&SEED_MASK.to_string(), None), Some(SEED_MASK));
+    assert_eq!((typed_seed("281474976710656", Some(9)), typed_seed(&"9".repeat(40), None)), (Some(9), None));
+    app.ui.ai_gen.seed = typed_seed("42", None);
+    assert_eq!(generate(&mut app).unwrap()["seed"], 42);
+    // A state set from outside with a seed too large is brought into range, not refused.
+    app.ui.ai_gen.seed = Some(u64::MAX);
+    assert_eq!(generate(&mut app).unwrap()["seed"].as_u64(), Some(SEED_MASK));
+    let state = serde_json::to_value(&app.ui.ai_gen).unwrap();
+    assert_eq!((&state["seed"], &state["lastSeed"], &state["advanced"]), (&json!(u64::MAX), &json!(SEED_MASK), &json!(false)));
+    // A result without a seed forgets the last one.
+    finished(&mut app, &json!({"seed": "x"}));
+    assert_eq!(app.ui.ai_gen.last_seed, None);
+}
+
+/// A document with one generation of each kind, made from the panel: the ids of the Background
+/// and of the created, the restyled and the filled layer.
+fn generated_layers(app: &mut PhotocraftApp) -> [u64; 4] {
+    add_model(app, z_image("z"));
+    add_model(app, Model { id: "z2".into(), inpaint: Some(true), ..Family::ZImage.preset() });
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let background = app.session.active().unwrap().active_layer.unwrap().0;
+    let made = |app: &mut PhotocraftApp| {
+        let r = generate(app).unwrap();
+        r["layer"].as_u64().unwrap()
+    };
+    app.ui.ai_gen = AiGenUi { model: "z2".into(), prompt: "a green field".into(), alpha: false, ..Default::default() };
+    let txt = made(app);
+    let restyle = (Mode::Edit, EditTask::Restyle);
+    app.ui.ai_gen =
+        AiGenUi { mode: restyle.0, task: restyle.1, model: "z".into(), prompt: "as a watercolour".into(), img_strength: 0.35, ..Default::default() };
+    app.ui.ai_gen.img_source = Some(SourceRef::Layer(background));
+    let img = made(app);
+    app.run("select.rect", json!({"x": 8, "y": 4, "width": 20, "height": 10})).unwrap();
+    app.ui.ai_gen = AiGenUi { mode: Mode::Edit, edit_model: "z2".into(), prompt: "a pond".into(), strength: 0.75, context: 0.5, ..Default::default() };
+    let inpaint = made(app);
+    [background, txt, img, inpaint]
+}
+
+#[test]
+fn load_prompt_puts_a_generated_layers_prompt_and_model_back_and_nothing_else() {
+    let mut app = app();
+    let [background, txt, img, inpaint] = generated_layers(&mut app);
+    // Something else in the panel: only its prompt and model are replaced.
+    let other = AiGenUi { mode: Mode::Create, model: "z".into(), edit_model: "z".into(), prompt: "something else".into(), ..Default::default() };
+    app.ui.ai_gen = other.clone();
+    // A layer that was not generated, and one that is not there, change nothing.
+    assert!(!load_prompt(&mut app, background));
+    assert!(!load_prompt(&mut app, u64::MAX));
+    assert_eq!(app.ui.ai_gen, other);
+    // A fill (Change's model), a restyle and a creation (the other): the prompt and the model it
+    // was made with; the tab, task and settings stay.
+    for (layer, prompt, model, edit_model) in [(inpaint, "a pond", "z", "z2"), (img, "as a watercolour", "z", "z2"), (txt, "a green field", "z2", "z2")] {
+        assert!(load_prompt(&mut app, layer));
+        assert_eq!(app.ui.ai_gen, AiGenUi { prompt: prompt.into(), model: model.into(), edit_model: edit_model.into(), ..other.clone() });
+    }
+    draw_panel(&mut app);
+    assert_eq!((app.ui.ai_gen.mode, app.ui.ai_gen.model.as_str()), (Mode::Create, "z2"));
+    // The command does the same, for the active layer when none is named.
+    app.ui.ai_gen = other.clone();
+    assert_eq!(menu(&mut app, LOAD_PROMPT, &json!({"layer": inpaint})), Some(Ok(json!({"loaded": true}))));
+    assert_eq!(app.ui.ai_gen, AiGenUi { prompt: "a pond".into(), edit_model: "z2".into(), ..other.clone() });
+    app.run("layer.select", json!({"layer": txt})).unwrap();
+    assert_eq!(menu(&mut app, LOAD_PROMPT, &json!({})), Some(Ok(json!({"loaded": true}))));
+    assert_eq!(app.ui.ai_gen.prompt, "a green field");
+    assert_eq!(menu(&mut app, LOAD_PROMPT, &json!({"layer": background})), Some(Ok(json!({"loaded": false}))));
+    assert!(menu(&mut app, LOAD_PROMPT, &json!({"layer": "x"})).unwrap().is_err());
+    assert!(menu(&mut app, LOAD_PROMPT, &json!({"layer": -1})).unwrap().is_err());
+    // A generated layer whose prompt is empty has nothing to load.
+    let d = app.session.active_mut().unwrap();
+    std::sync::Arc::make_mut(&mut d.doc).layer_mut(photocraft_doc::LayerId(txt)).unwrap().generation.as_mut().unwrap().prompt = "  ".into();
+    assert!(!load_prompt(&mut app, txt));
+    assert_eq!(app.ui.ai_gen.prompt, "a green field");
+}
+
+mod clicks {
+    use super::*;
+    use crate::layer_row_ui::recorded;
+    use egui::{Modifiers, PointerButton, Pos2, vec2};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+
+    fn click(h: &mut Harness<'_, PhotocraftApp>, at: Pos2) {
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn a_double_click_on_a_region_row_opens_its_editor() {
+        let mut app = app();
+        add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+        app.ui.ai_gen.model = "moss".into();
+        app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+        let regions = json!([{"caption": "a cat", "rect": [0, 0, 50, 50]}, {"caption": "an armchair", "rect": [60, 0, 50, 50]}]);
+        app.run("ai.setRegions", json!({"regions": regions})).unwrap();
+        let armchair = app.session.active().unwrap().doc.ai_regions[1].id;
+        app.ui.ai_gen.create_task = CreateTask::Regions;
+        menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+        // Tall enough for the rows to show without scrolling.
+        app.ui.dock.heights.insert(crate::dock::Group::Properties, 760.0);
+        // Steps a frame apart: the default quarter second would part the two clicks of a
+        // double-click by more than egui's 0.3 s.
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_max_steps(64).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            app
+        });
+        h.run_steps(8);
+        let at = h.get_by_label("an armchair").rect().center();
+        // One click selects the row; two open its editor, and it stays open.
+        click(&mut h, at);
+        assert_eq!((h.state().ui.ai_gen.region, h.state().ui.ai_gen.regions.editor), (Some(armchair), None));
+        h.run_steps(30);
+        for pressed in [true, false, true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+            h.run_steps(1);
+        }
+        h.run_steps(3);
+        assert_eq!(h.state().ui.ai_gen.regions.editor, Some(armchair));
+    }
+
+    #[test]
+    fn clicking_a_generated_layer_leaves_the_panel_and_load_prompt_loads_its_prompt() {
+        const LOAD: &str = "Load from layer";
+        let mut app = app();
+        let [background, _, _, inpaint] = generated_layers(&mut app);
+        app.ui.ai_gen = AiGenUi { model: "z".into(), prompt: "something else".into(), ..Default::default() };
+        menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            app
+        });
+        h.run_steps(8);
+        let row = |h: &Harness<'_, PhotocraftApp>, layer: u64| recorded(&h.ctx).into_iter().find(|r| r.layer == layer).unwrap();
+        // Clicking the layer selects it and leaves the panel as it is.
+        let at = row(&h, inpaint).name.unwrap().center();
+        click(&mut h, at);
+        assert_eq!(h.state().session.active().unwrap().active_layer, Some(photocraft_doc::LayerId(inpaint)));
+        let before = h.state().ui.ai_gen.clone();
+        assert_eq!((before.mode, before.model.as_str(), before.prompt.as_str()), (Mode::Create, "z", "something else"));
+        // Load from layer puts its prompt in the box and chooses its model (Change's, for a
+        // fill): no other tab.
+        let at = h.get_by_label(LOAD).rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen, AiGenUi { prompt: "a pond".into(), edit_model: "z2".into(), ..before });
+        // A layer that was not generated has no prompt to load: the button is off.
+        let at = row(&h, background).name.unwrap().center();
+        click(&mut h, at);
+        assert_eq!(h.state().session.active().unwrap().active_layer, Some(photocraft_doc::LayerId(background)));
+        assert!(h.get_by_label(LOAD).accesskit_node().is_disabled());
+        let at = h.get_by_label(LOAD).rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen.prompt, "a pond");
+    }
+
+    /// A harness over `app` with the AI Gen panel showing, tall enough for all its rows.
+    fn showing(mut app: PhotocraftApp) -> Harness<'static, PhotocraftApp> {
+        menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+        app.ui.dock.heights.insert(crate::dock::Group::Properties, 760.0);
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            app
+        });
+        h.run_steps(8);
+        h
+    }
+
+    #[test]
+    fn shift_click_on_enhance_prompt_restores_the_prompt_typed() {
+        let mut app = app();
+        add_model(&mut app, z_image("z"));
+        app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+        app.ui.ai_gen.prompt = "A ginger cat asleep on a sunlit windowsill".into();
+        app.ui.ai_gen.before_enhance = Some("cat window".into());
+        app.ui.ai_gen.enhanced_by = "Claude (claude-haiku-5-5)".into();
+        let mut h = showing(app);
+        // The button sits beside the model, and the status bar says who wrote the prompt.
+        let enhance = h.get_by_label("Enhance Prompt").rect();
+        let model = h.get_by_label("Model").rect();
+        assert!((enhance.center().y - model.center().y).abs() < 4.0, "{enhance:?} beside {model:?}");
+        let at = enhance.center();
+        h.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::SHIFT });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::SHIFT });
+        h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        h.run_steps(3);
+        assert_eq!(h.state().ui.ai_gen.prompt, "cat window");
+        assert!(h.state().ui.ai_gen.before_enhance.is_none());
+    }
+
+    #[test]
+    fn the_style_picker_chooses_a_preset_by_tab_and_no_preset_clears_it() {
+        let mut app = app();
+        add_model(&mut app, z_image("z"));
+        app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+        let mut h = showing(app);
+        let at = h.get_by_label("Style").rect().center();
+        click(&mut h, at);
+        // All the presets, and No preset first.
+        assert!(h.query_by_label("No preset").is_some() && h.query_by_label("Pixel Art").is_some());
+        let at = h.get_by_label("Traditional art").rect().center();
+        click(&mut h, at);
+        assert!(h.query_by_label("Pixel Art").is_none(), "the tab shows its group only");
+        let at = h.get_by_label("Watercolour").rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen.style, "watercolour");
+        assert!(h.query_by_label("No preset").is_none(), "choosing closes the picker");
+        // The tab stays; No preset takes the style away.
+        let at = h.get_by_label("Style").rect().center();
+        click(&mut h, at);
+        assert!(h.query_by_label("Pixel Art").is_none());
+        let at = h.get_by_label("No preset").rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen.style, "");
+    }
+
+    /// Each button of a Model Folders row does its own thing: none of them opens the list, which
+    /// only the chevron and the rest of the header do.
+    #[test]
+    fn a_folder_rows_buttons_do_their_own_thing_and_the_header_opens_its_list() {
+        let fields = serde_json::Map::from_iter([
+            (SETUP.to_string(), json!({"available": true, "route": "managed", "managed": true})),
+            (
+                "__aiFolderListing".to_string(),
+                json!([
+                    {"path": "C:/LayerShop/models", "kind": "setup", "found": true, "files": {"vae": ["v.safetensors"]}},
+                    {"path": "D:/mine/models", "kind": "yours", "found": true, "files": {"loras": ["a.safetensors"]}},
+                ]),
+            ),
+        ]);
+        let mut h = Harness::builder()
+            .with_size(vec2(900.0, 600.0))
+            .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
+            .build_ui_state(|ui, f: &mut Map<String, Value>| folders::page(ui, f, false), fields);
+        h.run();
+        let opened = |h: &Harness<'_, Map<String, Value>>| h.state().get("__aiFolderOpened").cloned().unwrap_or(json!([]));
+        // Pointer clicks, not accessibility actions: what lies over a button is what the pointer hits.
+        let click = |h: &mut Harness<'_, Map<String, Value>>, at: Pos2| {
+            h.hover_at(at);
+            h.run();
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+                h.run();
+            }
+        };
+        let press = |h: &mut Harness<'_, Map<String, Value>>, label: &str, nth: usize| {
+            h.state_mut().remove(ACTION);
+            let at = h.query_all_by_label(label).nth(nth).unwrap_or_else(|| panic!("no {label}")).rect().center();
+            click(h, at);
+            h.state_mut().remove(ACTION)
+        };
+        assert_eq!(press(&mut h, "Read the folder again", 1), Some(json!("folderList")));
+        let open = if cfg!(windows) { "Open in Explorer" } else if cfg!(target_os = "macos") { "Open in Finder" } else { "Open Folder" };
+        assert_eq!(press(&mut h, open, 1), Some(json!("folderShow:D:/mine/models")));
+        // Remove asks first; Cancel leaves the folder, Remove in the question removes it.
+        assert_eq!(press(&mut h, "Stop reading this folder (nothing in it is deleted)", 0), None);
+        assert_eq!(h.state().get("__aiFolderConfirm"), Some(&json!("D:/mine/models")));
+        assert!(h.query_by_label_contains("No files are deleted").is_some());
+        assert_eq!(press(&mut h, "Cancel", 0), None);
+        assert!(h.state().get("__aiFolderConfirm").is_none());
+        press(&mut h, "Stop reading this folder (nothing in it is deleted)", 0);
+        assert_eq!(press(&mut h, "Remove", 0), Some(json!("ownFolderRemove:D:/mine/models")));
+        assert!(h.state().get("__aiFolderConfirm").is_none());
+        assert_eq!(opened(&h), json!([]), "no button opened a list");
+        // The chevron, and a click on the folder's name, open and close it.
+        press(&mut h, "List its files", 1);
+        assert_eq!(opened(&h), json!(["D:/mine/models"]));
+        assert!(h.query_by_label("a.safetensors").is_some());
+        let name = h.get_by_label("Your models folder").rect().center();
+        click(&mut h, name);
+        assert_eq!(opened(&h), json!([]));
+    }
+}
+
+#[test]
+fn a_new_installation_lists_the_recommended_models_and_a_scan_points_them_at_the_servers_files() {
+    // Not `app()`, which empties the list.
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+    app.session.ai.transport = Some(Arc::new(Fake));
+    assert_eq!(app.session.prefs().integrations.ai.models, Model::defaults());
+    let (_, mut f) = dialog_fields(&mut app);
+    assert_eq!(f.get("section"), Some(&json!("generativeAi")));
+    draw_section(&mut f);
+    // Restore Defaults has nothing to add until some are removed; then it adds those, and only those.
+    let mut ai = f["values"]["integrations"]["ai"].as_object().cloned().unwrap();
+    assert_eq!(restore_defaults(&mut ai, &mut f), 0);
+    ai.get_mut("models").and_then(Value::as_array_mut).unwrap().retain(|m| m["id"] != "nano-banana-pro" && m["id"] != "krea-2-turbo");
+    assert_eq!(restore_defaults(&mut ai, &mut f), 2);
+    let ids: Vec<&str> = ai["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!((ids.len(), &ids[15..]), (17, &["nano-banana-pro", "krea-2-turbo"][..]));
+    // The same model stored another way, or under the user's own name, counts as listed.
+    for m in ai.get_mut("models").and_then(Value::as_array_mut).unwrap() {
+        if m["id"] == "z-image-turbo" {
+            m["unet"] = json!("z_image_turbo_bf16.safetensors");
+            m["name"] = json!("mine");
+        }
+    }
+    assert_eq!(restore_defaults(&mut ai, &mut f), 0);
+    // Emptied, or unreadable: all seventeen come back.
+    let mut none = Map::new();
+    assert_eq!((restore_defaults(&mut none, &mut f), none["models"].as_array().unwrap().len()), (17, 17));
+    let mut junk: Map<String, Value> = serde_json::from_value(json!({"models": [1, "a", {"provider": "nope"}]})).unwrap();
+    assert_eq!(restore_defaults(&mut junk, &mut f), 17);
+
+    // The fake server has Z-Image Turbo as bf16, not the int8 file the recommended entry names:
+    // a scan points that entry at the server's file instead of listing the model twice, and adds
+    // the two models that were not listed.
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    let models: Vec<Model> = serde_json::from_value(f["values"]["integrations"]["ai"]["models"].clone()).unwrap();
+    assert_eq!(models.len(), 19, "{:?}", models.iter().map(|m| &m.id).collect::<Vec<_>>());
+    let z = models.iter().find(|m| m.id == "z-image-turbo").unwrap();
+    assert_eq!((z.name.as_str(), z.unet.as_str(), z.cfg, z.steps), ("Z-Image Turbo", "z_image_turbo_bf16.safetensors", 2.0, 8));
+    let status = f[STATUS]["text"].as_str().unwrap().to_string();
+    assert!(status.contains("2 models added") && status.contains("1 matched to the server's files"), "{status}");
+    // A second scan has nothing left to do.
+    f.insert(ACTION.into(), json!("detect"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f["values"]["integrations"]["ai"]["models"].as_array().unwrap().len(), 19);
+    assert!(!f[STATUS]["text"].as_str().unwrap().contains("matched"));
+    // With the server's files read, the list marks the models whose file it doesn't have.
+    let listing: std::collections::BTreeMap<String, Vec<String>> = serde_json::from_value(f[FILES].clone()).unwrap();
+    let lost: Vec<&str> = models.iter().filter(|m| !photocraft_aigen::detect::on_server(&listing, m)).map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        lost,
+        [
+            "qwen-image-2-1",
+            "krea-2-turbo",
+            "flux-3-klein",
+            "moss-image",
+            "fibo-2-dev",
+            "ideogram-4",
+            "hidream-o1",
+            "ernie-image-turbo",
+            "ming-image-0-1-design"
+        ]
+    );
+    for x in Filter::ALL {
+        f.insert(FILTER.into(), json!(x.key()));
+        draw_section(&mut f);
+    }
+}
+
+#[test]
+fn the_newer_cloud_providers_take_a_key_and_are_drawn_sized_and_priced() {
+    let mut app = app();
+    for m in Model::cloud_presets().into_iter().filter(|m| matches!(m.provider, Provider::Xai | Provider::Meta | Provider::Bfl)) {
+        add_model(&mut app, Model { id: m.provider.key().into(), ..m });
+    }
+    let by = |app: &PhotocraftApp, id: &str| app.session.prefs().integrations.ai.models.iter().find(|m| m.id == id).cloned().unwrap();
+    assert_eq!(by(&app, "bfl").api_model, "flux-3-image");
+    // Each has a row on the API Keys page; a key typed there is saved like the others.
+    let (_, mut f) = dialog_fields(&mut app);
+    for provider in ["xai", "meta", "bfl"] {
+        f[KEYS][provider] = json!(format!("{provider}-secret"));
+    }
+    draw_section(&mut f);
+    prefs_confirmed(&mut app, &f).unwrap();
+    let keys = app.session.execute("ai.keys", json!({})).unwrap();
+    assert_eq!((&keys["xai"], &keys["meta"], &keys["bfl"]), (&json!(true), &json!(true), &json!(true)));
+    assert!(!app.session.prefs_to_json().contains("-secret"));
+    let e = app.session.execute("ai.setKey", json!({"provider": "nope", "key": "x"})).unwrap_err().to_string();
+    assert!(e.contains("openai|gemini|xai|meta|bfl"), "{e}");
+    // xAI and Black Forest Labs are asked for a shape, Muse Image for a size that only gives one.
+    assert_eq!((render_size(&by(&app, "xai"), 1920, 1080), render_size(&by(&app, "bfl"), 1920, 1080)), ((16, 9), (16, 9)));
+    let (w, h) = render_size(&by(&app, "meta"), 1920, 1080);
+    assert!(w > h && w >= 1024, "{w}x{h}");
+    // Muse Image has one price; the other two say what the last image cost once there was one.
+    assert_eq!(reported_price_note(&app, &by(&app, "meta")).map(|(text, _)| text).as_deref(), Some("Cost $0.010"));
+    assert!(reported_price_note(&app, &by(&app, "xai")).is_none() && reported_price_note(&app, &by(&app, "bfl")).is_none());
+    app.ui.ai_gen.last_cost = Some(0.048);
+    assert_eq!(reported_price_note(&app, &by(&app, "bfl")).map(|(text, _)| text).as_deref(), Some("Last image $0.048"));
+    // The panel and every settings page draw with each of them chosen.
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    for id in ["xai", "meta", "bfl"] {
+        app.ui.ai_gen.model = id.into();
+        app.ui.ai_gen.edit_model = id.into();
+        for mode in Mode::ALL {
+            app.ui.ai_gen.mode = mode;
+            draw_panel(&mut app);
+        }
+        let dialog = open_settings(&mut app, id);
+        let mut f = app.ui.dialogs.iter().find(|d| d.id == dialog).unwrap().fields.clone();
+        draw_section(&mut f);
+        // Drawing the settings changes nothing about the model.
+        let drawn: Vec<Model> = serde_json::from_value(f["values"]["integrations"]["ai"]["models"].clone()).unwrap();
+        assert_eq!(drawn, app.session.prefs().integrations.ai.models, "{id}");
+    }
+}
+
+#[test]
+fn the_order_of_the_list_is_the_panels_and_each_kind_can_be_left_out_of_it() {
+    let mut app = app();
+    let cloud = |id: &str, api: &str| Model { id: id.into(), ..Model::cloud(Provider::Openai, id, api, false) };
+    // As a user's list may be: local and cloud mixed, in no particular order.
+    add_model(&mut app, Model { id: "ernie".into(), ..Family::Ernie.preset() });
+    add_model(&mut app, cloud("pro", "gemini-3-pro-image-preview"));
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, cloud("sunburst", "gpt-image-2.5-sunburst"));
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    let panel = |app: &PhotocraftApp| enabled_models(app).into_iter().map(|m| m.id).collect::<Vec<_>>();
+    // The panel groups them: cloud first, each kind in the order of the settings.
+    assert_eq!(panel(&app), ["pro", "sunburst", "ernie", "z", "q21"]);
+    assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("pro"));
+
+    // Moving a model past its neighbour moves it in the settings, whatever lies between them there.
+    let (_, mut f) = dialog_fields(&mut app);
+    let ids = |models: &[Value]| models.iter().map(|m| m["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let mut models = f["values"]["integrations"]["ai"]["models"].as_array().cloned().unwrap();
+    move_model(&mut models, 3, 1);
+    assert_eq!(ids(&models), ["ernie", "sunburst", "pro", "z", "q21"]);
+    move_model(&mut models, 0, 3);
+    assert_eq!(ids(&models), ["sunburst", "pro", "z", "ernie", "q21"]);
+    for (from, to) in [(0, 0), (9, 0), (0, 9), (usize::MAX, 1)] {
+        let before = models.clone();
+        move_model(&mut models, from, to);
+        assert_eq!(models, before, "{from} -> {to}");
+    }
+    // Recommended Order: cloud before local, each kind best and newest first; an entry that
+    // doesn't read as a model stays, at the end.
+    models.insert(0, json!({"id": "junk", "provider": "nope"}));
+    sort_recommended(&mut models);
+    assert_eq!(ids(&models), ["sunburst", "pro", "q21", "z", "ernie", "junk"]);
+    models.pop();
+    f["values"]["integrations"]["ai"]["models"] = Value::Array(models);
+
+    // Each kind has a switch on the page; switched off, the draft says so and draws.
+    for x in Filter::ALL {
+        f.insert(FILTER.into(), json!(x.key()));
+        draw_section(&mut f);
+    }
+    assert_eq!((&f["values"]["integrations"]["ai"]["showCloud"], &f["values"]["integrations"]["ai"]["showLocal"]), (&json!(true), &json!(true)));
+    f["values"]["integrations"]["ai"]["showCloud"] = json!(false);
+    draw_section(&mut f);
+    crate::prefs_ui::confirm(&mut app, &f).unwrap();
+    let saved = app.session.prefs().integrations.ai.clone();
+    assert!(!saved.show_cloud && saved.show_local);
+    assert_eq!(saved.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["sunburst", "pro", "q21", "z", "ernie"]);
+    // The panel offers the local models only, in their new order, and falls back to its first.
+    assert_eq!(panel(&app), ["q21", "z", "ernie"]);
+    app.ui.ai_gen.model = "sunburst".into();
+    assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("q21"));
+    draw_panel(&mut app);
+    // `ai.models` says which are offered, in the panel's order.
+    let listed = app.session.execute("ai.models", json!({})).unwrap();
+    assert_eq!(listed["listed"], json!(["q21", "z", "ernie"]));
+    assert_eq!((&listed["models"][0]["id"], &listed["models"][0]["listed"]), (&json!("sunburst"), &json!(false)));
+    // Both off: nothing is offered, and the panel says how to get models.
+    app.run("prefs.set", json!({"path": "integrations.ai.showLocal", "value": false})).unwrap();
+    assert!(panel(&app).is_empty() && current_model(&app).is_none());
+    draw_panel(&mut app);
+    assert!(generate(&mut app).is_err());
+}
+
+#[test]
+fn the_panels_model_list_is_in_sections_and_names_the_models_plainly() {
+    let cloud = |id: &str| Model { id: id.into(), ..Model::cloud(Provider::Openai, id, "gpt-image-2", false) };
+    // As the panel lists them: cloud first. Each kind that is offered gets its heading.
+    let both = [cloud("a"), cloud("b"), z_image("z"), z_image("y")];
+    assert_eq!(model_headings(&both), [(0, "Cloud API"), (2, "Local Models")]);
+    assert_eq!(model_headings(&both[..2]), [(0, "Cloud API")]);
+    assert_eq!(model_headings(&both[2..]), [(0, "Local Models")]);
+    assert!(model_headings(&[]).is_empty());
+    // The list and the layer a generation lands on name the model, not where it runs.
+    let mut app = app();
+    add_model(&mut app, Model { name: "GPT Image 2".into(), ..cloud("gpt") });
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    for mode in Mode::ALL {
+        app.ui.ai_gen.mode = mode;
+        draw_panel(&mut app);
+    }
+    app.ui.ai_gen.mode = Mode::Create;
+    app.ui.ai_gen.model = "z".into();
+    app.ui.ai_gen.prompt = "a frog".into();
+    let r = generate(&mut app).unwrap();
+    let layer = r["layer"].as_u64().unwrap();
+    let doc = &app.session.active().unwrap().doc;
+    let name = doc.layers.iter().find(|l| l.id.0 == layer).map(|l| l.name.to_lowercase()).unwrap();
+    assert!(name.starts_with("[z_image_turbo]") && !name.contains("local") && !name.contains("cloud"), "{name}");
+}
+
+/// A ComfyUI that has one model file: Z-Image Turbo as the recommended list names it.
+struct OneModel;
+
+impl Transport for OneModel {
+    fn send(&self, r: &Request) -> photocraft_aigen::Result<Response> {
+        let body: &[u8] = if r.url.ends_with("/models/diffusion_models") {
+            br#"["z_image_turbo_int8_convrot.safetensors"]"#
+        } else if r.url.contains("/models/") {
+            b"[]"
+        } else {
+            return Ok(Response { status: 404, body: Vec::new() });
+        };
+        Ok(Response { status: 200, body: body.to_vec() })
+    }
+}
+
+/// Nothing answers: no ComfyUI here.
+struct Nobody;
+
+impl Transport for Nobody {
+    fn send(&self, _: &Request) -> photocraft_aigen::Result<Response> {
+        Err(photocraft_aigen::Error::Network("connection refused".into()))
+    }
+}
+
+fn offered(app: &PhotocraftApp) -> Vec<String> {
+    enabled_models(app).into_iter().map(|m| m.name).collect()
+}
+
+#[test]
+fn only_models_that_can_run_are_offered() {
+    // A new installation: the recommended models are ticked, but nothing can run yet: no API
+    // key, no ComfyUI. The panel says so, and offers the ways to one.
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+    app.session.ai.transport = Some(Arc::new(Nobody));
+    draw_panel(&mut app);
+    assert!(offered(&app).is_empty(), "{:?}", offered(&app));
+    assert_eq!(local_state(&app), Local::NotSetUp);
+    assert!(app.ui.notices.is_empty(), "a ComfyUI that isn't there is not an error");
+    assert_eq!(generate(&mut app).unwrap_err(), "No AI model is set up for this.");
+    // An OpenAI key: its models are offered, and only those.
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    let cloud = offered(&app);
+    assert_eq!(cloud, ["GPT Image 2.5 Sunburst", "GPT Image 2.5 Flare"]);
+    // A ComfyUI that answers, asked again when the app gets the focus back: the local models
+    // whose file it has are offered, after the cloud ones; the others are not.
+    app.session.ai.transport = Some(Arc::new(OneModel));
+    app.ui.ai_gen.server_asked = -LOOK_AGAIN - 1.0;
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    for focused in [false, true] {
+        let mut input = egui::RawInput::default();
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().focused = Some(focused);
+        ctx.run_ui(input, |ui| panel(&mut app, ui, true)).textures_delta.clear();
+    }
+    assert_eq!(local_state(&app), Local::Ready);
+    assert_eq!(offered(&app), ["GPT Image 2.5 Sunburst", "GPT Image 2.5 Flare", "Z-Image Turbo"]);
+    // A server that stops answering leaves what it said: its files are still there.
+    app.session.ai.transport = Some(Arc::new(Nobody));
+    app.ui.ai_gen.server_asked = f64::NEG_INFINITY;
+    draw_panel(&mut app);
+    assert!(offered(&app).contains(&"Z-Image Turbo".to_string()));
+}
+
+#[test]
+fn while_local_ai_is_being_set_up_its_models_wait_and_the_panel_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+    // The stand-in downloads never finish: the setup stays under way.
+    crate::ai_setup_ui::demo::install(&mut app, dir.path(), crate::ai_setup_ui::demo::Scale::Real);
+    app.ui.ai_setup.local_worked = true;
+    app.session.execute("ai.setup.start", json!({"route": "managed", "models": ["qwen-image-2-1"], "testImage": false})).unwrap();
+    assert!(crate::ai_setup_ui::running(&app));
+    draw_panel(&mut app);
+    assert_eq!(local_state(&app), Local::Installing);
+    assert!(offered(&app).is_empty(), "{:?}", offered(&app));
+    // A cloud model with its key still works meanwhile; the line under Generate says what waits.
+    app.session.ai.set_key(Provider::Gemini, "g-test");
+    assert_eq!(offered(&app), ["Nano Banana 2", "Nano Banana Pro"]);
+    draw_panel(&mut app);
+    // The status the panel reads is the wizard's; once it has some, the line names the progress.
+    let line = setup_line(&app).unwrap_or_default();
+    assert!(line.is_empty() || line.contains("Local models appear here when it has finished"), "{line}");
+    app.session.execute("ai.setup.cancel", json!({})).unwrap();
+    let began = std::time::Instant::now();
+    while crate::ai_setup_ui::running(&app) {
+        assert!(began.elapsed() < std::time::Duration::from_secs(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_panels_own_look_at_the_server_ends_quietly() {
+    use photocraft_engine::jobs::{JobEvent, JobId, JobOutcome};
+    let mut app = app();
+    let event = |id: u64, outcome: JobOutcome| JobEvent {
+        id: JobId(id),
+        command: "ai.comfyModels".into(),
+        label: "Connect to ComfyUI".into(),
+        document: None,
+        outcome,
+        error: None,
+    };
+    // Someone else's job is not the panel's.
+    assert!(!on_job_event(&mut app, &event(4, JobOutcome::Failed("refused".into()))));
+    app.ui.ai_gen.server_job = Some(9);
+    assert!(on_job_event(&mut app, &event(9, JobOutcome::Failed("refused".into()))));
+    assert!(app.ui.ai_gen.server_job.is_none() && app.ui.ai_gen.server_files.is_none() && app.ui.notices.is_empty());
+    app.ui.ai_gen.server_job = Some(10);
+    assert!(on_job_event(&mut app, &event(10, JobOutcome::Done(json!({"folders": {"diffusion_models": ["a.safetensors"]}})))));
+    assert_eq!(app.ui.ai_gen.server_files.as_ref().unwrap()["diffusion_models"], ["a.safetensors"]);
+}
+
+#[test]
+fn a_narrow_panel_keeps_everything_inside_it() {
+    let mut app = app();
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let doc = app.session.active().unwrap().doc.id.0;
+    // A layer named after a long prompt (as generated layers are), the source and a reference.
+    let long = "[qwen_image_2.1] Create a breathtaking, photorealistic nature scene at dawn";
+    app.run("layer.new.layer", json!({"name": long})).unwrap();
+    app.run("select.all", json!({})).unwrap();
+    app.run("edit.fill", json!({"color": "#336699"})).unwrap();
+    app.run("select.deselect", json!({})).unwrap();
+    let layer = app.session.active().unwrap().active_layer.unwrap().0;
+    (app.ui.ai_gen.mode, app.ui.ai_gen.task, app.ui.ai_gen.edit_model) = (Mode::Edit, EditTask::Change, "q21".into());
+    app.ui.ai_gen.prompt = "add @dracco rising from the lake".into();
+    let _ = doc;
+    let reference = |name: &str| json!({"layer": layer, "name": name});
+    app.run("ai.setReferences", json!({"references": [reference("dracco_the_dragon_king"), reference("another_long_name"), reference("and_a_third_one")]}))
+        .unwrap();
+    app.ui.ai_gen.editing_ref = Some(0);
+    // The dock is 250 wide at its narrowest (`panels::DOCK_WIDTH`), its content a little less.
+    for width in [234.0, 260.0, 300.0, 360.0] {
+        let ctx = egui::Context::default();
+        PhotocraftApp::setup_context(&ctx, Default::default());
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))), ..Default::default() };
+        let mut used = 0.0f32;
+        for _ in 0..3 {
+            ctx.run_ui(input(), |ui| {
+                let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 900.0));
+                let r = ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| panel(&mut app, ui, false)).response.rect;
+                used = r.width();
+            })
+            .textures_delta
+            .clear();
+        }
+        assert!(used <= width + 0.5, "the panel's content is {used} wide in a panel {width} wide");
+    }
+}
+
+/// A long model name is cut short in its menu instead of growing it past its share of the row:
+/// grown, it pushed Load from layer, the gear and (the panel laid out that much wider) Generate
+/// out of the dock (LayerShop issue 7).
+#[test]
+fn a_long_model_name_keeps_generate_and_the_gear_in_the_panel() {
+    let mut app = app();
+    let name = "Qwen Image 2.1 viggle turbo v0.3 6step int8 convrot";
+    add_model(&mut app, Model { id: "q21".into(), name: name.into(), ..Family::QwenImage21.preset() });
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.run("layer.new.layer", json!({"name": "[moss_image_sft_attn] a frog is eating a fly while it sits on a lily pad"})).unwrap();
+    app.run("select.all", json!({})).unwrap();
+    app.run("edit.fill", json!({"color": "#336699"})).unwrap();
+    app.run("select.deselect", json!({})).unwrap();
+    app.ui.ai_gen.prompt = "a frog is eating a fly while it sits on a lily pad".into();
+    for mode in [Mode::Edit, Mode::Create] {
+        (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (mode, EditTask::Change);
+        (app.ui.ai_gen.edit_model, app.ui.ai_gen.model) = ("q21".into(), "q21".into());
+        // From where the buttons beside the model keep their words to where the name nearly fits.
+        for width in [300.0, 420.0, 520.0, 600.0, 700.0] {
+            let ctx = egui::Context::default();
+            PhotocraftApp::setup_context(&ctx, Default::default());
+            let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))), ..Default::default() };
+            let mut used = 0.0f32;
+            for _ in 0..3 {
+                ctx.run_ui(input(), |ui| {
+                    let inner = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 900.0));
+                    // As the dock draws it: filling its group, in the panel's own scroll area.
+                    let r = ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| panel(&mut app, ui, true)).response.rect;
+                    used = r.width();
+                })
+                .textures_delta
+                .clear();
+            }
+            assert!(used <= width + 0.5, "{mode:?}: the panel's content is {used} wide in a panel {width} wide");
+        }
+    }
+}
+
+/// Draw the Generative AI section once on `page`, leaving the dialog wherever the frame took it.
+fn draw_page(f: &mut Map<String, Value>, page: &str) {
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    f.insert(PAGE.into(), json!(page));
+    for _ in 0..2 {
+        ctx.run_ui(Default::default(), |ui| {
+            let mut values = f.get("values").cloned().unwrap();
+            let obj = values.get_mut("integrations").and_then(Value::as_object_mut).unwrap();
+            prefs_section(ui, obj, f, 480.0);
+            f.insert("values".into(), values);
+        })
+        .textures_delta
+        .clear();
+    }
+}
+
+#[test]
+fn models_that_cant_run_say_why_and_lead_to_what_makes_them_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+    crate::ai_setup_ui::demo::install(&mut app, dir.path(), crate::ai_setup_ui::demo::Scale::Small);
+    crate::ai_setup_ui::demo::pretend_installed(&app, dir.path()).unwrap();
+    // Z-Image Turbo's model file is gone since: it is the wizard's, so it can be installed again.
+    let models_dir = dir.path().join("models").join("diffusion_models");
+    let zimage = std::fs::read_dir(&models_dir).unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().contains("z_image")).unwrap();
+    std::fs::remove_file(zimage).unwrap();
+    let defaults = Model::defaults();
+    let by = |id: &str| defaults.iter().find(|m| m.id == id).cloned().unwrap();
+    let gpt = Model::cloud_presets().into_iter().find(|m| m.provider == Provider::Openai).unwrap();
+    let krea = by("krea-2-turbo");
+    let listed = vec![gpt.clone(), by("qwen-image-2-1"), by("z-image-turbo"), krea.clone()];
+    app.run("prefs.set", json!({"path": "integrations.ai.models", "value": listed})).unwrap();
+    let (_, mut f) = dialog_fields(&mut app);
+    // The dialog reads what the setup installed, with ComfyUI not running.
+    after_body(&mut app, &mut f);
+    assert!(f.get(FILES).is_none());
+    let ai = f["values"]["integrations"]["ai"].as_object().unwrap().clone();
+    let standing = Standing::of(&ai, &f);
+    let model = |i: usize| model_of(&ai["models"][i]).unwrap();
+    assert_eq!(standing.missing(&model(0)), Some(Missing::Key(Provider::Openai)));
+    assert_eq!(standing.missing(&model(1)), None, "Qwen Image 2.1 is installed");
+    let Some(Missing::Files(Some(wizard))) = standing.missing(&model(2)) else { panic!("{:?}", standing.missing(&model(2))) };
+    assert_eq!(wizard["id"], "z-image-turbo");
+    // Not one of the wizard's models (in this cut-down manifest): it says so, with nothing to press.
+    assert_eq!(standing.missing(&model(3)), Some(Missing::Files(None)));
+    draw_page(&mut f, "models");
+    // A model that can't run keeps its tick for when it can, and the panel doesn't offer it.
+    assert_eq!(f["values"]["integrations"]["ai"]["models"][2]["enabled"], json!(by("z-image-turbo").enabled));
+    // A typed key is enough for the page.
+    f[KEYS]["openai"] = json!("sk-typed");
+    assert_eq!(Standing::of(&ai, &f).missing(&model(0)), None);
+    f[KEYS]["openai"] = json!("");
+
+    // "Add an API key" goes to the API Keys page with the provider in front.
+    act_on_missing(&mut f, &Missing::Key(Provider::Openai));
+    draw_page(&mut f, "models");
+    assert_eq!((&f[PAGE], &f[KEY_FOCUS]), (&json!("keys"), &json!("openai")));
+    draw_page(&mut f, "keys");
+    assert_eq!(f[KEY_FOCUS_ONCE], false, "the field took the keyboard once");
+    assert_eq!(key_source(Provider::Openai).0, "https://platform.openai.com/api-keys");
+    for p in Provider::ALL.into_iter().filter(|p| !p.is_local()) {
+        assert!(key_source(p).0.starts_with("https://") && !key_source(p).2.is_empty(), "{p:?}");
+    }
+
+    // Install hands over to the wizard, on its Models screen with the model ticked.
+    act_on_missing(&mut f, &Missing::Files(Some(wizard)));
+    assert_eq!(f[ACTION], "install:z-image-turbo");
+    let id = app.ui.dialogs.iter().find(|d| crate::prefs_ui::is_preferences(&d.fields)).unwrap().id;
+    app.ui.dialog_mut(id).unwrap().fields = f.clone();
+    let mut fields = app.ui.dialog_mut(id).unwrap().fields.clone();
+    after_body(&mut app, &mut fields);
+    app.ui.dialog_mut(id).unwrap().fields = fields;
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    ctx.run_ui(Default::default(), |ui| crate::ai_setup_ui::window(&mut app, ui.ctx())).textures_delta.clear();
+    assert!(app.ui.dialogs.is_empty(), "the preferences were confirmed first");
+    assert!(app.ui.ai_setup.open && app.ui.ai_setup.page == crate::ai_setup_ui::Page::Models);
+    assert!(app.ui.ai_setup.models.iter().any(|m| m == "z-image-turbo"), "{:?}", app.ui.ai_setup.models);
+}
+
+#[test]
+fn local_models_before_local_ai_is_set_up_offer_the_setup() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    let (_, mut f) = dialog_fields(&mut app);
+    // Nothing installed, nothing to start, no server answered.
+    f.insert(SETUP.into(), json!({"installed": false, "catalog": [{"id": "z-image-turbo", "main": z_image("z").main_file(), "size": "12.3 GB"}]}));
+    let ai = f["values"]["integrations"]["ai"].as_object().unwrap().clone();
+    let lack = Standing::of(&ai, &f).missing(&model_of(&ai["models"][0]).unwrap());
+    assert!(matches!(&lack, Some(Missing::NoLocalAi(Some(w))) if w["id"] == "z-image-turbo"), "{lack:?}");
+    act_on_missing(&mut f, &lack.unwrap());
+    assert_eq!(f[ACTION], "install:z-image-turbo");
+    // A server that answered is enough to know.
+    f.insert(FILES.into(), json!({"diffusion_models": [z_image("z").main_file()]}));
+    assert_eq!(Standing::of(&ai, &f).missing(&model_of(&ai["models"][0]).unwrap()), None);
+}
+
+#[test]
+fn the_dialogs_own_look_at_the_server_is_not_reported_twice() {
+    use photocraft_engine::jobs::{JobEvent, JobId, JobOutcome};
+    let mut app = app();
+    let id = open_settings(&mut app, "");
+    app.ui.dialog_mut(id).unwrap().fields.insert(JOB.into(), json!({"id": 21, "action": "peek"}));
+    let event = |id: u64| JobEvent {
+        id: JobId(id),
+        command: "ai.comfyModels".into(),
+        label: "Connect to ComfyUI".into(),
+        document: None,
+        outcome: JobOutcome::Failed("Could not reach ComfyUI".into()),
+        error: None,
+    };
+    assert!(on_job_event(&mut app, &event(21)), "the dialog says how its connect ended");
+    assert!(!on_job_event(&mut app, &event(22)));
+}
+
+#[test]
+fn regions_are_drawn_on_the_canvas_and_sent_to_a_model_trained_on_boxes() {
+    use crate::canvas::ToolEvent;
+    use crate::state::Tool;
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.prompt = "a reading nook".into();
+    // Z-Image reads a layout as words: the Regions tab stays shut, the choice kept for later.
+    app.ui.ai_gen.model = "z".into();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    app.ui.tool = Tool::Brush;
+    draw_panel(&mut app);
+    assert!(!regions::tab_open(&app) && !regions::editing(&app) && app.ui.tool == Tool::Brush);
+    let down = |x, y| ToolEvent::Down { x, y, pressure: 1.0 };
+    assert!(!regions::pointer(&mut app, down(5.0, 5.0)), "the brush keeps the pointer");
+    // MOSS Image takes them: the tab opens and gives the pointer to the boxes.
+    app.ui.ai_gen.model = "moss".into();
+    draw_panel(&mut app);
+    assert!(regions::tab_open(&app) && regions::editing(&app) && app.ui.tool == Tool::Move);
+    let rect = |app: &PhotocraftApp| app.session.active().unwrap().doc.ai_regions.iter().map(|r| r.rect).collect::<Vec<_>>();
+    let gesture = |app: &mut PhotocraftApp, from: [f64; 2], to: [f64; 2]| {
+        assert!(regions::pointer(app, down(from[0], from[1])));
+        assert!(regions::pointer(app, ToolEvent::Move { x: to[0], y: to[1], pressure: 1.0 }));
+        assert!(regions::pointer(app, ToolEvent::Up { x: to[0], y: to[1] }));
+    };
+    // A drag on empty canvas draws a box, selected and open for typing; a click draws none.
+    gesture(&mut app, [10.0, 10.0], [60.0, 40.0]);
+    assert_eq!(rect(&app), [photocraft_geom::Rect::new(10, 10, 60, 40)]);
+    let id = app.session.active().unwrap().doc.ai_regions[0].id;
+    assert_eq!((app.ui.ai_gen.region, app.ui.ai_gen.regions.typing), (Some(id), Some(id)));
+    gesture(&mut app, [150.0, 80.0], [150.5, 80.0]);
+    assert_eq!((rect(&app).len(), app.ui.ai_gen.region), (1, None));
+    // A click selects it; dragging it then moves it (kept on the canvas), and its corner resizes it.
+    gesture(&mut app, [20.0, 20.0], [20.0, 20.0]);
+    assert_eq!(app.ui.ai_gen.region, Some(id));
+    gesture(&mut app, [20.0, 20.0], [30.0, 25.0]);
+    assert_eq!(rect(&app), [photocraft_geom::Rect::new(20, 15, 70, 45)]);
+    gesture(&mut app, [70.0, 45.0], [300.0, 60.0]);
+    assert_eq!(rect(&app), [photocraft_geom::Rect::new(20, 15, 200, 60)]);
+    // A second box goes in front.
+    gesture(&mut app, [100.0, 70.0], [140.0, 95.0]);
+    assert_eq!(rect(&app)[0], photocraft_geom::Rect::new(100, 70, 140, 95));
+    // Double-clicking a box types its description.
+    app.ui.ai_gen.regions.typing = None;
+    assert!(regions::double_click(&mut app, 30.0, 30.0));
+    assert_eq!(app.ui.ai_gen.regions.typing, Some(id));
+    app.run("ai.region.set", json!({"id": id, "caption": "a green armchair"})).unwrap();
+    draw_panel(&mut app);
+    // The pencil's editor draws, for a text region too.
+    app.ui.ai_gen.regions.editor = Some(id);
+    app.run("ai.region.set", json!({"id": id, "kind": "text", "text": "HELLO"})).unwrap();
+    draw_panel(&mut app);
+    app.run("ai.region.set", json!({"id": id, "kind": "object"})).unwrap();
+    // Generate sends the scene and the boxes; the layer keeps them, and Load Prompt brings them
+    // back with the tab.
+    let r = generate(&mut app).unwrap();
+    let sent = r["modelPrompt"].as_str().unwrap();
+    assert!(sent.contains("abs_centralized") && sent.contains("a green armchair") && sent.contains("a reading nook"), "{sent}");
+    let layer = r["layer"].as_u64().unwrap();
+    let kept = rect(&app);
+    app.run("ai.setRegions", json!({"regions": []})).unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Prompt;
+    assert!(load_prompt(&mut app, layer));
+    assert_eq!((rect(&app), app.ui.ai_gen.create_task), (kept, CreateTask::Regions));
+    // Another tool takes the pointer back; the boxes stay until the tab is left.
+    app.ui.tool = Tool::Brush;
+    draw_panel(&mut app);
+    assert!(regions::tab_open(&app) && !regions::editing(&app));
+    assert!(!regions::pointer(&mut app, down(30.0, 30.0)));
+    // The state reads and loads like the rest of the panel's.
+    let state = serde_json::to_value(&app.ui.ai_gen).unwrap();
+    assert_eq!(state["createTask"], "regions");
+}
+
+#[test]
+fn a_drag_on_a_box_that_is_not_selected_draws_a_new_one() {
+    use crate::canvas::ToolEvent;
+    let mut app = app();
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    app.ui.ai_gen.model = "moss".into();
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    draw_panel(&mut app);
+    assert!(regions::editing(&app));
+    // Two boxes cover the whole canvas: no empty place is left to start a new one from.
+    let full = |x0: i32, x1: i32| json!([x0, 0, x1 - x0, 100]);
+    app.run("ai.setRegions", json!({"regions": [{"rect": full(0, 100)}, {"rect": full(100, 200)}]})).unwrap();
+    let rects = |app: &PhotocraftApp| app.session.active().unwrap().doc.ai_regions.iter().map(|r| r.rect).collect::<Vec<_>>();
+    let ids = app.session.active().unwrap().doc.ai_regions.iter().map(|r| r.id).collect::<Vec<_>>();
+    let gesture = |app: &mut PhotocraftApp, from: [f64; 2], to: [f64; 2]| {
+        assert!(regions::pointer(app, ToolEvent::Down { x: from[0], y: from[1], pressure: 1.0 }));
+        assert!(regions::pointer(app, ToolEvent::Move { x: to[0], y: to[1], pressure: 1.0 }));
+        assert!(regions::pointer(app, ToolEvent::Up { x: to[0], y: to[1] }));
+    };
+    // A click selects the box under it.
+    app.ui.ai_gen.region = None;
+    gesture(&mut app, [150.0, 50.0], [150.0, 50.0]);
+    assert_eq!((app.ui.ai_gen.region, rects(&app).len()), (Some(ids[1]), 2));
+    // A drag on the other one, not selected, draws a new box over it and leaves it where it is.
+    gesture(&mut app, [20.0, 20.0], [60.0, 50.0]);
+    let now = rects(&app);
+    assert_eq!(now.len(), 3, "{now:?}");
+    assert!(now.contains(&photocraft_geom::Rect::new(20, 20, 60, 50)) && now.contains(&photocraft_geom::Rect::new(0, 0, 100, 100)), "{now:?}");
+    let new = app.ui.ai_gen.region.unwrap();
+    assert!(!ids.contains(&new));
+    // The selected box still moves.
+    gesture(&mut app, [30.0, 30.0], [40.0, 35.0]);
+    assert!(rects(&app).contains(&photocraft_geom::Rect::new(30, 25, 70, 55)), "{:?}", rects(&app));
+}
+
+#[test]
+fn a_box_label_selects_and_moves_its_box_even_behind_another() {
+    use crate::canvas::{ToolEvent, ViewXform};
+    let mut app = app();
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    app.ui.ai_gen.model = "moss".into();
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    draw_panel(&mut app);
+    // In front, one over the whole canvas; behind it, a smaller one.
+    app.run("ai.setRegions", json!({"regions": [{"rect": [0, 0, 200, 100]}, {"rect": [100, 40, 100, 60]}]})).unwrap();
+    let ids = app.session.active().unwrap().doc.ai_regions.iter().map(|r| r.id).collect::<Vec<_>>();
+    // The canvas at 100%, document pixels on screen points: the labels are where they are drawn.
+    let xf = ViewXform {
+        rect: egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(200.0, 100.0)),
+        zoom: 1.0,
+        center: [100.0, 50.0],
+        flip: false,
+        rotation: 0.0,
+        aspect: 1.0,
+    };
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    for _ in 0..3 {
+        ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            regions::canvas(&mut app, ui, &painter, &xf, None);
+        })
+        .textures_delta
+        .clear();
+    }
+    let gesture = |app: &mut PhotocraftApp, from: [f64; 2], to: [f64; 2]| {
+        assert!(regions::pointer(app, ToolEvent::Down { x: from[0], y: from[1], pressure: 1.0 }));
+        assert!(regions::pointer(app, ToolEvent::Move { x: to[0], y: to[1], pressure: 1.0 }));
+        assert!(regions::pointer(app, ToolEvent::Up { x: to[0], y: to[1] }));
+    };
+    // A click in the box behind lands on the one in front; a click on its label (above it)
+    // selects it.
+    gesture(&mut app, [150.0, 70.0], [150.0, 70.0]);
+    assert_eq!(app.ui.ai_gen.region, Some(ids[0]));
+    gesture(&mut app, [104.0, 36.0], [104.0, 36.0]);
+    assert_eq!(app.ui.ai_gen.region, Some(ids[1]));
+    // Dragging a label moves its box (kept on the canvas), and draws nothing new.
+    app.ui.ai_gen.region = None;
+    gesture(&mut app, [104.0, 36.0], [94.0, 26.0]);
+    let doc = &app.session.active().unwrap().doc;
+    assert_eq!((doc.ai_regions.len(), doc.ai_regions[1].rect), (2, photocraft_geom::Rect::new(90, 30, 190, 90)));
+    assert_eq!(app.ui.ai_gen.region, Some(ids[1]));
+    // The pointer's shape is the boxes' over the canvas only: not with a dialog, menu or window
+    // over it (no hover on the canvas).
+    let cursor = |app: &mut PhotocraftApp, hover: Option<egui::Pos2>| {
+        let out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            regions::canvas(app, ui, &painter, &xf, hover);
+        });
+        out.platform_output.cursor_icon
+    };
+    assert_eq!(cursor(&mut app, Some(egui::pos2(20.0, 80.0))), egui::CursorIcon::Crosshair);
+    assert_eq!(cursor(&mut app, None), egui::CursorIcon::Default);
+    // Hidden, a press on a label or the selected box draws instead, and drawing shows them again;
+    // a click selects nothing and leaves them hidden.
+    app.ui.ai_gen.regions.hidden = true;
+    gesture(&mut app, [100.0, 60.0], [100.0, 60.0]);
+    assert_eq!((app.ui.ai_gen.region, app.ui.ai_gen.regions.hidden), (None, true));
+    assert!(!regions::double_click(&mut app, 100.0, 60.0));
+    app.ui.ai_gen.region = Some(ids[1]);
+    assert!(regions::pointer(&mut app, ToolEvent::Down { x: 100.0, y: 60.0, pressure: 1.0 }));
+    assert!(regions::pointer(&mut app, ToolEvent::Move { x: 140.0, y: 90.0, pressure: 1.0 }));
+    assert!(!app.ui.ai_gen.regions.hidden, "shown as soon as a box is being drawn");
+    assert!(regions::pointer(&mut app, ToolEvent::Up { x: 140.0, y: 90.0 }));
+    let doc = &app.session.active().unwrap().doc;
+    assert_eq!((doc.ai_regions.len(), doc.ai_regions[0].rect), (3, photocraft_geom::Rect::new(100, 60, 140, 90)));
+}
+
+#[test]
+fn fibo_2_says_it_places_regions_roughly() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    let mut app = app();
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    add_model(&mut app, Model { id: "fibo".into(), ..Family::Fibo2.preset() });
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    app.ui.ai_gen.model = "moss".into();
+    let without = regions::rows(&app);
+    app.ui.ai_gen.model = "fibo".into();
+    assert_eq!(regions::rows(&app), without + 2, "the note's lines count in the panel's height");
+    let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_max_steps(64).build_eframe(move |cc| {
+        PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+        app
+    });
+    h.run_steps(8);
+    let note = "Regions are experimental with FIBO 2: it places them roughly and may not follow the boxes exactly.";
+    assert!(h.query_by_label(note).is_some());
+    // MOSS Image was trained on boxes: no note.
+    h.state_mut().ui.ai_gen.model = "moss".into();
+    h.run_steps(4);
+    assert!(h.query_by_label(note).is_none());
+}
+
+#[test]
+fn the_selected_ai_layer_keeps_the_layout_it_is_edited_to() {
+    use crate::canvas::ToolEvent;
+    let mut app = app();
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    app.ui.ai_gen.model = "moss".into();
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    app.ui.ai_gen.prompt = "a reading nook".into();
+    draw_panel(&mut app);
+    app.run("ai.setRegions", json!({"regions": [{"caption": "an armchair", "rect": [10, 10, 50, 40]}]})).unwrap();
+    let layer = generate(&mut app).unwrap()["layer"].as_u64().unwrap();
+    let kept = |app: &PhotocraftApp| {
+        let g = app.session.active().unwrap().doc.layer(photocraft_doc::LayerId(layer)).unwrap().generation.clone().unwrap();
+        (g.prompt, g.regions)
+    };
+    let doc_regions = |app: &PhotocraftApp| app.session.active().unwrap().doc.ai_regions.clone();
+    draw_panel(&mut app);
+    assert_eq!(regions::linked(&app), Some(layer));
+    // A box moved on the canvas and the scene typed: the layer keeps both.
+    let id = doc_regions(&app)[0].id;
+    app.ui.ai_gen.region = Some(id);
+    assert!(regions::pointer(&mut app, ToolEvent::Down { x: 20.0, y: 20.0, pressure: 1.0 }));
+    assert!(regions::pointer(&mut app, ToolEvent::Up { x: 30.0, y: 25.0 }));
+    app.ui.ai_gen.prompt = "a reading nook at dusk".into();
+    regions::keep_scene(&mut app);
+    assert_eq!(kept(&app), ("a reading nook at dusk".to_string(), doc_regions(&app)));
+    assert_eq!(doc_regions(&app)[0].rect, photocraft_geom::Rect::new(20, 15, 70, 55));
+    // So Load Prompt changes nothing.
+    assert!(load_prompt(&mut app, layer));
+    assert_eq!((app.ui.ai_gen.prompt.as_str(), doc_regions(&app)[0].rect), ("a reading nook at dusk", photocraft_geom::Rect::new(20, 15, 70, 55)));
+    // Coming back to the tab with the layer selected brings its scene and regions.
+    app.ui.ai_gen.create_task = CreateTask::Prompt;
+    draw_panel(&mut app);
+    app.ui.ai_gen.prompt.clear();
+    app.run("ai.setRegions", json!({"regions": []})).unwrap();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    draw_panel(&mut app);
+    assert_eq!((app.ui.ai_gen.prompt.clone(), doc_regions(&app)), kept(&app));
+    // Load from layer chooses the model the layer was made with again.
+    add_model(&mut app, z_image("z"));
+    app.ui.ai_gen.model = "z".into();
+    assert!(load_prompt(&mut app, layer));
+    assert_eq!((app.ui.ai_gen.model.as_str(), app.ui.ai_gen.create_task), ("moss", CreateTask::Regions));
+    // With another layer selected the edits stay the document's.
+    app.run("layer.new.layer", json!({})).unwrap();
+    draw_panel(&mut app);
+    assert_eq!(regions::linked(&app), None);
+    app.run("ai.setRegions", json!({"regions": []})).unwrap();
+    app.ui.ai_gen.prompt = "elsewhere".into();
+    regions::keep_scene(&mut app);
+    assert_eq!(kept(&app).0, "a reading nook at dusk");
+    assert_eq!(kept(&app).1.len(), 1);
+}
+
+#[test]
+fn the_region_editor_follows_the_selection_and_closes_on_a_press_outside_it() {
+    let mut app = app();
+    add_model(&mut app, Model { id: "moss".into(), ..Family::MossImage.preset() });
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+    app.ui.ai_gen.model = "moss".into();
+    app.ui.ai_gen.create_task = CreateTask::Regions;
+    app.run("ai.setRegions", json!({"regions": [{"rect": [0, 0, 50, 50]}, {"rect": [60, 0, 50, 50]}]})).unwrap();
+    let ids: Vec<u32> = app.session.active().unwrap().doc.ai_regions.iter().map(|r| r.id).collect();
+    let open = |app: &mut PhotocraftApp| {
+        app.ui.ai_gen.region = Some(ids[0]);
+        app.ui.ai_gen.regions.editor = Some(ids[0]);
+    };
+    open(&mut app);
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.regions.editor, Some(ids[0]), "open while its region is selected");
+    // Selecting another region (in the list or on the canvas) closes it.
+    app.ui.ai_gen.region = Some(ids[1]);
+    draw_panel(&mut app);
+    assert_eq!(app.ui.ai_gen.regions.editor, None);
+    // So does a press anywhere outside it.
+    open(&mut app);
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    let far = egui::pos2(5000.0, 5000.0);
+    let press = egui::RawInput {
+        events: vec![
+            egui::Event::PointerMoved(far),
+            egui::Event::PointerButton { pos: far, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ],
+        ..Default::default()
+    };
+    ctx.run_ui(Default::default(), |ui| panel(&mut app, ui, true)).textures_delta.clear();
+    assert_eq!(app.ui.ai_gen.regions.editor, Some(ids[0]), "no press, still open");
+    ctx.run_ui(press, |ui| panel(&mut app, ui, true)).textures_delta.clear();
+    assert_eq!(app.ui.ai_gen.regions.editor, None);
+}
+
+#[test]
+fn loras_are_added_per_model_with_a_strength_and_come_back_with_load_prompt() {
+    use loras::PanelLora;
+    use photocraft_aigen::Lora;
+    let mut app = app();
+    let ink = Lora { file: "ink_v1.safetensors".into(), name: "Ink".into(), strength: 0.6, trigger: "ink drawing".into() };
+    let oil = Lora { file: "styles/oil_paint.safetensors".into(), ..Lora::default() };
+    add_model(&mut app, Model { loras: vec![ink, oil], ..z_image("z") });
+    add_model(&mut app, Model { id: "gpt".into(), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
+    app.session.ai.set_key(Provider::Openai, "sk-test");
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    app.ui.ai_gen.model = "z".into();
+    app.ui.ai_gen.prompt = "a harbour".into();
+
+    // Open, Advanced has a LoRAs heading for a local model, and a row for each LoRA added.
+    let closed = wanted_height(&app);
+    app.ui.ai_gen.advanced = true;
+    // (The seed, Alpha Channel and the LoRAs heading.)
+    assert_eq!(wanted_height(&app), closed + 3.0 * ROW);
+    let added = vec![
+        PanelLora { file: "ink_v1.safetensors".into(), strength: 0.8, on: true },
+        PanelLora { file: "styles/oil_paint.safetensors".into(), strength: 1.2, on: false },
+        PanelLora { file: "gone.safetensors".into(), strength: 0.5, on: true },
+    ];
+    app.ui.ai_gen.loras.insert("z".into(), added.clone());
+    assert_eq!(wanted_height(&app), closed + 6.0 * ROW);
+    draw_panel(&mut app);
+    // Drawing leaves them as they are.
+    assert_eq!(app.ui.ai_gen.loras["z"], added);
+
+    // Generate sends those switched on; the layer keeps them with their names.
+    generate(&mut app).unwrap();
+    let d = app.session.active().unwrap();
+    let made = d.doc.layer(d.active_layer.unwrap()).unwrap().generation.as_deref().cloned().unwrap();
+    let kept: Vec<_> = made.loras.iter().map(|l| (l.name.as_str(), l.strength)).collect();
+    assert_eq!(kept, [("Ink", 0.8), ("gone", 0.5)]);
+    let layer = d.active_layer.unwrap().0;
+
+    // Another model has LoRAs of its own; a cloud model none, and no heading.
+    app.ui.ai_gen.model = "gpt".into();
+    // (The seed and Alpha Channel.)
+    assert_eq!(wanted_height(&app), closed + 2.0 * ROW);
+    assert!(loras::param(&app, current_model(&app).unwrap()).is_none());
+    draw_panel(&mut app);
+
+    // Load Prompt brings the model back with what it was made with.
+    app.ui.ai_gen.loras.insert("z".into(), Vec::new());
+    assert!(load_prompt(&mut app, layer));
+    assert_eq!(app.ui.ai_gen.model, "z");
+    let back: Vec<_> = app.ui.ai_gen.loras["z"].iter().map(|l| (l.file.as_str(), l.strength, l.on)).collect();
+    assert_eq!(back, [("ink_v1.safetensors", 0.8, true), ("gone.safetensors", 0.5, true)]);
+    // The panel's state is readable like the rest, and a state saved before LoRAs loads.
+    assert_eq!(serde_json::to_value(&app.ui).unwrap()["ai_gen"]["loras"]["z"][0]["file"], "ink_v1.safetensors");
+    let old: AiGenUi = serde_json::from_value(json!({"prompt": "x"})).unwrap();
+    assert!(old.loras.is_empty());
+}
+
+#[test]
+fn the_model_settings_keep_its_loras() {
+    use photocraft_aigen::Lora;
+    let mut app = app();
+    let ink = Lora { file: "ink_v1.safetensors".into(), name: "Ink".into(), strength: 0.6, trigger: "ink drawing".into() };
+    add_model(&mut app, Model { loras: vec![ink.clone(), Lora::default()], ..z_image("z") });
+    let (_, mut f) = dialog_fields(&mut app);
+    draw_section(&mut f);
+    let models = f["values"]["integrations"]["ai"]["models"].clone();
+    let z: Model = serde_json::from_value(models.as_array().unwrap().iter().find(|m| m["id"] == "z").unwrap().clone()).unwrap();
+    assert_eq!(z.loras, [ink, Lora::default()]);
+}
+
+#[test]
+fn each_model_is_listed_in_the_group_of_where_it_runs_from() {
+    let files = |names: &[&str]| std::collections::BTreeMap::from([("diffusion_models".to_string(), names.iter().map(|n| n.to_string()).collect::<Vec<_>>())]);
+    let (internal, external) = (files(&["mine.safetensors"]), files(&["theirs.safetensors", "mine.safetensors"]));
+    let local = |file: &str| Model { unet: file.into(), ..Family::ZImage.preset() };
+    let of = |m: &Model, installed: bool, existing: bool| Group::of(m, installed, &internal, &external, existing);
+    // PhotoCraft's own folder wins when both have the file.
+    assert_eq!(of(&local("mine.safetensors"), true, false), Group::Internal);
+    assert_eq!(of(&local("theirs.safetensors"), true, false), Group::External);
+    assert_eq!(of(&local("theirs.safetensors"), false, false), Group::Missing, "not installed, wherever its name points");
+    assert_eq!(of(&Model::cloud(Provider::Openai, "GPT", "gpt-image-2", false), false, false), Group::Cloud, "a cloud model without its key is still cloud");
+    // A custom workflow runs on the engine: PhotoCraft's, or the user's own ComfyUI.
+    let custom = Model { family: Family::Custom, ..Model::default() };
+    assert_eq!((of(&custom, true, false), of(&custom, true, true)), (Group::Internal, Group::External));
+    // The user's own ComfyUI: what it has is theirs, even a file the folders don't show.
+    assert_eq!(of(&local("elsewhere.safetensors"), true, true), Group::External);
+}
+
+#[test]
+fn a_group_folds_at_its_header_and_stays_folded() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    let mut app = app();
+    add_model(&mut app, Model { id: "gpt".into(), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
+    add_model(&mut app, z_image("z"));
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert(PAGE.into(), json!("models"));
+    let mut h = Harness::builder()
+        .with_size(vec2(1100.0, 700.0))
+        .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
+        .build_ui_state(
+            |ui, f: &mut Map<String, Value>| {
+                let mut values = f.get("values").cloned().unwrap_or_default();
+                if let Some(obj) = values.get_mut("integrations").and_then(Value::as_object_mut) {
+                    prefs_section(ui, obj, f, 600.0);
+                }
+                f.insert("values".into(), values);
+            },
+            f,
+        );
+    h.run();
+    assert!(h.query_by_label("Offer in the AI Gen panel: GPT Image 2").is_some(), "the cloud group starts open");
+    h.get_by_label("Cloud").click();
+    h.run();
+    // Folded: its header stays, its rows go; the other groups are as they were.
+    assert!(h.query_by_label("Cloud").is_some() && h.query_by_label("Offer in the AI Gen panel: GPT Image 2").is_none());
+    let folded = h.state()["values"]["integrations"]["ai"]["listCollapsed"].clone();
+    assert_eq!(folded, json!(["cloud"]));
+    // Kept at once, not only on OK: a Cancel doesn't bring the rows back next time.
+    let mut f = h.state().clone();
+    f.remove(ACTION);
+    after_body(&mut app, &mut f);
+    assert_eq!(app.session.prefs().integrations.ai.list_collapsed, ["cloud"]);
+    // And open again.
+    h.get_by_label("Cloud").click();
+    h.run();
+    assert!(h.query_by_label("Offer in the AI Gen panel: GPT Image 2").is_some());
+    assert_eq!(h.state()["values"]["integrations"]["ai"]["listCollapsed"], json!([]));
+}
+
+#[test]
+fn reset_puts_a_models_defaults_back_and_takes_its_loras_away() {
+    let lora = |file: &str| photocraft_aigen::Lora { file: file.into(), ..Default::default() };
+    // A recommended model: its own defaults, whatever was changed. Name and switch stay.
+    let qwen = Model::defaults().into_iter().find(|m| m.id == "qwen-image-2-1").unwrap();
+    let changed = Model { name: "My Qwen".into(), enabled: false, steps: 99, cfg: 7.5, lora: String::new(), loras: vec![lora("a.safetensors")], ..qwen.clone() };
+    let reset = defaults_for(&changed, None);
+    assert_eq!((reset.steps, reset.cfg, reset.lora.as_str()), (qwen.steps, qwen.cfg, qwen.lora.as_str()));
+    assert_eq!((reset.name.as_str(), reset.enabled, reset.id.as_str()), ("My Qwen", false, "qwen-image-2-1"));
+    assert!(reset.loras.is_empty());
+    // One Scan Server found: what it makes of the file, with the encoder the folders have.
+    let files = json!({"diffusion_models": ["z_image_bf16.safetensors"], "text_encoders": ["qwen_3_4b.safetensors"], "vae": ["ae.safetensors"]});
+    let found = photocraft_aigen::detect::detect(&serde_json::from_value(files.clone()).unwrap()).into_iter().next().unwrap();
+    let mine = Model { id: "z-image-bf16".into(), name: "z image".into(), steps: 3, loras: vec![lora("b.safetensors")], ..found.clone() };
+    let reset = defaults_for(&mine, files.as_object());
+    assert_eq!((reset.steps, reset.unet.as_str(), reset.clip.as_str()), (found.steps, "z_image_bf16.safetensors", found.clip.as_str()));
+    assert!(reset.loras.is_empty() && reset.id == "z-image-bf16");
+    // Without the server's lists: its architecture's settings, keeping its file.
+    let reset = defaults_for(&mine, None);
+    assert_eq!((reset.steps, reset.unet.as_str()), (Family::ZImage.preset().steps, "z_image_bf16.safetensors"));
+    // A cloud model: its preset.
+    let gpt = Model::cloud_presets().into_iter().next().unwrap();
+    let reset = defaults_for(&Model { id: "g".into(), seed: 5, ..gpt.clone() }, None);
+    assert_eq!((reset.seed, reset.api_model.as_str()), (gpt.seed, gpt.api_model.as_str()));
+}
+
+#[test]
+fn remove_not_installed_asks_then_takes_only_the_models_it_names() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    let models = vec![json!({"id": "a", "name": "Left Over"}), json!({"id": "b", "name": "Keep"}), json!({"id": "c", "name": "Gone Too"})];
+    let state = (models, serde_json::Map::from_iter([(PRUNE.to_string(), json!(true)), (SELECTED.to_string(), json!(1))]), false);
+    let mut h = Harness::builder()
+        .with_size(vec2(900.0, 600.0))
+        .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
+        .build_ui_state(
+            |ui, (models, f, went): &mut (Vec<Value>, Map<String, Value>, bool)| {
+                *went |= prune_question(ui.ctx(), models, f, &[0, 2]);
+            },
+            state,
+        );
+    h.run();
+    // It names them, and changes nothing until Remove.
+    assert!(h.query_by_label("•  Left Over").is_some() && h.query_by_label("•  Gone Too").is_some());
+    assert_eq!(h.state().0.len(), 3);
+    h.get_by_label("Remove").click();
+    h.run();
+    let (models, f, went) = h.state();
+    assert!(*went);
+    assert_eq!(models, &vec![json!({"id": "b", "name": "Keep"})]);
+    assert_eq!(f[ACTION], json!("panelLoras:a\nc"));
+    assert!(f.get(PRUNE).is_none() && f.get(SELECTED).is_none());
+    assert!(f[STATUS]["text"].as_str().unwrap().starts_with("2 models"));
+}
+
+#[test]
+fn model_settings_offer_the_files_of_the_folders_as_well_as_the_servers() {
+    // The server was read before a folder was added (or not at all: the engine is stopped when
+    // the folders change). Its LoRAs are offered all the same, from what the folder has.
+    let listing = json!([
+        {"path": "C:/LayerShop/models", "kind": "setup", "found": true, "files": {"vae": ["ae.safetensors"]}},
+        {"path": "D:/mine/models", "kind": "yours", "found": true, "files": {"loras": ["b.safetensors", "A.safetensors"]}},
+    ]);
+    let mut f = Map::from_iter([("__aiFolderListing".to_string(), listing)]);
+    let files = known_files(&f).unwrap();
+    assert_eq!((files["loras"].clone(), files["vae"].clone()), (json!(["A.safetensors", "b.safetensors"]), json!(["ae.safetensors"])));
+    f.insert(FILES.into(), json!({"loras": ["b.safetensors", "server_only.safetensors"]}));
+    assert_eq!(known_files(&f).unwrap()["loras"], json!(["A.safetensors", "b.safetensors", "server_only.safetensors"]));
+    // Nothing known: typed names.
+    assert!(known_files(&Map::new()).is_none());
+}
+
+// ---------- Prompt enhancement ----------
+
+/// A text service: answers chat requests with one prompt (after `wait`, unless `release` says
+/// go first) and model listings with two models.
+struct FakeText {
+    wait: std::time::Duration,
+    release: Arc<std::sync::atomic::AtomicBool>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeText {
+    fn new(wait_ms: u64) -> Arc<Self> {
+        Arc::new(Self { wait: std::time::Duration::from_millis(wait_ms), release: Default::default(), asked: Mutex::new(Vec::new()) })
+    }
+}
+
+impl Transport for FakeText {
+    fn send(&self, r: &Request) -> photocraft_aigen::Result<Response> {
+        self.asked.lock().unwrap().push(String::from_utf8_lossy(&r.body).into_owned());
+        let start = std::time::Instant::now();
+        while start.elapsed() < self.wait && !self.release.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let body = if r.url.contains("/models") {
+            json!({"data": [{"id": "claude-opus-5-5"}, {"id": "claude-haiku-5-5"}]})
+        } else {
+            json!({"content": [{"type": "text", "text": "A ginger cat asleep on a sunlit windowsill"}]})
+        };
+        Ok(Response { status: 200, body: body.to_string().into_bytes() })
+    }
+}
+
+/// [`app`] with prompts enhanced by Claude through `fake`, and a prompt typed.
+fn enhancing_app(fake: &Arc<FakeText>) -> PhotocraftApp {
+    let mut app = app();
+    app.session.ai.transport = Some(fake.clone());
+    app.session.ai.set_text_key(TextProvider::Anthropic, "ak");
+    app.run("prefs.set", json!({"path": "integrations.ai.enhance.provider", "value": "anthropic"})).unwrap();
+    add_model(&mut app, z_image("z"));
+    app.ui.ai_gen.prompt = "cat window".into();
+    app
+}
+
+/// Let the jobs end and their events reach the panel, until `done` or about four seconds.
+fn tick_until(app: &mut PhotocraftApp, done: impl Fn(&PhotocraftApp) -> bool) {
+    let ctx = egui::Context::default();
+    for _ in 0..400 {
+        crate::jobs_ui::tick(app, &ctx);
+        if done(app) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn enhance_puts_the_answer_in_the_prompt_and_the_original_can_come_back() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    assert_eq!(enhance::blocked(&app), None);
+    let r = menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
+    assert_eq!(r["prompt"], "A ginger cat asleep on a sunlit windowsill");
+    assert_eq!(app.ui.ai_gen.prompt, "A ginger cat asleep on a sunlit windowsill");
+    assert_eq!(app.ui.ai_gen.before_enhance.as_deref(), Some("cat window"));
+    let line = enhance::enhanced_by(&app).unwrap();
+    assert!(line.contains("Claude (claude-haiku-5-5)"), "{line}");
+    assert!(enhance::restore_tip(&app).contains("Shift-click"));
+    // The task and the image model go with the prompt.
+    let asked = fake.asked.lock().unwrap().last().cloned().unwrap();
+    assert!(asked.contains("a new image") && asked.contains("The image model is Z-Image"), "{asked}");
+    draw_panel(&mut app);
+    assert_eq!(menu(&mut app, enhance::RESTORE_MENU, &json!({})), Some(Ok(json!({"restored": true}))));
+    assert_eq!(app.ui.ai_gen.prompt, "cat window");
+    assert_eq!(menu(&mut app, enhance::RESTORE_MENU, &json!({})), Some(Ok(json!({"restored": false}))));
+    // An edit's instruction is enhanced as one.
+    app.ui.ai_gen.mode = Mode::Edit;
+    menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
+    assert!(fake.asked.lock().unwrap().last().unwrap().contains("Keep it an instruction"));
+}
+
+#[test]
+fn enhance_says_why_it_cant_run() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    app.ui.ai_gen.prompt = "  ".into();
+    assert!(enhance::blocked(&app).unwrap().contains("Write a prompt"));
+    assert!(menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().is_err());
+    app.ui.ai_gen.prompt = "cat".into();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        app.run("prefs.set", json!({"path": "integrations.ai.enhance.provider", "value": "openrouter"})).unwrap();
+        assert!(enhance::blocked(&app).unwrap().contains("OpenRouter needs an API key"));
+    }
+    app.session.ai.transport = None;
+    assert!(enhance::blocked(&app).unwrap().contains("desktop app"));
+    draw_panel(&mut app);
+    assert!(fake.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_background_enhancement_veils_the_prompt_and_cancel_keeps_it() {
+    let fake = FakeText::new(20_000);
+    let mut app = enhancing_app(&fake);
+    app.background_jobs = true;
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let r = menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
+    assert_eq!(r["pending"], true);
+    assert!(enhance::running(&app).is_some());
+    assert!(menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().is_err(), "one at a time");
+    // The panel draws the veil over the prompt, in a wide panel and a narrow one.
+    draw_panel(&mut app);
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    for width in [220.0, 520.0] {
+        ctx.run_ui(Default::default(), |ui| {
+            ui.set_max_width(width);
+            panel(&mut app, ui, false);
+        })
+        .textures_delta
+        .clear();
+    }
+    let id = enhance::running(&app).unwrap().id;
+    assert!(crate::jobs_ui::cancel(&mut app, id));
+    fake.release.store(true, std::sync::atomic::Ordering::Relaxed);
+    tick_until(&mut app, |app| app.ui.ai_gen.enhance_job.is_none());
+    assert_eq!(app.ui.ai_gen.enhance_job, None);
+    assert_eq!(app.ui.ai_gen.prompt, "cat window", "a cancel leaves the prompt as it was");
+    assert_eq!(app.ui.ai_gen.before_enhance, None);
+}
+
+#[test]
+fn a_background_enhancement_lands_in_the_prompt() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    app.background_jobs = true;
+    menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
+    tick_until(&mut app, |app| app.ui.ai_gen.enhance_job.is_none());
+    assert_eq!(app.ui.ai_gen.prompt, "A ginger cat asleep on a sunlit windowsill");
+    assert!(app.ui.notices.is_empty());
+}
+
+#[test]
+fn enhancement_job_events_are_the_panels() {
+    use photocraft_engine::jobs::{JobEvent, JobId, JobOutcome};
+    let mut app = app();
+    app.ui.ai_gen.prompt = "cat".into();
+    let event = |id: u64, outcome: JobOutcome| JobEvent { id: JobId(id), command: enhance::ENHANCE.into(), label: "Enhance Prompt".into(), document: None, outcome, error: None };
+    assert!(!on_job_event(&mut app, &event(3, JobOutcome::Cancelled)), "not the panel's");
+    app.ui.ai_gen.enhance_job = Some(3);
+    assert!(on_job_event(&mut app, &event(3, JobOutcome::Failed("Claude refused the request: bad key.".into()))));
+    assert_eq!(app.ui.ai_gen.enhance_job, None);
+    assert_eq!(app.ui.ai_gen.prompt, "cat");
+    assert!(app.ui.notices.iter().any(|n| n.plain_text().contains("bad key")));
+    app.ui.ai_gen.enhance_job = Some(4);
+    assert!(on_job_event(&mut app, &event(4, JobOutcome::Done(json!({"prompt": "  ", "provider": "xai"})))));
+    assert_eq!(app.ui.ai_gen.prompt, "cat", "an empty answer changes nothing");
+    app.ui.ai_gen.enhance_job = Some(5);
+    assert!(on_job_event(&mut app, &event(5, JobOutcome::Done(json!({"prompt": "A cat", "provider": "xai", "textModel": "grok-4.7"})))));
+    assert_eq!((app.ui.ai_gen.prompt.as_str(), app.ui.ai_gen.before_enhance.as_deref()), ("A cat", Some("cat")));
+    assert!(enhance::enhanced_by(&app).unwrap().contains("Grok (grok-4.7)"));
+}
+
+#[test]
+fn the_prompt_enhancement_page_chooses_one_service_lists_models_and_saves_keys() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    let (_, mut f) = dialog_fields(&mut app);
+    // Each tab draws with each service chosen, and so does every other page.
+    for tab in ["local", "cloud", "settings", "nope"] {
+        f.insert("__aiEnhanceTab".into(), json!(tab));
+        for p in TextProvider::ALL {
+            f["values"]["integrations"]["ai"]["enhance"]["provider"] = json!(p.key());
+            draw_page(&mut f, "enhance");
+        }
+    }
+    assert!(f.get("__aiEnhanceTab").is_none(), "an unknown tab is dropped: the page opens on the default one");
+    draw_section(&mut f);
+    // Settings keeps the timeout and the length in their ranges.
+    f.insert("__aiEnhanceTab".into(), json!("settings"));
+    f["values"]["integrations"]["ai"]["enhance"] =
+        json!({"provider": "anthropic", "models": {"anthropic": "claude-opus-5-5"}, "timeoutSeconds": 99999, "words": 0, "instructions": ""});
+    draw_page(&mut f, "enhance");
+    assert_eq!(f["values"]["integrations"]["ai"]["enhance"]["timeoutSeconds"], 600);
+    assert_eq!(f["values"]["integrations"]["ai"]["enhance"]["words"], photocraft_aigen::enhance::MIN_WORDS);
+    // The refresh button asks the service for its models.
+    f.insert("__aiEnhanceTab".into(), json!("cloud"));
+    f.insert(ACTION.into(), json!("enhanceModels:anthropic"));
+    after_body(&mut app, &mut f);
+    assert_eq!(f["__aiEnhanceListed"]["anthropic"], json!(["claude-opus-5-5", "claude-haiku-5-5"]));
+    assert_eq!(f["__aiEnhanceStatus"]["error"], false);
+    draw_page(&mut f, "enhance");
+    f.insert(ACTION.into(), json!("enhanceModels:nope"));
+    after_body(&mut app, &mut f);
+    // Save keeps the edited instructions at once; the built-in ones are kept as none.
+    f["values"]["integrations"]["ai"]["enhance"]["instructions"] = json!("Write haiku.");
+    f.insert(ACTION.into(), json!(enhance::SAVE_INSTRUCTIONS));
+    after_body(&mut app, &mut f);
+    assert_eq!(app.session.prefs().integrations.ai.enhance.instructions, "Write haiku.");
+    f["values"]["integrations"]["ai"]["enhance"]["instructions"] = json!(photocraft_aigen::enhance::DEFAULT_INSTRUCTIONS);
+    f.insert(ACTION.into(), json!(enhance::SAVE_INSTRUCTIONS));
+    after_body(&mut app, &mut f);
+    assert_eq!(app.session.prefs().integrations.ai.enhance.instructions, "");
+    // Edits in the box wait for Save, and are drawn until then.
+    f["values"]["integrations"]["ai"]["enhance"]["instructions"] = json!("");
+    f.insert("__aiEnhanceTab".into(), json!("settings"));
+    f.insert("__aiEnhanceEditing".into(), json!("Draft words"));
+    draw_page(&mut f, "enhance");
+    assert_eq!(f["__aiEnhanceEditing"], "Draft words");
+    assert_eq!(f["values"]["integrations"]["ai"]["enhance"]["instructions"], "", "not saved yet");
+    // An OpenRouter key typed on the API Keys page is saved with the others, never in the preferences.
+    f[KEYS]["openrouter"] = json!("or-secret");
+    prefs_confirmed(&mut app, &f).unwrap();
+    assert_eq!(app.session.ai.text_key(TextProvider::Openrouter), "or-secret");
+    assert_eq!(app.session.execute("ai.keys", json!({})).unwrap()["openrouter"], true);
+    assert!(!app.session.prefs_to_json().contains("or-secret"));
+    // The draft is what the engine enhances with once it is saved.
+    let ai: Settings = serde_json::from_value(f["values"]["integrations"]["ai"].clone()).unwrap();
+    assert_eq!(ai.enhance.model(TextProvider::Anthropic), "claude-opus-5-5");
+}
+
+#[test]
+fn a_batch_and_a_style_go_with_generate_and_a_fixed_seed_warns() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.ui.ai_gen.prompt = "a fox".into();
+    assert_eq!(menu(&mut app, BATCH_MENU, &json!({"count": 3})), Some(Ok(json!({"count": 3}))));
+    for bad in [json!({}), json!({"count": 0}), json!({"count": 11}), json!({"count": "2"})] {
+        assert!(menu(&mut app, BATCH_MENU, &bad).unwrap().is_err(), "{bad}");
+    }
+    assert_eq!(menu(&mut app, styles::STYLE_MENU, &json!({"style": "Anime"})), Some(Ok(json!({"style": "anime"}))));
+    assert!(menu(&mut app, styles::STYLE_MENU, &json!({"style": "nope"})).unwrap().is_err());
+    assert!(menu(&mut app, styles::STYLE_MENU, &json!({"style": 4})).unwrap().is_err());
+    assert_eq!(app.ui.ai_gen.style, "anime", "a bad id leaves the choice");
+    let r = generate(&mut app).unwrap();
+    assert_eq!(r["layers"].as_array().unwrap().len(), 3);
+    assert!(r["modelPrompt"].as_str().unwrap().contains("Style: an anime illustration"));
+    // Load from layer chooses the style it was made with again.
+    menu(&mut app, styles::STYLE_MENU, &json!({"style": ""})).unwrap().unwrap();
+    assert!(load_prompt(&mut app, r["layer"].as_u64().unwrap()));
+    assert_eq!(app.ui.ai_gen.style, "anime");
+    // Out of range in a saved state, the batch is still one Generate can ask for.
+    app.ui.ai_gen.batch = 99;
+    assert_eq!(app.ui.ai_gen.batch(), 10);
+    app.ui.ai_gen.batch = 0;
+    assert_eq!(app.ui.ai_gen.batch(), 1);
+
+    // A batch of one seed warns, until the seed is random again; one image never does.
+    let current = current_model(&app).cloned().unwrap();
+    app.ui.ai_gen.batch = 4;
+    app.ui.ai_gen.seed = Some(5);
+    assert!(batch_warning(&app, &current).unwrap().contains("all 4 images will come out the same"));
+    app.ui.ai_gen.seed = None;
+    assert!(batch_warning(&app, &current).is_none());
+    assert!(batch_warning(&app, &Model { seed: 42, ..current.clone() }).is_some(), "a model's own fixed seed");
+    app.ui.ai_gen.batch = 1;
+    assert!(batch_warning(&app, &Model { seed: 42, ..current }).is_none());
+    draw_panel(&mut app);
+}
+
+#[test]
+fn a_style_chosen_after_enhancing_warns_and_enhance_again_writes_for_it_from_the_typed_prompt() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    // Enhanced without a style: nothing to warn about.
+    menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
+    assert!(!fake.asked.lock().unwrap().last().unwrap().contains("A style preset decides"));
+    assert_eq!(enhance::style_mismatch(&app), None);
+    // A style chosen since: the prompt may fight it.
+    menu(&mut app, styles::STYLE_MENU, &json!({"style": "anime"})).unwrap().unwrap();
+    let warning = enhance::style_mismatch(&app).unwrap();
+    assert!(warning.contains("without a style") && warning.contains("Anime"), "{warning}");
+    draw_panel(&mut app);
+    // Enhance again: the prompt as typed goes, written for Anime; it stays the one to go back to.
+    menu(&mut app, enhance::ENHANCE_MENU, &json!({"again": true})).unwrap().unwrap();
+    let asked = fake.asked.lock().unwrap().last().cloned().unwrap();
+    assert!(asked.contains("\"cat window\"") && asked.contains("the Anime preset replaces them"), "{asked}");
+    assert_eq!(app.ui.ai_gen.before_enhance.as_deref(), Some("cat window"));
+    assert_eq!((app.ui.ai_gen.enhanced_style.as_str(), enhance::style_mismatch(&app)), ("anime", None));
+    // Another style, or none, warns again; typing makes the prompt the user's, with no warning.
+    menu(&mut app, styles::STYLE_MENU, &json!({"style": "watercolour"})).unwrap().unwrap();
+    assert!(enhance::style_mismatch(&app).unwrap().contains("enhanced for Anime and may work against Watercolour"));
+    menu(&mut app, styles::STYLE_MENU, &json!({"style": ""})).unwrap().unwrap();
+    assert!(enhance::style_mismatch(&app).unwrap().contains("no longer chosen"));
+    app.ui.ai_gen.before_enhance = None;
+    assert_eq!(enhance::style_mismatch(&app), None);
+    // The button's tooltip names the style it writes for.
+    menu(&mut app, styles::STYLE_MENU, &json!({"style": "anime"})).unwrap().unwrap();
+    assert!(enhance::tip(&app).contains("It writes for the Anime style chosen."));
+}
+
+#[test]
+fn local_models_are_chosen_in_their_tab_need_no_key_and_install_with_the_setup() {
+    let fake = FakeText::new(0);
+    let mut app = enhancing_app(&fake);
+    let (_, mut f) = dialog_fields(&mut app);
+    f.insert("__aiEnhanceTab".into(), json!("local"));
+    // Not set up: every model offers Install, greyed, and the page offers the setup.
+    for id in ["gemma-4-e2b", "qwen3-4b", "gemma-4-e4b"] {
+        f["values"]["integrations"]["ai"]["enhance"] = json!({"provider": "local", "models": {"local": id}});
+        draw_page(&mut f, "enhance");
+    }
+    // A model's file in a models folder shows it as installed (the folders the page lists).
+    f.insert("__aiSetup".into(), json!({"route": "managed"}));
+    f.insert("__aiFolderListing".into(), json!([{"kind": "setup", "files": {"text_encoders": ["gemma4_e4b_it_fp8_scaled.safetensors"]}}]));
+    draw_page(&mut f, "enhance");
+    // Installing without the desktop app's setup says why.
+    f.insert(ACTION.into(), json!("enhanceInstall:gemma-4-e2b"));
+    after_body(&mut app, &mut f);
+    let status = &f["__aiEnhanceInstallStatus"];
+    assert_eq!((status["model"].as_str(), status["error"].as_bool()), (Some("gemma-4-e2b"), Some(true)), "{status}");
+    f.insert(ACTION.into(), json!("enhanceInstall:nope"));
+    after_body(&mut app, &mut f);
+    f.insert(ACTION.into(), json!("enhanceStopInstall"));
+    after_body(&mut app, &mut f);
+    // Chosen: Enhance needs no key for it.
+    app.run("prefs.set", json!({"path": "integrations.ai.enhance.provider", "value": "local"})).unwrap();
+    assert_eq!(enhance::blocked(&app), None);
+    // The Cloud Models tab draws with no cloud service chosen.
+    f.insert("__aiEnhanceTab".into(), json!("cloud"));
+    draw_page(&mut f, "enhance");
+}
+/// An OpenAI that answers with a 3-frame 4 × 4 GIF and keeps what it was asked.
+struct GifOpenai(Mutex<Vec<Value>>);
+
+impl Transport for GifOpenai {
+    fn send(&self, r: &Request) -> photocraft_aigen::Result<Response> {
+        self.0.lock().unwrap().push(serde_json::from_slice(&r.body).unwrap_or(Value::Null));
+        let frame = |c: [u8; 3]| photocraft_codecs::web::GifFrame { indices: vec![0; 16], palette: vec![c], transparent: None, delay_cs: 20 };
+        let gif = photocraft_codecs::web::encode_gif_animated(4, 4, &[frame([255, 0, 0]), frame([0, 255, 0]), frame([0, 0, 255])], true).unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, gif);
+        Ok(Response { status: 200, body: json!({"data": [{"b64_json": b64}]}).to_string().into_bytes() })
+    }
+}
+
+#[test]
+fn animate_makes_a_gif_on_the_timeline_with_a_model_that_can() {
+    let mut app = app();
+    let sent = Arc::new(GifOpenai(Mutex::new(Vec::new())));
+    app.session.ai.transport = Some(sent.clone());
+    app.run("ai.setKey", json!({"provider": "openai", "key": "sk-test"})).unwrap();
+    let flare = Model { id: "flare".into(), ..Model::cloud(Provider::Openai, "GPT Image 2.6 Flare", "gpt-image-2.6-flare", true) };
+    let still = Model { id: "still".into(), ..Model::cloud(Provider::Openai, "GPT Image 2.5 Flare", "gpt-image-2.5-flare", true) };
+    add_model(&mut app, flare.clone());
+    add_model(&mut app, still.clone());
+    app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+    app.ui.ai_gen.prompt = "a lantern swaying".into();
+    // Offered for a new picture and an edit with a model that animates; never for the others.
+    assert!(animates(&flare, GenerationMode::Txt2img) && animates(&flare, GenerationMode::ImgEdit));
+    assert!(!animates(&flare, GenerationMode::Inpaint) && !animates(&still, GenerationMode::Txt2img));
+    // Settings say so under Used for, from the model ID: there is nothing to tick.
+    assert_eq!(uses(&flare), ["Text to image", "Editing", "Animation"]);
+    assert_eq!(uses(&still), ["Text to image", "Editing"]);
+    // Advanced has its rows (the box; ticked, the frames row too), part of the panel's height.
+    app.ui.ai_gen.advanced = true;
+    app.ui.ai_gen.model = "still".into();
+    let without = wanted_height(&app);
+    app.ui.ai_gen.model = "flare".into();
+    let boxed = wanted_height(&app);
+    assert!(boxed > without);
+    app.ui.ai_gen.animate = true;
+    assert!(wanted_height(&app) > boxed);
+    app.ui.ai_gen.advanced = false;
+    assert_eq!(wanted_height(&app), {
+        app.ui.ai_gen.model = "still".into();
+        let h = wanted_height(&app);
+        app.ui.ai_gen.model = "flare".into();
+        h
+    });
+    // Ticked, with times the dropdowns don't list (set through the control channel), clamped.
+    app.ui.ai_gen.animate = true;
+    app.ui.ai_gen.frames = 3;
+    app.ui.ai_gen.frame_ms = 99_999;
+    app.ui.ai_gen.batch = 4;
+    draw_panel(&mut app);
+    generate(&mut app).unwrap();
+    let asked = sent.0.lock().unwrap().last().cloned().unwrap();
+    assert_eq!((asked["output_format"].as_str(), asked["frame_count"].as_u64(), asked["frame_duration_ms"].as_u64()), (Some("gif"), Some(3), Some(2000)));
+    let t = app.session.active().unwrap().doc.timeline.clone().expect("a timeline");
+    assert_eq!((t.duration, t.current), (3, 0));
+    assert!(app.ui.timeline.open && !app.ui.timeline.playing);
+    // Unticked, the same model makes a still again (and the batch applies).
+    app.ui.ai_gen.animate = false;
+    app.ui.ai_gen.batch = 1;
+    generate(&mut app).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(sent.0.lock().unwrap().last().unwrap()["output_format"], "gif");
+}
+
+/// Play beside Frames and Interval: shown for a selected video layer; the timeline takes its
+/// rate and length and plays it from the first frame, also with the Timeline panel closed.
+#[test]
+fn play_shows_the_selected_animation_on_the_canvas() {
+    let mut app = app();
+    app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+    assert_eq!(active_animation(&app), None, "a pixel layer is no animation");
+    app.run("timeline.create", json!({"duration": 30, "fps": 30.0})).unwrap();
+    app.run("layer.videoLayers.newBlankVideoLayer", json!({})).unwrap();
+    app.run("layer.videoLayers.interpretFootage", json!({"fps": 5.0})).unwrap();
+    let (frames, fps) = active_animation(&app).unwrap();
+    assert_eq!((frames, fps), (30, 5.0));
+    let ctx = egui::Context::default();
+    play_animation(&mut app, &ctx, frames, fps, true);
+    let t = app.session.active().unwrap().doc.timeline.clone().unwrap();
+    assert_eq!((t.fps, t.duration, t.current, t.work_end), (5.0, 30, 0, 30));
+    assert!(app.ui.timeline.playing && !app.ui.timeline.open);
+    // The playhead moves on with the panel closed.
+    app.ui.timeline.last_time = -1.0;
+    crate::timeline_ui::windows(&mut app, &ctx);
+    assert_eq!(app.session.active().unwrap().doc.timeline.as_ref().unwrap().current, 1);
+    play_animation(&mut app, &ctx, frames, fps, false);
+    assert!(!app.ui.timeline.playing);
+    // The timeline deleted (the Timeline panel's bin): Advanced says so, and Play makes a new one.
+    app.run("timeline.delete", json!({})).unwrap();
+    assert!(untimed(&app));
+    app.ui.ai_gen.animate = true;
+    app.ui.ai_gen.untimed = true;
+    let flare = Model { id: "flare".into(), ..Model::cloud(Provider::Openai, "GPT Image 2.6 Flare", "gpt-image-2.6-flare", true) };
+    let ai = &app.ui.ai_gen;
+    assert_eq!(animate_rows(ai, Some(&flare), GenerationMode::Txt2img), 3, "the box, Frames and the note");
+    play_animation(&mut app, &ctx, frames, fps, true);
+    let t = app.session.active().unwrap().doc.timeline.clone().expect("Play made a timeline");
+    assert_eq!((t.fps, t.duration), (5.0, 30));
+    assert!(app.ui.timeline.playing && !untimed(&app));
+}
+
+/// Save GIF beside Play: the selected animation, at its own rate and length, as one GIF where the
+/// person picks, without the Timeline panel; with no timeline (it was deleted) one is made for it.
+#[test]
+fn save_gif_writes_the_selected_animation() {
+    use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
+    let dir = std::env::temp_dir().join(format!("photocraft-ai-save-gif-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("lantern.gif").to_string_lossy().replace('\\', "/");
+    let (show, asked) = crate::file_dialog::fake(vec![Some(FileDialogAnswer::SaveTo(target.clone()))]);
+    let mut app = PhotocraftApp::new(Session::new(), crate::Services { file_dialog: Some(show), ..Default::default() });
+    app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+    app.run("timeline.create", json!({"duration": 30, "fps": 30.0})).unwrap();
+    app.run("layer.videoLayers.newBlankVideoLayer", json!({})).unwrap();
+    app.run("layer.videoLayers.interpretFootage", json!({"fps": 5.0})).unwrap();
+    app.run("timeline.delete", json!({})).unwrap();
+    let (frames, fps) = active_animation(&app).unwrap();
+    app.ui.timeline.playing = true;
+    save_animation(&mut app, frames, fps);
+    let t = app.session.active().unwrap().doc.timeline.clone().expect("Save made a timeline");
+    assert_eq!((t.fps, t.duration, t.work_end), (5.0, 30, 30));
+    assert!(!app.ui.timeline.playing, "saving stops playback");
+    let ctx = egui::Context::default();
+    for _ in 0..3 {
+        app.poll_file_dialog(&ctx, None);
+    }
+    assert!(matches!(asked.borrow().as_slice(), [FileDialogRequest::Save { suggested }] if suggested.ends_with(".gif")), "{:?}", asked.borrow());
+    let gif = std::fs::read(&target).unwrap();
+    assert_eq!(&gif[..6], b"GIF89a");
+    let _ = std::fs::remove_dir_all(&dir);
+}

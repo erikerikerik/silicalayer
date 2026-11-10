@@ -1,0 +1,90 @@
+//! Inpaint through the engine against a running ComfyUI server, without the app: the same
+//! `ai.generate {"mode": "inpaint"}` the AI Gen panel runs, so what the model is sent (the crop,
+//! the faded mask, the workflow) is what the app sends.
+//!
+//! ```sh
+//! cargo run -p photocraft-engine --example ai_inpaint -- http://127.0.0.1:8188                 # list detected models
+//! cargo run -p photocraft-engine --example ai_inpaint -- http://127.0.0.1:8188 2 photo.png 292,291,584,489 "a deer eating grass" out.png [context] [strength]
+//! ```
+//!
+//! The rectangle is the selection (`x,y,width,height`); `out.png` is the flattened result.
+//! With `img2img` in place of the rectangle the whole picture is redrawn instead (image to image;
+//! the strength then defaults to 0.6). With `edit` the prompt is an instruction to an edit model
+//! about the whole picture, and with `edit:x,y,width,height` about that selection (crop, edit,
+//! composite); a further argument after the strength names a picture to refer to ("image 2"),
+//! and one after that the quality (`draft`, `standard` or `detail`).
+
+use std::sync::Arc;
+
+use photocraft_aigen::{UreqTransport, comfy_models, detect::detect};
+use photocraft_engine::Session;
+use serde_json::json;
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let url = args.first().cloned().unwrap_or_else(|| "http://127.0.0.1:8188".into());
+    let transport = Arc::new(UreqTransport::new());
+    let folders = comfy_models(transport.as_ref(), &url).map_err(|e| e.to_string())?;
+    let models = detect(&folders);
+    let Some(pick) = args.get(1) else {
+        for (i, m) in models.iter().enumerate() {
+            println!("{i:>2}  {:<26} {:<44} inpaints: {:<5} edits: {}", m.family.label(), m.name, m.can_inpaint(), m.can_edit());
+        }
+        return Ok(());
+    };
+    let index: usize = pick.parse().map_err(|_| format!("`{pick}` is not a model number"))?;
+    let mut model = models.get(index).cloned().ok_or_else(|| format!("no model {index} (there are {})", models.len()))?;
+    model.id = "model".into();
+    // Whatever its architecture does unasked: this is for trying it.
+    model.inpaint = Some(true);
+    let arg = |i: usize, what: &str| args.get(i).cloned().ok_or_else(|| format!("missing {what}"));
+    let (image, rect, prompt, out) = (arg(2, "the image")?, arg(3, "the selection x,y,width,height")?, arg(4, "the prompt")?, arg(5, "the output file")?);
+    let img2img = rect == "img2img";
+    let edit = rect == "edit" || rect.starts_with("edit:");
+    let rect: Vec<i64> = rect.trim_start_matches("edit").trim_start_matches(':').split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let number = |i: usize, default: f64| args.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
+
+    let mut s = Session::new();
+    s.ai.transport = Some(transport);
+    let run = |s: &mut Session, id: &str, params| s.execute(id, params).map_err(|e| format!("{id}: {e}"));
+    run(&mut s, "prefs.set", json!({"path": "integrations.ai.comfyUrl", "value": url}))?;
+    run(&mut s, "prefs.set", json!({"path": "integrations.ai.models", "value": [serde_json::to_value(&model).map_err(|e| e.to_string())?]}))?;
+    run(&mut s, "file.openAs", json!({"path": image}))?;
+    let mut params = if edit {
+        if let [x, y, width, height] = rect[..] {
+            run(&mut s, "select.rect", json!({"x": x, "y": y, "width": width, "height": height}))?;
+        }
+        let mut params = json!({"prompt": prompt, "mode": "imgEdit", "quality": args.get(9).map_or("standard", String::as_str)});
+        if let Some(reference) = args.get(8).filter(|r| !r.is_empty()) {
+            // The picture to refer to is opened as a second document; the first stays in front.
+            run(&mut s, "file.openAs", json!({"path": reference}))?;
+            let id = s.active().map(|d| d.doc.id.0).ok_or("the reference did not open")?;
+            s.set_active(0);
+            params["references"] = json!([{"document": id}]);
+        }
+        params
+    } else if img2img {
+        json!({"prompt": prompt, "mode": "img2img", "strength": number(7, 0.6)})
+    } else {
+        let [x, y, width, height] = rect[..] else { return Err("the selection must be x,y,width,height (or img2img)".into()) };
+        run(&mut s, "select.rect", json!({"x": x, "y": y, "width": width, "height": height}))?;
+        json!({"prompt": prompt, "mode": "inpaint", "strength": number(7, 1.0)})
+    };
+    if let Some(context) = args.get(6).and_then(|v| v.parse::<f64>().ok()) {
+        params["context"] = json!(context);
+    }
+    let result = run(&mut s, "ai.generate", params)?;
+    println!("{result}");
+    let layer = s.active().and_then(|d| d.doc.layer(d.active_layer?)).map(|l| l.name.clone()).unwrap_or_default();
+    println!("layer: {layer}");
+    run(&mut s, "file.saveACopy", json!({"path": out, "layers": false}))?;
+    println!("wrote {out}");
+    Ok(())
+}

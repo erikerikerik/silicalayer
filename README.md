@@ -6,7 +6,11 @@ The project exists to give professional graphic designers a practical, local-fir
 
 ## Current status
 
-Planning and repository handoff. No porting code has been written yet.
+The LayerShop source history is now imported at baseline commit
+`5d3cff0b210ff41999e5a0dc5747683d52383ea1`. Phase 0 and the initial M4 host
+qualification are complete. Porting changes have not started yet; the repository
+currently adds planning, audit evidence, and the bounded local development
+supervisor.
 
 The first implementation target is a Mac mini with:
 
@@ -28,7 +32,8 @@ See:
 
 - [Project brief](docs/PROJECT_BRIEF.md)
 - [Engineering and security standards](docs/ENGINEERING_STANDARDS.md)
-- [Roadmap and V1 definition](docs/ROADMAP.md)
+- [SilicaLayer roadmap and V1 definition](docs/SILICALAYER_ROADMAP.md)
+- [Upstream LayerShop roadmap](docs/roadmap.md)
 - [Machine handoff notes](docs/MACHINE_HANDOFF.md)
 
 ## Primary references

@@ -1,0 +1,219 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+STATE="$ROOT/.silica-agent"
+LOGS="$STATE/logs"
+COMPLETED="$STATE/completed"
+QUARANTINED="$STATE/quarantined"
+FAILURES="$STATE/failures"
+LOCK="$STATE/lock"
+MODEL=${SILICA_MODEL:-qwen3.5:9b}
+MAX_REPAIRS=${SILICA_MAX_REPAIRS:-3}
+MAX_FAILED_RUNS=${SILICA_MAX_FAILED_RUNS:-1}
+AGENT_TIMEOUT=${SILICA_AGENT_TIMEOUT:-3600}
+GATE_TIMEOUT=${SILICA_GATE_TIMEOUT:-3600}
+PUSH=${SILICA_PUSH:-0}
+GATE=${SILICA_GATE:-automation/gate}
+MIN_FREE_GB=${SILICA_MIN_FREE_GB:-80}
+PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+say() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+die() { say "ERROR: $*" >&2; exit 1; }
+checkpoint() {
+  tmp="$STATE/checkpoint.tmp.$$"
+  printf 'task=%s\nphase=%s\nattempt=%s\nhead=%s\nupdated=%s\n' "$TASK_NAME" "$1" "${2:-0}" "$(git -C "$ROOT" rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+  mv "$tmp" "$STATE/checkpoint"
+}
+task_failure() {
+  reason=$1
+  mkdir -p "$FAILURES" "$QUARANTINED"
+  count_file="$FAILURES/$TASK_NAME"
+  previous=$(sed -n '1p' "$count_file" 2>/dev/null || true)
+  case "$previous" in *[!0-9]*|'') previous=0;; esac
+  count=$((previous + 1))
+  tmp="$count_file.tmp.$$"
+  printf '%s\n' "$count" > "$tmp"
+  mv "$tmp" "$count_file"
+  if [ "$count" -ge "$MAX_FAILED_RUNS" ]; then
+    tmp="$QUARANTINED/$TASK_NAME.tmp.$$"
+    printf 'task=%s\nfailed_runs=%s\nreason=%s\nupdated=%s\n' "$TASK_NAME" "$count" "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+    mv "$tmp" "$QUARANTINED/$TASK_NAME"
+    checkpoint quarantined "$count"
+    die "$TASK_NAME quarantined after $count failed run(s): $reason"
+  fi
+  checkpoint failed "$count"
+  die "$TASK_NAME failed run $count of $MAX_FAILED_RUNS: $reason"
+}
+acquire_lock() {
+  if mkdir "$LOCK" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK/pid"
+    return
+  fi
+  old_pid=$(sed -n '1p' "$LOCK/pid" 2>/dev/null || true)
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    die "another worker is active as PID $old_pid"
+  fi
+  rm -f "$LOCK/pid" 2>/dev/null || true
+  rmdir "$LOCK" 2>/dev/null || die "cannot safely clear stale lock $LOCK"
+  mkdir "$LOCK" || die "cannot acquire $LOCK"
+  printf '%s\n' "$$" > "$LOCK/pid"
+}
+unload_model() {
+  ollama stop "$MODEL" >/dev/null 2>&1 || true
+  i=0
+  while ollama ps 2>/dev/null | grep -F "$MODEL" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 30 ] || die "Ollama did not unload $MODEL"
+    sleep 1
+  done
+}
+preflight() {
+  command -v git >/dev/null || die "git is missing"
+  command -v opencode >/dev/null || die "OpenCode is missing"
+  command -v ollama >/dev/null || die "Ollama is missing"
+  command -v cargo >/dev/null || die "Rust/Cargo is missing"
+  curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || die "Ollama is not listening on loopback"
+  ollama show "$MODEL" >/dev/null 2>&1 || die "Ollama model $MODEL is not installed"
+  [ "$(uname -m)" = arm64 ] || die "this worker is qualified only on Apple Silicon"
+  free_kb=$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')
+  [ "$free_kb" -ge $((MIN_FREE_GB * 1024 * 1024)) ] || die "less than ${MIN_FREE_GB} GiB is free"
+  case "$MAX_REPAIRS" in *[!0-9]*|'') die "SILICA_MAX_REPAIRS must be an integer";; esac
+  [ "$MAX_REPAIRS" -le 5 ] || die "SILICA_MAX_REPAIRS may not exceed 5"
+  case "$MAX_FAILED_RUNS" in *[!0-9]*|'') die "SILICA_MAX_FAILED_RUNS must be an integer";; esac
+  [ "$MAX_FAILED_RUNS" -ge 1 ] && [ "$MAX_FAILED_RUNS" -le 3 ] || die "SILICA_MAX_FAILED_RUNS must be between 1 and 3"
+  case "$AGENT_TIMEOUT:$GATE_TIMEOUT" in *[!0-9:]*) die "timeouts must be integer seconds";; esac
+  [ "$AGENT_TIMEOUT" -le 7200 ] && [ "$GATE_TIMEOUT" -le 7200 ] || die "timeouts may not exceed 7200 seconds"
+  case "$PUSH" in 0|1) :;; *) die "SILICA_PUSH must be 0 or 1";; esac
+  branch=$(git -C "$ROOT" branch --show-current)
+  [ -n "$branch" ] || die "detached HEAD is not allowed"
+  case "$branch" in main|master) die "the autonomous worker refuses protected branch $branch";; esac
+  case "$branch" in automation/*|silicalayer/*) :;; *) die "branch must start with automation/ or silicalayer/";; esac
+  origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)
+  case "$origin" in
+    git@github.com:erikerikerik/silicalayer.git|https://github.com/erikerikerik/silicalayer.git) :;;
+    *) die "origin is not the expected private SilicaLayer repository";;
+  esac
+  [ -f "$ROOT/$GATE" ] || die "$GATE is missing"
+  say "preflight passed: model=$MODEL branch=$branch free=$((free_kb / 1024 / 1024))GiB"
+}
+next_task() {
+  for file in "$ROOT"/automation/tasks/*.md; do
+    [ -f "$file" ] || return 1
+    name=$(basename "$file" .md)
+    if [ ! -f "$COMPLETED/$name" ] && [ ! -f "$QUARANTINED/$name" ]; then
+      TASK_FILE=$file
+      TASK_NAME=$name
+      return 0
+    fi
+  done
+  return 1
+}
+run_agent() {
+  phase=$1
+  prompt=$2
+  out=$3
+  checkpoint "$phase" "${4:-0}"
+  /usr/bin/perl -e '$t = shift @ARGV; alarm $t; exec @ARGV' "$AGENT_TIMEOUT" \
+    opencode run --standalone --archived --auto --model "ollama/$MODEL" --format json "$prompt" > "$out" 2>&1
+}
+run_gate() {
+  out=$1
+  (cd "$ROOT" && /usr/bin/perl -e '$t = shift @ARGV; alarm $t; exec @ARGV' "$GATE_TIMEOUT" /bin/sh "$ROOT/$GATE") > "$out" 2>&1
+}
+secret_scan() {
+  if git -C "$ROOT" diff --cached -U0 | grep -E '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,})' >/dev/null; then
+    task_failure "possible secret detected in staged diff"
+  fi
+}
+one_run() {
+  mkdir -p "$LOGS" "$COMPLETED" "$QUARANTINED" "$FAILURES"
+  acquire_lock
+  trap 'unload_model; rm -f "$LOCK/pid" 2>/dev/null || true; rmdir "$LOCK" 2>/dev/null || true' EXIT HUP INT TERM
+  preflight
+  next_task || { say "no queued task"; exit 0; }
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  RUN_LOG="$LOGS/$stamp-$TASK_NAME"
+  mkdir -p "$RUN_LOG"
+  dirty=$(git -C "$ROOT" status --porcelain)
+  if [ -z "$dirty" ]; then
+    prompt=$(printf 'Read AGENTS.md, automation/GOVERNANCE.md, all SilicaLayer governing documents available in this checkout, and %s. Implement only that bounded task. Do not run builds or tests; the supervisor does that after unloading the model. Do not commit, push, access the network, use secrets, change CI, release, publish, or ask questions. Keep the tree buildable and stop after the smallest tested-by-design change.' "$TASK_FILE")
+    run_agent implement "$prompt" "$RUN_LOG/implement.jsonl" 0 || task_failure "implementation session failed; see $RUN_LOG"
+  else
+    if [ ! -f "$STATE/checkpoint" ] || ! grep -Fqx "task=$TASK_NAME" "$STATE/checkpoint"; then
+      die "dirty tree is not associated with the active checkpoint; refusing to stage it"
+    fi
+    say "checkpointed dirty tree found; resuming at verification"
+  fi
+  unload_model
+  if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
+    task_failure "agent changed supervisor policy, task definitions, or CI"
+  fi
+  attempt=0
+  while :; do
+    checkpoint gate "$attempt"
+    if run_gate "$RUN_LOG/gate-$attempt.log"; then
+      break
+    fi
+    [ "$attempt" -lt "$MAX_REPAIRS" ] || task_failure "gate failed after $MAX_REPAIRS repairs; see $RUN_LOG"
+    attempt=$((attempt + 1))
+    tail -c 24000 "$RUN_LOG/gate-$((attempt - 1)).log" > "$RUN_LOG/failure-tail.log"
+    prompt=$(printf 'The bounded task is %s. The supervisor tests failed; inspect %s and the current diff, identify the root cause, and make the smallest repair. Do not run builds/tests, commit, push, access the network, use secrets, weaken checks, or broaden scope. Stop after editing.' "$TASK_FILE" "$RUN_LOG/failure-tail.log")
+    run_agent repair "$prompt" "$RUN_LOG/repair-$attempt.jsonl" "$attempt" || task_failure "repair session failed; see $RUN_LOG"
+    unload_model
+    if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
+      task_failure "repair changed supervisor policy, task definitions, or CI"
+    fi
+  done
+  prompt=$(printf 'Independently review the current uncommitted diff for the task in %s. Check correctness, security, recoverability, architecture, tests, and scope against AGENTS.md. Fix only confirmed issues in the diff. Do not run builds/tests, commit, push, access the network, use secrets, or broaden scope. If no issue exists, make no edit.' "$TASK_FILE")
+  run_agent review "$prompt" "$RUN_LOG/review.jsonl" 0 || task_failure "review session failed; see $RUN_LOG"
+  unload_model
+  if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
+    task_failure "review changed supervisor policy, task definitions, or CI"
+  fi
+  checkpoint final-gate 0
+  run_gate "$RUN_LOG/final-gate.log" || task_failure "post-review gate failed; see $RUN_LOG"
+  [ -n "$(git -C "$ROOT" status --porcelain)" ] || task_failure "task produced no change"
+  git -C "$ROOT" add -A
+  secret_scan
+  git -C "$ROOT" diff --cached --check
+  git -C "$ROOT" commit -m "$(sed -n '1s/^# *//p' "$TASK_FILE")"
+  if [ "$PUSH" = 1 ]; then
+    branch=$(git -C "$ROOT" branch --show-current)
+    git -C "$ROOT" push --set-upstream origin "$branch"
+  fi
+  : > "$COMPLETED/$TASK_NAME"
+  rm -f "$FAILURES/$TASK_NAME" "$QUARANTINED/$TASK_NAME"
+  checkpoint complete 0
+  say "completed $TASK_NAME (push=$PUSH)"
+}
+
+status() {
+  printf '%s\n' 'SilicaLayer local supervisor'
+  if [ -f "$STATE/checkpoint" ]; then
+    cat "$STATE/checkpoint"
+  else
+    printf '%s\n' 'checkpoint=none'
+  fi
+  if [ -f "$LOCK/pid" ]; then
+    worker_pid=$(sed -n '1p' "$LOCK/pid")
+    if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null; then
+      printf 'worker_pid=%s\n' "$worker_pid"
+    else
+      printf 'worker_pid=stale:%s\n' "$worker_pid"
+    fi
+  else
+    printf '%s\n' 'worker_pid=none'
+  fi
+  printf 'completed=%s\n' "$(find "$COMPLETED" -type f -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  printf 'quarantined=%s\n' "$(find "$QUARANTINED" -type f -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  git -C "$ROOT" status --short --branch
+}
+
+case ${1:-once} in
+  preflight) mkdir -p "$STATE"; TASK_NAME=preflight; preflight;;
+  once) one_run;;
+  status) status;;
+  *) die "usage: automation/silica-agent [preflight|once|status]";;
+esac
