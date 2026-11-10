@@ -226,6 +226,13 @@ impl Layout {
             Route::Existing => PathBuf::new(),
         };
         let engine_root = engine_dir.join(&manifest.comfy.version);
+        let (python, script) = match choices.route {
+            Route::Managed => {
+                let paths = manifest.runtime_paths(&choices.variant)?;
+                (paths.python, paths.script)
+            }
+            Route::Existing => (manifest.comfy.python.as_str(), manifest.comfy.script.as_str()),
+        };
         let archive_name = match choices.route {
             Route::Managed => {
                 let url = &manifest.asset(&choices.variant)?.url;
@@ -246,8 +253,8 @@ impl Layout {
             archive: engine_dir.join(archive_name),
             marker: engine_root.join(MARKER),
             model_paths: engine_root.join(MODEL_PATHS),
-            python: inside(&manifest.comfy.python),
-            script: inside(&manifest.comfy.script),
+            python: inside(python),
+            script: inside(script),
             engine_dir,
             engine_root,
             models_dir,
@@ -480,6 +487,19 @@ mod tests {
 
     fn keys(plan: &Plan) -> Vec<String> {
         plan.steps.iter().map(|s| s.step.key()).collect()
+    }
+
+    #[test]
+    fn a_runtime_assets_own_layout_reaches_the_managed_paths() {
+        let mut json = serde_json::to_value(manifest()).unwrap();
+        let mut asset = json["comfy"]["assets"]["nvidia"].clone();
+        asset["python"] = serde_json::json!("python/bin/python3");
+        asset["script"] = serde_json::json!("ComfyUI-macos/main.py");
+        json["comfy"]["assets"]["macos_arm64"] = asset;
+        let m = Manifest::parse(&serde_json::to_string(&json).unwrap()).unwrap();
+        let layout = Layout::new(&m, &Choices { variant: "macos_arm64".into(), ..choices(&[]) }).unwrap();
+        assert_eq!(layout.python.strip_prefix(&layout.engine_root).unwrap(), Path::new("python/bin/python3"));
+        assert_eq!(layout.script.strip_prefix(&layout.engine_root).unwrap(), Path::new("ComfyUI-macos/main.py"));
     }
 
     #[test]

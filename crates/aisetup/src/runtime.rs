@@ -233,8 +233,8 @@ pub fn launch(manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
 
 /// Build the ComfyUI launch command for a given platform. This is a pure function that accepts
 /// the runtime platform explicitly (for future macOS support) and constructs the command line.
-pub fn build_launch_command(platform: RuntimePlatform, manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let script = manifest.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
+pub fn build_launch_command(platform: RuntimePlatform, _manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
+    let script = layout.script.strip_prefix(&layout.engine_root).unwrap_or(&layout.script).to_string_lossy().into_owned();
     let mut args = vec![
         // Python's `-s`: the user's own site-packages stay out of the engine.
         "-s".to_string(),
@@ -659,11 +659,16 @@ mod tests {
         let windows = split_args(&launch(m, &layout, false).args);
         assert_eq!(windows, ["-s", script.as_str(), "--windows-standalone-build", "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
 
-        // The future macOS runtime uses the same pinned script and quoted paths without the
-        // Windows-only flag. CPU mode adds exactly one explicit argument on either platform.
-        let macos = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, false).args);
-        assert_eq!(macos, ["-s", script.as_str(), "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
-        let macos_cpu = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, true).args);
+        // A future macOS asset's own paths reach launch construction without the Windows-only
+        // flag. CPU mode adds exactly one explicit argument on either platform.
+        let mut mac_layout = layout.clone();
+        mac_layout.python = mac_layout.engine_root.join("python/bin/python3");
+        mac_layout.script = mac_layout.engine_root.join("ComfyUI-macos/main.py");
+        let launched = build_launch_command(RuntimePlatform::MacosArm64, m, &mac_layout, false);
+        assert!(launched.python.ends_with("python/bin/python3"));
+        let macos = split_args(&launched.args);
+        assert_eq!(macos, ["-s", "ComfyUI-macos/main.py", "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
+        let macos_cpu = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &mac_layout, true).args);
         assert_eq!((macos_cpu.len(), macos_cpu.last().map(String::as_str)), (macos.len() + 1, Some("--cpu")));
     }
 }

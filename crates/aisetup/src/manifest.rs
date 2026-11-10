@@ -105,6 +105,14 @@ pub struct Asset {
     /// check before anything is downloaded. 0: not measured.
     #[serde(default)]
     pub longest_path: u32,
+    /// Inside this build: its Python, when it is not where [`Comfy::python`] says. Absent: the
+    /// manifest's global path. A build that says one of these two says both: a half override is
+    /// refused at parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    /// Inside this build: the script it runs, when it is not where [`Comfy::script`] says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
 }
 
 /// The pinned ComfyUI: a release works with exactly the version its workflows were tested on.
@@ -117,6 +125,13 @@ pub struct Comfy {
     pub script: String,
     /// By graphics card: `nvidia`, `nvidia_cu126`, `amd`, `intel`.
     pub assets: BTreeMap<String, Asset>,
+}
+
+/// Paths inside one runtime archive after variant-specific overrides are resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimePaths<'a> {
+    pub python: &'a str,
+    pub script: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -141,6 +156,11 @@ fn bad(msg: impl Into<String>) -> Error {
 
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Is `rel` a plain path inside the unpacked build?
+fn is_plain_rel(rel: &str) -> bool {
+    !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']))
 }
 
 /// `url` is `https://<host>/…` with nothing that could change where it goes.
@@ -182,8 +202,7 @@ impl Manifest {
             return Err(bad("the ComfyUI version is not a version number"));
         }
         for rel in [&m.comfy.python, &m.comfy.script] {
-            let plain = !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']));
-            if !plain {
+            if !is_plain_rel(rel) {
                 return Err(bad(format!("`{rel}` is not a path inside the ComfyUI build")));
             }
         }
@@ -196,6 +215,15 @@ impl Manifest {
             }
             if asset.size == 0 || asset.size > MAX_FILE_BYTES || !is_sha256(&asset.sha256) {
                 return Err(bad(format!("the `{name}` build has no usable size or sha256")));
+            }
+            // A build may name its own Python and script: both or neither, each a plain path.
+            if asset.python.is_some() != asset.script.is_some() {
+                return Err(bad(format!("the `{name}` build names only one of its Python and script, and must name both or neither")));
+            }
+            for rel in [asset.python.as_deref(), asset.script.as_deref()].into_iter().flatten() {
+                if !is_plain_rel(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}`, which is not a path inside the ComfyUI build")));
+                }
             }
         }
         for (key, file) in &m.files {
@@ -227,7 +255,8 @@ impl Manifest {
                 }
             }
             let min = model.min_comfy.as_str();
-            let min_ok = min.is_empty() || (min.len() <= 32 && min.starts_with(|c: char| c.is_ascii_digit()) && min.chars().all(|c| c.is_ascii_digit() || c == '.'));
+            let min_ok =
+                min.is_empty() || (min.len() <= 32 && min.starts_with(|c: char| c.is_ascii_digit()) && min.chars().all(|c| c.is_ascii_digit() || c == '.'));
             if !min_ok {
                 return Err(bad(format!("`{}` names `{min}` as its ComfyUI version, which is not a version number", model.id)));
             }
@@ -334,6 +363,18 @@ impl Manifest {
     pub fn asset(&self, variant: &str) -> Result<&Asset> {
         self.comfy.assets.get(variant).ok_or_else(|| Error::Config(format!("there is no ComfyUI build for `{variant}`")))
     }
+
+    /// The Python executable and ComfyUI script inside one runtime archive. Older manifests use
+    /// the global paths; an asset may override both together for a different platform layout.
+    pub fn runtime_paths(&self, variant: &str) -> Result<RuntimePaths<'_>> {
+        let asset = self.asset(variant)?;
+        Ok(match (&asset.python, &asset.script) {
+            (Some(python), Some(script)) => RuntimePaths { python, script },
+            (None, None) => RuntimePaths { python: &self.comfy.python, script: &self.comfy.script },
+            // Parsed manifests cannot reach this, but callers may construct one in memory.
+            _ => return Err(Error::Config(format!("the ComfyUI build for `{variant}` must name both its Python and script or neither"))),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +407,33 @@ mod tests {
         // Each local enhancer is pinned at the size the app knows it by.
         for x in photocraft_aigen::enhance::local::MODELS {
             assert_eq!(m.files.get(&x.manifest_key()).map(|f| f.size), Some(x.size), "{}", x.id);
+        }
+    }
+
+    #[test]
+    fn runtime_paths_fall_back_override_together_and_refuse_hostile_values() {
+        let bundled = bundled();
+        assert_eq!(bundled.runtime_paths("nvidia").unwrap(), RuntimePaths { python: bundled.comfy.python.as_str(), script: bundled.comfy.script.as_str() });
+        assert!(bundled.runtime_paths("missing").is_err());
+
+        let with_paths = |python: Option<&str>, script: Option<&str>| {
+            let mut json = serde_json::to_value(bundled).unwrap();
+            if let Some(python) = python {
+                json["comfy"]["assets"]["nvidia"]["python"] = serde_json::json!(python);
+            }
+            if let Some(script) = script {
+                json["comfy"]["assets"]["nvidia"]["script"] = serde_json::json!(script);
+            }
+            Manifest::parse(&serde_json::to_string(&json).unwrap())
+        };
+        let overridden = with_paths(Some("python/bin/python3"), Some("ComfyUI/main.py")).unwrap();
+        assert_eq!(overridden.runtime_paths("nvidia").unwrap(), RuntimePaths { python: "python/bin/python3", script: "ComfyUI/main.py" });
+
+        assert!(with_paths(Some("python/bin/python3"), None).is_err());
+        assert!(with_paths(None, Some("ComfyUI/main.py")).is_err());
+        for hostile in ["/bin/python3", "../python3", "bin/../python3", "C:/python.exe", r"bin\python3", "bin//python3"] {
+            assert!(with_paths(Some(hostile), Some("ComfyUI/main.py")).is_err(), "accepted {hostile:?}");
+            assert!(with_paths(Some("python/bin/python3"), Some(hostile)).is_err(), "accepted {hostile:?}");
         }
     }
 
