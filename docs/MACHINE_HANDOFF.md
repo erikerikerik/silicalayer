@@ -46,7 +46,7 @@ Expected responsibilities:
 
 - Build the Rust/macOS application
 - Install and test the private ARM64 ComfyUI runtime
-- Run MPS inference qualification
+- Continue MPS inference qualification; the first one-megapixel Z-Image Turbo run is recorded in [MPS Model Spike](MPS_MODEL_SPIKE.md)
 - Execute hardware-specific integration and regression tests
 - Package, sign, notarize, and verify releases
 - Run the bounded automated build/test/review loop
