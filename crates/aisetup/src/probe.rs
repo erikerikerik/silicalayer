@@ -60,6 +60,10 @@ pub struct Os {
     pub virtual_mb: Option<u64>,
     /// Whether Windows sizes the paging file itself (it then grows when it must, room allowing).
     pub paging_managed: Option<bool>,
+    /// CPU architecture as macOS reports it (`arm64` on Apple Silicon); empty elsewhere.
+    pub architecture: String,
+    /// Unified memory in megabytes on macOS, from `sysctl hw.memsize`.
+    pub unified_memory_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +179,23 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<Gpu> {
         .collect()
 }
 
+/// The byte count printed by `sysctl -n hw.memsize` on macOS.
+fn parse_macos_memory(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok().map(|bytes| bytes >> 20).filter(|mb| *mb > 0)
+}
+
+/// The root-volume row printed by `df -Pk /` on macOS. `-k` fixes the unit at 1024 bytes.
+fn parse_macos_disk(text: &str) -> Option<Drive> {
+    let mut fields = text.lines().nth(1)?.split_whitespace();
+    fields.next()?;
+    let total = fields.next()?.parse::<u64>().ok()?.checked_mul(1_024)?;
+    fields.next()?;
+    let free = fields.next()?.parse::<u64>().ok()?.checked_mul(1_024)?;
+    fields.next()?;
+    let name: String = fields.next()?.chars().take(1_000).collect();
+    (total > 0 && free <= total && !name.is_empty()).then_some(Drive { name, free, total })
+}
+
 /// One value or a list of them: PowerShell's `ConvertTo-Json` writes a list of one as the one.
 fn list(v: &serde_json::Value) -> Vec<&serde_json::Value> {
     match v {
@@ -209,6 +230,7 @@ pub fn parse_system(json: &str) -> (Os, Vec<Gpu>, Vec<Drive>) {
         memory_mb: mb("TotalVisibleMemorySize"),
         virtual_mb: mb("TotalVirtualMemorySize"),
         paging_managed,
+        ..Os::default()
     };
     // The registry knows the real memory of a card; `AdapterRAM` stops at 4 GB.
     let reg: Vec<(String, u64)> = list(v.get("reg").unwrap_or(&serde_json::Value::Null))
@@ -486,11 +508,33 @@ mod native {
             "linux" => "Linux",
             other => other,
         };
-        (
-            Os { name: name.to_string(), version: String::new(), sixty_four_bit: cfg!(target_pointer_width = "64"), windows: false, ..Os::default() },
-            Vec::new(),
-            Vec::new(),
-        )
+        #[cfg(target_os = "macos")]
+        {
+            let architecture = match std::env::consts::ARCH {
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let os = Os {
+                name: name.to_string(),
+                version: String::new(),
+                sixty_four_bit: cfg!(target_pointer_width = "64"),
+                windows: false,
+                architecture: architecture.to_string(),
+                unified_memory_mb: output("/usr/sbin/sysctl", &["-n", "hw.memsize"]).and_then(|text| super::parse_macos_memory(&text)),
+                ..Os::default()
+            };
+            let drives = output("/bin/df", &["-Pk", "/"]).and_then(|text| super::parse_macos_disk(&text)).into_iter().collect();
+            (os, Vec::new(), drives)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            (
+                Os { name: name.to_string(), version: String::new(), sixty_four_bit: cfg!(target_pointer_width = "64"), windows: false, ..Os::default() },
+                Vec::new(),
+                Vec::new(),
+            )
+        }
     }
 
     /// Look at this machine. `urls` are the addresses a ComfyUI is looked for at (the one in the
@@ -745,6 +789,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Probe>(&json).unwrap(), probe());
         assert_eq!(serde_json::from_str::<Probe>("{}").unwrap(), Probe::default());
     }
+
     #[test]
     fn a_pc_the_engine_would_not_start_on_says_so_and_how_to_fix_it() {
         let row = |p: &Probe| p.checks().into_iter().find(|c| c.id == "vcRuntime");
@@ -755,5 +800,62 @@ mod tests {
         let missing = row(&Probe { vc_runtime: VcRuntime::Missing, ..probe() }).unwrap();
         assert!(missing.level == Level::Warn && missing.detail.contains("vc_redist.x64.exe"), "{missing:?}");
         assert!(Probe { vc_runtime: VcRuntime::Missing, ..probe() }.can_install(), "a warning, not a stop");
+    }
+
+    #[test]
+    fn macos_facts_round_trip_without_changing_old_probe_json() {
+        let old: Probe = serde_json::from_str("{}").unwrap();
+        assert_eq!((old.os.architecture.as_str(), old.os.unified_memory_mb), ("", None));
+
+        let probe = Probe {
+            os: Os { name: "macOS".into(), architecture: "arm64".into(), unified_memory_mb: Some(24_576), ..Os::default() },
+            drives: vec![Drive { name: "/".into(), free: 50_000_000_000, total: 100_000_000_000 }],
+            ..Probe::default()
+        };
+        let json = serde_json::to_string(&probe).unwrap();
+        assert_eq!(serde_json::from_str::<Probe>(&json).unwrap(), probe);
+    }
+
+    #[test]
+    fn macos_memory_and_root_disk_parsers_bound_hostile_answers() {
+        assert_eq!(parse_macos_memory("25769803776\n"), Some(24_576));
+        for junk in ["", "-1", "many", "0", "1048575", "18446744073709551616"] {
+            assert_eq!(parse_macos_memory(junk), None, "{junk}");
+        }
+
+        let disk = parse_macos_disk("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s1 500000000 300000000 200000000 60% /\n").unwrap();
+        assert_eq!(disk, Drive { name: "/".into(), free: 204_800_000_000, total: 512_000_000_000 });
+        for junk in [
+            "",
+            "header only\n",
+            "header\n/dev/disk3s1 no numbers here\n",
+            "header\n/dev/disk3s1 100 90 101 90% /\n",
+            "header\n/dev/disk3s1 18446744073709551615 0 1 0% /\n",
+        ] {
+            assert_eq!(parse_macos_disk(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn macos_fields_default_when_absent() {
+        // Older serialized probes have neither field.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let p: Probe = Probe::default();
+            assert_eq!(p.os.architecture, "");
+            assert_eq!(p.os.unified_memory_mb, None);
+        }
+
+        // On macOS (simulated by constructing a probe with those fields), they round-trip.
+        #[cfg(target_os = "macos")]
+        {
+            let mut p = Probe::default();
+            p.os.architecture = "arm64".into();
+            p.os.unified_memory_mb = Some(96000);
+            let json = serde_json::to_string(&p).unwrap();
+            let parsed: Probe = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.os.architecture, "arm64");
+            assert_eq!(parsed.os.unified_memory_mb, Some(96000));
+        }
     }
 }
