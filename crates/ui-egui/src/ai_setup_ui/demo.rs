@@ -453,6 +453,8 @@ fn probe_with(dir: &Path, comfy: Existing) -> Value {
             memory_mb: Some(65_536),
             virtual_mb: Some(75_000),
             paging_managed: Some(true),
+            architecture: String::new(),
+            unified_memory_mb: None,
         },
         gpus: vec![Gpu { name: "NVIDIA GeForce RTX 4090".into(), vendor: Vendor::Nvidia, vram_mb: Some(24564), driver: "591.59".into() }],
         drives: vec![Drive { name: "D:".into(), free: 412_000_000_000, total: 2_000_000_000_000 }],
