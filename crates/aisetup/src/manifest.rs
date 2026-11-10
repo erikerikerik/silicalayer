@@ -29,6 +29,8 @@ const ASSET_HOST: &str = "github.com";
 const MAX_FILE_BYTES: u64 = 96 << 30;
 const MAX_FILES: usize = 2000;
 const MAX_MODELS: usize = 500;
+/// How many files one build may name as executables (see [`Asset::executables`]).
+pub const MAX_EXECUTABLES: usize = 128;
 /// A card with less video memory than this is offered the `light` preset first.
 pub const LIGHT_BELOW_VRAM_GB: u64 = 16;
 
@@ -113,6 +115,12 @@ pub struct Asset {
     /// Inside this build: the script it runs, when it is not where [`Comfy::script`] says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
+    /// Inside this build: the files the setup may make executable, as plain relative paths. The
+    /// archive's own mode bits are not trusted, so a build says what it needs here and unpack
+    /// applies the permissions after extracting. Absent: nothing: the archive's modes stand, and
+    /// a build that needs none, and every Windows build, say nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executables: Vec<String>,
 }
 
 /// The pinned ComfyUI: a release works with exactly the version its workflows were tested on.
@@ -159,7 +167,7 @@ fn is_sha256(s: &str) -> bool {
 }
 
 /// Is `rel` a plain path inside the unpacked build?
-fn is_plain_rel(rel: &str) -> bool {
+pub(crate) fn is_plain_rel(rel: &str) -> bool {
     !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']))
 }
 
@@ -223,6 +231,20 @@ impl Manifest {
             for rel in [asset.python.as_deref(), asset.script.as_deref()].into_iter().flatten() {
                 if !is_plain_rel(rel) {
                     return Err(bad(format!("the `{name}` build names `{rel}`, which is not a path inside the ComfyUI build")));
+                }
+            }
+            // The files unpack may make executable: each a plain path inside the build, no
+            // repeats, few enough that a hostile manifest cannot make unpack walk forever.
+            if asset.executables.len() > MAX_EXECUTABLES {
+                return Err(bad(format!("the `{name}` build names more than {MAX_EXECUTABLES} executables")));
+            }
+            let mut seen_executables = BTreeSet::new();
+            for rel in &asset.executables {
+                if !is_plain_rel(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}` as an executable, which is not a path inside the ComfyUI build")));
+                }
+                if !seen_executables.insert(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}` as an executable twice")));
                 }
             }
         }
@@ -643,5 +665,31 @@ mod tests {
         let folders = m.folders(chosen);
         assert_eq!(folders["vae"], ["qwen_image_2.1_vae_bf16.safetensors", "ae.safetensors"]);
         assert_eq!(folders["diffusion_models"].len(), 2);
+    }
+
+    /// `executables` defaults to empty (a manifest that says nothing stays valid, as every
+    /// manifest does until a build needs it), round-trips, and refuses hostile or repeated paths.
+    #[test]
+    fn executable_paths_default_empty_and_hostile_values_are_refused() {
+        let bundled = bundled();
+        // The bundled manifest declares nothing: they are all Windows builds.
+        assert!(bundled.comfy.assets.values().all(|a| a.executables.is_empty()));
+        assert_eq!(Manifest::parse(&serde_json::to_string(&bundled).unwrap()).unwrap(), bundled.clone());
+
+        let with_executables = |executables: serde_json::Value| {
+            let mut json = serde_json::to_value(bundled).unwrap();
+            json["comfy"]["assets"]["nvidia"]["executables"] = executables;
+            Manifest::parse(&serde_json::to_string(&json).unwrap())
+        };
+        let declared = with_executables(serde_json::json!(["python/bin/python3", "ComfyUI/run.sh"])).unwrap();
+        assert_eq!(declared.comfy.assets["nvidia"].executables, ["python/bin/python3", "ComfyUI/run.sh"]);
+        assert!(with_executables(serde_json::json!([])).unwrap().comfy.assets["nvidia"].executables.is_empty());
+
+        for hostile in ["/bin/sh", "../escape", "bin/../python3", "C:/windows/system32/cmd.exe", r"bin\python3", "bin//python3", "", ".", "bin/."] {
+            assert!(with_executables(serde_json::json!([hostile])).is_err(), "accepted {hostile:?}");
+        }
+        assert!(with_executables(serde_json::json!(["a.sh", "a.sh"])).is_err(), "accepted a duplicate");
+        let many: Vec<String> = (0..=MAX_EXECUTABLES).map(|i| format!("bin/tool{i}")).collect();
+        assert!(with_executables(serde_json::json!(many)).is_err(), "accepted a build naming {MAX_EXECUTABLES}");
     }
 }

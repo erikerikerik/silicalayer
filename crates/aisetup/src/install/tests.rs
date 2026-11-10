@@ -245,8 +245,15 @@ impl Rig {
 
     /// Run a setup to its end.
     fn run_job(&self, job: Job, free_space: fn(&Path) -> Option<u64>) -> (Result<Outcome>, Progress) {
+        let net = self.net.clone();
+        self.run_job_with(job, &net, free_space)
+    }
+
+    /// Run a setup whose manifest points at a different fake network: what a test does to
+    /// try an asset or an archive the rig's own manifest does not describe.
+    fn run_job_with(&self, job: Job, net: &Arc<FakeNet>, free_space: fn(&Path) -> Option<u64>) -> (Result<Outcome>, Progress) {
         let env = Env {
-            fetch: self.net.clone(),
+            fetch: net.clone(),
             transport: self.comfy.clone(),
             server: Some(self.server.clone()),
             state_file: Some(self.state_file()),
@@ -627,6 +634,51 @@ fn an_archive_that_is_not_the_build_leaves_no_engine_and_is_fetched_again() {
     let layout = rig.layout();
     assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && !layout.archive.exists());
     assert_eq!(progress.steps.iter().find(|s| s.key == "unpack").map(|s| s.state), Some(StepState::Failed));
+}
+
+#[test]
+fn an_archive_built_for_another_asset_is_refused_by_that_assets_python() {
+    // The catalogue's default Python is present, so a check on it alone would pass. The asset
+    // names its own, deeper path: an archive without it is not the build that asset installs.
+    let rig = Rig::with(true, FakeComfy { running: true, fails: None, prompts: AtomicU64::new(0) }, FakeServer::default());
+    let mut manifest = rig.manifest.clone();
+    let asset = manifest.comfy.assets.get_mut("nvidia").unwrap();
+    (asset.python, asset.script) = (Some("runtime/python/python.exe".into()), Some("ComfyUI/main.py".into()));
+    let archive = rig.net.files.get(&manifest.comfy.assets["nvidia"].url.clone()).unwrap().clone();
+    let net = Arc::new(FakeNet::new(&manifest, &archive));
+    let mut job = rig.job(rig.choices(&[]));
+    job.manifest = manifest;
+    let (result, _) = rig.run_job_with(job, &net, plenty);
+    let e = result.unwrap_err();
+    assert!(matches!(&e, Error::Archive(m) if m.contains("runtime/python/python.exe") && !m.contains("python_embeded/python.exe")), "{e:?}");
+    let layout = rig.layout();
+    assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && !layout.archive.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_runtime_executables_get_only_the_declared_unix_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    let mut job = rig.job(rig.choices(&[]));
+    job.manifest.comfy.assets.get_mut("nvidia").unwrap().executables = vec!["ComfyUI/main.py".into()];
+    rig.run_job(job, plenty).0.unwrap();
+    let mode = std::fs::metadata(rig.layout().engine_root.join("ComfyUI/main.py")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[test]
+fn missing_or_non_file_declared_executables_refuse_the_archive_atomically() {
+    for relative in ["missing-tool", "ComfyUI"] {
+        let rig = Rig::new();
+        let mut job = rig.job(rig.choices(&[]));
+        job.manifest.comfy.assets.get_mut("nvidia").unwrap().executables = vec![relative.into()];
+        let error = rig.run_job(job, plenty).0.unwrap_err();
+        assert!(matches!(&error, Error::Archive(message) if message.contains(relative)), "{error:?}");
+        let layout = rig.layout();
+        assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && !layout.archive.exists());
+    }
 }
 
 #[test]

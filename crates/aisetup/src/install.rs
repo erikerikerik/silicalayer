@@ -434,19 +434,43 @@ fn fetch_step(env: &Env, job: &Job, layout: &Layout, shared: &Shared, index: usi
 }
 
 /// Unpack the runtime archive into the engine folder, then delete the archive.
+fn apply_executable_permissions(staging: &Path, executables: &[String]) -> Result<()> {
+    for relative in executables {
+        if !crate::manifest::is_plain_rel(relative) {
+            return Err(Error::Archive(format!("The engine manifest names `{relative}` as an executable, but it is not a safe path inside the build.")));
+        }
+        let path = staging.join(relative);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| Error::Archive(format!("The engine archive has no executable `{relative}`: it is not the build this version of the app installs.")))?;
+        if !metadata.is_file() {
+            return Err(Error::Archive(format!(
+                "The engine archive's declared executable `{relative}` is not a regular file: it is not the build this version of the app installs."
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| Error::Disk(format!("Could not make `{}` executable: {e}.", path.display())))?;
+        }
+    }
+    Ok(())
+}
+
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
     let marker = Marker::managed(runtime::RuntimePlatform::WindowsPortable, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
-    let python = job.manifest.comfy.python.split('/').fold(PathBuf::new(), |p, part| p.join(part));
+    // The Python this asset's own manifest entry names, not the catalogue's default:
+    // an asset may ship its runtime somewhere else.
+    let paths = job.manifest.runtime_paths(&job.choices.variant)?;
+    let python = paths.python.split('/').fold(PathBuf::new(), |p, part| p.join(part));
     let finish = |staging: &Path| {
         // An archive that unpacks without the Python it is started with is not an engine.
         if !staging.join(&python).is_file() {
-            return Err(Error::Archive(format!(
-                "The engine archive has no `{}`: it is not the build this version of the app installs.",
-                job.manifest.comfy.python
-            )));
+            return Err(Error::Archive(format!("The engine archive has no `{}`: it is not the build this version of the app installs.", paths.python)));
         }
+        apply_executable_permissions(staging, &asset.executables)?;
         runtime::write_marker(staging, &marker)
     };
     let done =
