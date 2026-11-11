@@ -166,6 +166,11 @@ const WORTH_LISTING: u64 = 10_000_000_000;
 const LITTLE_MEMORY_MB: u64 = 15_000;
 /// A paging file set by hand to leave less than this (memory included) is called small.
 const SMALL_VIRTUAL_MB: u64 = 32_000;
+/// The least unified memory that qualifies an Apple Silicon host for local models: 24 GiB. The
+/// only qualified configuration is Z-Image Turbo INT8 on 24 GB (`docs/MPS_MODEL_SPIKE.md`), and
+/// that run already reached 21% free memory; below this the models may not fit. Unknown memory
+/// does not qualify either: it must not be assumed enough.
+pub const MIN_QUALIFIED_UNIFIED_MEMORY_MB: u64 = 24 * 1_024;
 
 /// `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits`
 pub fn parse_nvidia_smi(text: &str) -> Vec<Gpu> {
@@ -313,6 +318,23 @@ impl Probe {
         self.usable_gpu().is_some() || (self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon())
     }
 
+    /// Whether the acceleration of this Apple Silicon host is qualified for local models: its
+    /// unified memory must be known and at least [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`].
+    pub fn unified_memory_qualified(&self) -> bool {
+        self.os.unified_memory_mb.is_some_and(|mb| mb >= MIN_QUALIFIED_UNIFIED_MEMORY_MB)
+    }
+
+    /// The memory, in megabytes, models are sized by: the best card's when the host reports
+    /// cards, and an Apple Silicon host's unified memory where it reports none. A host that
+    /// reports neither gives no figure.
+    pub fn model_memory_mb(&self) -> Option<u64> {
+        match self.gpu().and_then(|g| g.vram_mb) {
+            Some(mb) => Some(mb),
+            None if self.os.is_apple_silicon() => self.os.unified_memory_mb,
+            None => None,
+        }
+    }
+
     /// The build of ComfyUI for this machine's card (a key of the manifest's assets), and
     /// whether that pairing has been tried: only NVIDIA has.
     pub fn variant(&self) -> (&'static str, bool) {
@@ -335,15 +357,16 @@ impl Probe {
     /// The runtime target this machine's facts select, if any: the Windows
     /// portable GPU runtime when this is a 64-bit Windows host (same variant
     /// and qualification as [`Probe::variant`] reports), or the Apple Silicon
-    /// macOS runtime on a 64-bit `arm64` host. Older Intel Macs, 32-bit hosts
-    /// and malformed facts select nothing.
+    /// macOS runtime on a 64-bit `arm64` host, qualified only when its unified
+    /// memory is known and at least [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`]. Older
+    /// Intel Macs, 32-bit hosts and malformed facts select nothing.
     pub fn runtime_target(&self) -> Option<RuntimeTarget> {
         if self.os.windows && self.os.sixty_four_bit {
             let (variant, qualified) = self.variant();
             return Some(RuntimeTarget::new(RuntimePlatform::WindowsPortable, variant, qualified));
         }
         if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
-            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, true));
+            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, self.unified_memory_qualified()));
         }
         None
     }
@@ -353,9 +376,12 @@ impl Probe {
         self.drives.iter().max_by_key(|d| d.free)
     }
 
-    /// Can the app install the engine itself here?
+    /// Can the app install the engine itself here? Windows as ever; an Apple Silicon Mac whose
+    /// memory falls short of [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`] like Windows' unqualified card
+    /// variants: install stays open, and the shortfall is said by the `gpu` check row and the
+    /// target's qualified flag rather than silently blocking or silently allowing.
     pub fn can_install(&self) -> bool {
-        (self.os.windows && self.os.sixty_four_bit) || self.runtime_target().is_some_and(|target| target.is_macos_arm64() && target.is_qualified())
+        (self.os.windows && self.os.sixty_four_bit) || self.runtime_target().is_some_and(|target| target.is_macos_arm64())
     }
 
     /// The rows of the first screen.
@@ -380,7 +406,20 @@ impl Probe {
         // The graphics card.
         out.push(if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
             let memory = self.os.unified_memory_mb.map_or_else(String::new, |mb| format!("{} GB unified", (mb as f64 / 1024.0).round() as u64));
-            row("gpu", Level::Ok, "Apple Silicon GPU".into(), "Metal Performance Shaders acceleration is available", memory)
+            if self.unified_memory_qualified() {
+                row("gpu", Level::Ok, "Apple Silicon GPU".into(), "Metal Performance Shaders acceleration is available", memory)
+            } else {
+                row(
+                    "gpu",
+                    Level::Warn,
+                    "Apple Silicon GPU".into(),
+                    &format!(
+                        "Local models may not fit in this Mac's unified memory: {} GB or more is qualified. Cloud models work on any Mac.",
+                        MIN_QUALIFIED_UNIFIED_MEMORY_MB / 1024
+                    ),
+                    memory,
+                )
+            }
         } else {
             match self.gpu() {
                 Some(gpu) => {
@@ -831,7 +870,14 @@ mod tests {
     #[test]
     fn the_runtime_target_selects_qualified_apple_silicon() {
         let p = Probe {
-            os: Os { name: "macOS".into(), version: "26.1".into(), architecture: "arm64".into(), sixty_four_bit: true, ..Os::default() },
+            os: Os {
+                name: "macOS".into(),
+                version: "26.1".into(),
+                architecture: "arm64".into(),
+                sixty_four_bit: true,
+                unified_memory_mb: Some(24_576),
+                ..Os::default()
+            },
             ..Probe::default()
         };
         let target = p.runtime_target().expect("Apple Silicon selects a target");
@@ -840,8 +886,44 @@ mod tests {
         assert!(target.is_qualified());
         assert!(p.can_install());
         assert!(p.has_usable_acceleration());
+        assert_eq!(p.model_memory_mb(), Some(24_576));
         let gpu = p.checks().into_iter().find(|check| check.id == "gpu").expect("the acceleration check is present");
-        assert_eq!((gpu.level, gpu.title.as_str(), gpu.value.as_str()), (Level::Ok, "Apple Silicon GPU", ""));
+        assert_eq!((gpu.level, gpu.title.as_str(), gpu.value.as_str()), (Level::Ok, "Apple Silicon GPU", "24 GB unified"));
+    }
+
+    /// Only 24 GiB of unified memory and above qualifies (Z-Image Turbo INT8 on 24 GB is the one
+    /// qualified configuration); below it, or with the memory unknown, the target is unqualified
+    /// and the card row warns. Install stays open either way, and a figure comes back for Macs so
+    /// preset selection and the light-preset suggestion work there.
+    #[test]
+    fn apple_silicon_qualifies_only_at_the_unified_memory_floor() {
+        let mac = |mb: Option<u64>| Probe {
+            os: Os { name: "macOS".into(), architecture: "arm64".into(), sixty_four_bit: true, unified_memory_mb: mb, ..Os::default() },
+            ..Probe::default()
+        };
+        let read = |mb: Option<u64>| {
+            let p = mac(mb);
+            let target = p.runtime_target().expect("Apple Silicon selects a target");
+            let gpu = p.checks().into_iter().find(|c| c.id == "gpu").expect("the acceleration check is present");
+            (target.is_qualified(), gpu.level, gpu.value, p.model_memory_mb(), p.can_install())
+        };
+        // Below the floor: unqualified, a warning and not a stop, and a memory figure all the same.
+        assert_eq!(read(Some(8_192)), (false, Level::Warn, "8 GB unified".to_string(), Some(8_192), true));
+        assert_eq!(read(Some(16_384)), (false, Level::Warn, "16 GB unified".to_string(), Some(16_384), true));
+        // 23.9 GiB rounds to 24 GB on the row and still is under the 24 GiB floor.
+        assert_eq!(read(Some(24_473)), (false, Level::Warn, "24 GB unified".to_string(), Some(24_473), true));
+        // Unknown memory is not qualified either: it must not be assumed enough.
+        assert_eq!(read(None), (false, Level::Warn, String::new(), None, true));
+        // At and above the floor: qualified, and the row reads as before.
+        assert_eq!(read(Some(24_576)), (true, Level::Ok, "24 GB unified".to_string(), Some(24_576), true));
+        assert_eq!(read(Some(65_536)), (true, Level::Ok, "64 GB unified".to_string(), Some(65_536), true));
+        // The warning says what it means: the models may not fit here, and cloud models still work.
+        let warn = mac(Some(8_192)).checks().into_iter().find(|c| c.id == "gpu").expect("the card row");
+        assert!(warn.detail.contains("may not fit") && warn.detail.contains("24 GB") && warn.detail.contains("Cloud models"), "{}", warn.detail);
+        // Windows is unchanged: the card's memory is the figure, and the card still qualifies.
+        let win = probe();
+        assert_eq!(win.model_memory_mb(), Some(24_564));
+        assert!(win.can_install() && win.runtime_target().is_some_and(|t| t.is_qualified()));
     }
 
     #[test]

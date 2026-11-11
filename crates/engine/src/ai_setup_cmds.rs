@@ -532,7 +532,7 @@ mod native {
             move |_, found: probe::Probe| {
                 let target = found.runtime_target();
                 let (variant, tried) = target.as_ref().map_or_else(|| found.variant(), |target| (target.variant(), target.is_qualified()));
-                let vram_gb = found.gpu().and_then(|g| g.vram_mb).map(|mb| (mb as f64 / 1024.0).round() as u64);
+                let vram_gb = found.model_memory_mb().map(|mb| (mb as f64 / 1024.0).round() as u64);
                 Ok(json!({
                     "probe": found, "checks": found.checks(), "runtimeTarget": target,
                     "variant": variant, "variantTested": tried, "canInstall": found.can_install(),
@@ -1252,7 +1252,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Check This PC for Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],runtimeTarget:{platform:windowsPortable|macosArm64,variant,qualified}?,variant (legacy selected build),variantTested,canInstall,gpuUsable (a GPU or Apple Silicon accelerator the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb,defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
+            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],runtimeTarget:{platform:windowsPortable|macosArm64,variant,qualified}?,variant (legacy selected build),variantTested,canInstall,gpuUsable (a GPU or Apple Silicon accelerator the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb (the card's memory in GB, or an Apple Silicon Mac's unified memory where no card is reported),defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
             enabled: can_install,
             run: imp::probe,
             journal: false,
