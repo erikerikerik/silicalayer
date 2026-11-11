@@ -65,7 +65,9 @@ The saved local evidence is intentionally outside Git under `.silica-agent/mps-s
 
 ## Decision and next checks
 
-Use Z-Image Turbo INT8 as the first 24 GB default candidate and continue the ComfyUI/MPS implementation. Keep generation sequential at batch size one and preserve staged loading/offload. Before Phase 4 exits, add:
+Use Z-Image Turbo INT8 as the first 24 GB default candidate and continue the ComfyUI/MPS implementation. Keep generation sequential at batch size one and preserve staged loading/offload. The next runtime milestone is now recorded in [MACOS_RUNTIME_ARTIFACT.md](MACOS_RUNTIME_ARTIFACT.md): a 760 MB relocatable archive passed the production extractor and generated a fresh 1008×1008 image from its extracted location on this host.
+
+Before Phase 4 exits, add:
 
 1. two or more consecutive one-megapixel renders after a clean boot;
 2. cancellation during text encoding, model loading, and sampling;
