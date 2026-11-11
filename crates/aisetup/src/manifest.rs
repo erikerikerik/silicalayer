@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use photocraft_aigen::Family;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, platform::RuntimePlatform};
 
 /// The manifest format this build reads.
 pub const VERSION: u32 = 1;
@@ -387,6 +387,13 @@ impl Manifest {
         self.comfy.assets.get(variant).ok_or_else(|| Error::Config(format!("there is no ComfyUI build for `{variant}`")))
     }
 
+    /// The builds that run on `platform`, by variant key: every setup listing,
+    /// default or validation of managed builds must go through this so a host
+    /// never sees, chooses or downloads a build made for another platform.
+    pub fn assets_for(&self, platform: RuntimePlatform) -> BTreeMap<&str, &Asset> {
+        self.comfy.assets.iter().filter(|(variant, _)| platform.accepts_variant(variant)).map(|(variant, asset)| (variant.as_str(), asset)).collect()
+    }
+
     /// The Python executable and ComfyUI script inside one runtime archive. Older manifests use
     /// the global paths; an asset may override both together for a different platform layout.
     pub fn runtime_paths(&self, variant: &str) -> Result<RuntimePaths<'_>> {
@@ -443,6 +450,24 @@ mod tests {
         // Each local enhancer is pinned at the size the app knows it by.
         for x in photocraft_aigen::enhance::local::MODELS {
             assert_eq!(m.files.get(&x.manifest_key()).map(|f| f.size), Some(x.size), "{}", x.id);
+        }
+    }
+
+    #[test]
+    fn assets_for_hands_each_platform_only_its_own_builds() {
+        let m = bundled();
+        let mac: Vec<&str> = m.assets_for(RuntimePlatform::MacosArm64).keys().copied().collect();
+        assert_eq!(mac, ["macos_arm64"]);
+        let windows: Vec<&str> = m.assets_for(RuntimePlatform::WindowsPortable).keys().copied().collect();
+        assert_eq!(windows, ["amd", "intel", "nvidia", "nvidia_cu126"]);
+        assert!(!windows.contains(&"macos_arm64"));
+        // Every build a platform lists can be fetched and run on that platform, and no others leak.
+        for platform in [RuntimePlatform::MacosArm64, RuntimePlatform::WindowsPortable] {
+            for (variant, asset) in m.assets_for(platform) {
+                assert!(platform.accepts_variant(variant), "{variant} listed for {platform:?}");
+                assert_eq!(m.asset(variant).unwrap(), asset);
+                assert!(m.runtime_paths(variant).is_ok(), "{variant}");
+            }
         }
     }
 

@@ -82,8 +82,13 @@ fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb
         .collect();
     let presets: serde_json::Map<String, Value> =
         m.presets.iter().map(|(name, ids)| (name.clone(), json!({"models": ids, "bytes": m.download_bytes(ids)}))).collect();
-    let assets: serde_json::Map<String, Value> =
-        m.comfy.assets.iter().map(|(name, a)| (name.clone(), json!({"bytes": a.size, "unpackedBytes": a.unpacked_bytes}))).collect();
+    // Only the builds this computer could actually run are worth offering; a host with no
+    // managed build (Linux, an Intel Mac, the browser) still sees every build.
+    let build = |a: &photocraft_aisetup::manifest::Asset| json!({"bytes": a.size, "unpackedBytes": a.unpacked_bytes});
+    let assets: serde_json::Map<String, Value> = match photocraft_aisetup::RuntimePlatform::host() {
+        Some(host) => m.assets_for(host).into_iter().map(|(name, a)| (name.to_string(), build(a))).collect(),
+        None => m.comfy.assets.iter().map(|(name, a)| (name.clone(), build(a))).collect(),
+    };
     json!({
         "version": m.version, "checked": m.checked, "comfy": {"version": m.comfy.version, "builds": assets}, "models": models, "presets": presets,
         "suggested": m.suggested_preset(vram_gb),
@@ -379,17 +384,32 @@ mod native {
         let or_default = |given: Option<String>, saved: &str, default: &str| {
             given.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| if saved.trim().is_empty() { default.to_string() } else { saved.to_string() })
         };
-        let variant = text_param(p, "variant", cmd)?
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| if record.choices.variant.is_empty() { "nvidia".into() } else { record.choices.variant.clone() });
-        let platform = match text_param(p, "platform", cmd)?.as_deref() {
-            None | Some("") => record.choices.platform,
-            Some("windowsPortable") => runtime::RuntimePlatform::WindowsPortable,
-            Some("macosArm64") => runtime::RuntimePlatform::MacosArm64,
+        let want_variant = text_param(p, "variant", cmd)?.filter(|v| !v.is_empty());
+        let want_platform = match text_param(p, "platform", cmd)?.as_deref() {
+            None | Some("") => None,
+            Some("windowsPortable") => Some(runtime::RuntimePlatform::WindowsPortable),
+            Some("macosArm64") => Some(runtime::RuntimePlatform::MacosArm64),
             Some(_) => return Err(bad(cmd, "`platform` must be windowsPortable|macosArm64")),
         };
-        if route == Route::Managed && !m.comfy.assets.contains_key(&variant) {
-            let known: Vec<&str> = m.comfy.assets.keys().map(String::as_str).collect();
+        // A managed build must run on this computer: a parameter naming another platform, or a
+        // variant this platform does not own, is refused, and a record saved for another platform
+        // is not reused (the host's own build applies), so a Mac never plans or downloads a
+        // Windows build and Windows keeps its historic choices.
+        let saved = (!record.choices.variant.trim().is_empty()).then(|| (record.choices.platform, record.choices.variant.as_str()));
+        let (platform, variant) = match (route, runtime::RuntimePlatform::host()) {
+            (Route::Managed, Some(host)) => {
+                photocraft_aisetup::platform::resolve_runtime(Some(host), want_platform, want_variant.as_deref(), saved).map_err(|why| bad(cmd, why))?
+            }
+            // A ComfyUI of the user's own runs wherever it runs; its record's platform and
+            // variant are only carried along, as before. A host without a managed build of its
+            // own (Linux, an Intel Mac) stays as it was too: the wizard never offers it one.
+            _ => (
+                want_platform.unwrap_or(record.choices.platform),
+                want_variant.unwrap_or_else(|| if record.choices.variant.is_empty() { "nvidia".into() } else { record.choices.variant.clone() }),
+            ),
+        };
+        if route == Route::Managed && !m.assets_for(platform).contains_key(variant.as_str()) {
+            let known: Vec<&str> = m.assets_for(platform).keys().copied().collect();
             return Err(bad(cmd, format!("`variant` must be {}", known.join("|"))));
         }
         Ok(Choices {
@@ -736,6 +756,15 @@ mod native {
         let record = s.ai_setup.record();
         if record.phase == Phase::None || record.choices.models_dir.trim().is_empty() {
             return Err(EngineError::Other("There is no setup to repair yet: set up local AI first.".into()));
+        }
+        // A managed record names the build its machine was asked to install, and repair unpacks
+        // exactly that build. On a computer that is not its own — settings moved to a Mac, say —
+        // repairing would install something that can never run here: refuse, the way a plan or
+        // the wizard refuses an explicit request for another computer's build. A host with no
+        // managed build of its own repairs what it always could.
+        if let (Route::Managed, Some(host)) = (record.choices.route, photocraft_aisetup::RuntimePlatform::host()) {
+            let variant = (!record.choices.variant.is_empty()).then_some(record.choices.variant.as_str());
+            photocraft_aisetup::platform::resolve_runtime(Some(host), Some(record.choices.platform), variant, None).map_err(EngineError::Other)?;
         }
         let choices = Choices { recheck: true, test_image: true, token: !s.ai.hf_token().is_empty(), ..record.choices };
         begin(s, choices, None, None, cmd)
@@ -1243,7 +1272,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Plan Local AI Setup",
             menu: &[],
             shortcut: None,
-            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?,"variant":"nvidia|nvidia_cu126|amd|intel|macos_arm64"?,"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {platform,steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
+            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?=this computer's (one it can't run is refused),"variant":"nvidia|nvidia_cu126|amd|intel|macos_arm64"?=this computer's build (one it can't run is refused),"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {platform,steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
             enabled: can_install,
             run: imp::plan_cmd,
             journal: false,
@@ -1263,7 +1292,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Set Up Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?,"variant":str?,"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
+            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?=this computer's (one it can't run is refused),"variant":str?=this computer's build (one it can't run is refused),"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
             enabled: can_install,
             run: imp::start,
             journal: false,

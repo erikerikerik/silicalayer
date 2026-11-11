@@ -19,7 +19,7 @@ use egui::{Align, Color32, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Ui
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use photocraft_aisetup::probe::Stage;
+use photocraft_aisetup::{platform::RuntimePlatform, probe::Stage};
 
 use crate::PhotocraftApp;
 use crate::theme::Tokens;
@@ -752,9 +752,21 @@ fn params(app: &PhotocraftApp) -> Value {
         p["route"] = json!("managed");
         p["engineDir"] = json!(s.engine_dir);
         p["extraModelsDirs"] = json!(s.extra_models_dirs);
-        p["variant"] = json!(s.probe.as_ref().map_or("nvidia", |v| text(v, "/variant")));
-        if let Some(platform) = s.probe.as_ref().and_then(|v| v.pointer("/runtimeTarget/platform")).and_then(Value::as_str) {
+        // Only a target this computer itself is gets sent: a probe can describe another machine
+        // (the walkthrough's does), and the engine refuses a managed build for another platform.
+        // Left out, the engine picks this computer's build and its default variant, so a Mac is
+        // never asked to download the Windows NVIDIA build.
+        let host = RuntimePlatform::host();
+        if let Some(platform) =
+            s.probe.as_ref().and_then(|v| v.pointer("/runtimeTarget/platform")).and_then(|v| serde_json::from_value::<RuntimePlatform>(v.clone()).ok())
+            && Some(platform) == host
+        {
             p["platform"] = json!(platform);
+        }
+        if let Some(variant) = s.probe.as_ref().map(|v| text(v, "/variant")).filter(|v| !v.is_empty())
+            && host.is_some_and(|host| host.accepts_variant(&variant))
+        {
+            p["variant"] = json!(variant);
         }
         // Without a card it can use, the engine runs on the processor (Install anyway was ticked).
         p["cpu"] = json!(s.probe.as_ref().and_then(|v| v.get("gpuUsable")).and_then(Value::as_bool) == Some(false));

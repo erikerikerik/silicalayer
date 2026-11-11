@@ -42,6 +42,36 @@ impl RuntimePlatform {
             RuntimePlatform::MacosArm64 => &[],
         }
     }
+
+    /// The platform this computer is, if a managed runtime build exists for it.
+    /// `None` means no managed build runs here (Linux, Intel Macs, other
+    /// targets): setup must offer the externally-managed route instead, never
+    /// plan or download a build for another platform.
+    pub fn host() -> Option<Self> {
+        Self::host_from(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// The pure platform decision behind [`RuntimePlatform::host`], taking the
+    /// host facts as parameters so every rule is testable on any machine:
+    /// Apple-silicon macOS is `MacosArm64`, Windows is `WindowsPortable`, and
+    /// nothing else has a managed build.
+    pub fn host_from(os: &str, arch: &str) -> Option<Self> {
+        match (os, arch) {
+            ("macos", "aarch64") => Some(Self::MacosArm64),
+            ("windows", _) => Some(Self::WindowsPortable),
+            _ => None,
+        }
+    }
+
+    /// The managed-build variant this platform uses when nothing more specific
+    /// is chosen: the Apple-silicon runtime on macOS, the NVIDIA build on
+    /// Windows (matching the historic default there).
+    pub fn default_variant(self) -> &'static str {
+        match self {
+            RuntimePlatform::WindowsPortable => "nvidia",
+            RuntimePlatform::MacosArm64 => RuntimeTarget::MACOS_ARM64_VARIANT,
+        }
+    }
 }
 
 /// The managed-runtime target the host's facts select: which
@@ -105,6 +135,58 @@ impl RuntimeTarget {
     }
 }
 
+/// Decide which managed runtime a setup should use, so a host never plans,
+/// downloads or launches a build made for another platform.
+///
+/// - `host` is [`RuntimePlatform::host`]: `None` (Linux, Intel Macs) means no
+///   managed build runs here at all.
+/// - `want_platform` / `want_variant` are explicit request parameters; a
+///   platform that is not the host's, or a variant the host platform does not
+///   own, is an actionable error, never a silent cross-platform choice. A
+///   variant the host does own is used as asked, ahead of `saved` and the default.
+/// - `saved` is the platform and variant from the stored setup record: it is
+///   reused only when it names this host platform and an accepted variant; a
+///   record from another platform is ignored (host defaults apply) rather than
+///   reused.
+///
+/// Returns the platform and variant to use, or an actionable message.
+pub fn resolve_runtime(
+    host: Option<RuntimePlatform>,
+    want_platform: Option<RuntimePlatform>,
+    want_variant: Option<&str>,
+    saved: Option<(RuntimePlatform, &str)>,
+) -> Result<(RuntimePlatform, String), String> {
+    let Some(host) = host else {
+        return Err(
+            "This computer can't run a managed ComfyUI build. Point PhotoCraft at your own ComfyUI installation (\"Use my ComfyUI\") instead.".to_string()
+        );
+    };
+    if let Some(want) = want_platform
+        && want != host
+    {
+        return Err(format!(
+            "The {want:?} runtime can't run on this computer, so it won't be downloaded. This machine is a {host:?} host; leave the platform unset (or set it to {host:?}) to use the build for this computer."
+        ));
+    }
+    if let Some(variant) = want_variant.filter(|v| !v.is_empty()) {
+        if !host.accepts_variant(variant) {
+            let usable = if host == RuntimePlatform::MacosArm64 { "'macos_arm64'" } else { "'nvidia', 'nvidia_cu126', 'amd' or 'intel'" };
+            return Err(format!("There is no {host:?} build for graphics card '{variant}'. This computer can use {usable}."));
+        }
+        // An explicit variant the host platform owns is used as asked, in preference
+        // to the saved record and the platform default.
+        return Ok((host, variant.to_string()));
+    }
+    if let Some((saved_platform, saved_variant)) = saved
+        && saved_platform == host
+        && !saved_variant.is_empty()
+        && host.accepts_variant(saved_variant)
+    {
+        return Ok((host, saved_variant.to_string()));
+    }
+    Ok((host, host.default_variant().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +226,87 @@ mod tests {
         assert!(!RuntimePlatform::WindowsPortable.accepts_variant("voodoo"));
         assert!(RuntimePlatform::WindowsPortable.needs_windows_support());
         assert!(!RuntimePlatform::MacosArm64.needs_windows_support());
+    }
+
+    #[test]
+    fn host_platform_is_decoded_from_host_facts_only() {
+        assert_eq!(RuntimePlatform::host_from("macos", "aarch64"), Some(RuntimePlatform::MacosArm64));
+        assert_eq!(RuntimePlatform::host_from("macos", "x86_64"), None);
+        assert_eq!(RuntimePlatform::host_from("windows", "x86_64"), Some(RuntimePlatform::WindowsPortable));
+        assert_eq!(RuntimePlatform::host_from("windows", "aarch64"), Some(RuntimePlatform::WindowsPortable));
+        assert_eq!(RuntimePlatform::host_from("linux", "x86_64"), None);
+        assert_eq!(RuntimePlatform::host_from("linux", "aarch64"), None);
+        // The live call must agree with the pure rule for this machine's own facts.
+        assert_eq!(RuntimePlatform::host(), RuntimePlatform::host_from(std::env::consts::OS, std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn each_platform_defaults_to_its_own_build() {
+        assert_eq!(RuntimePlatform::MacosArm64.default_variant(), RuntimeTarget::MACOS_ARM64_VARIANT);
+        assert_eq!(RuntimePlatform::WindowsPortable.default_variant(), "nvidia");
+        for p in [RuntimePlatform::MacosArm64, RuntimePlatform::WindowsPortable] {
+            assert!(p.accepts_variant(p.default_variant()));
+        }
+    }
+
+    #[test]
+    fn a_macos_host_with_no_parameters_gets_the_macos_arm64_build() {
+        let (platform, variant) = resolve_runtime(Some(RuntimePlatform::MacosArm64), None, None, None).unwrap();
+        assert_eq!(platform, RuntimePlatform::MacosArm64);
+        assert_eq!(variant, "macos_arm64");
+    }
+
+    #[test]
+    fn a_macos_host_cannot_be_asked_for_the_windows_build() {
+        // Asking for the other platform outright is an actionable error, never a silent download.
+        let err = resolve_runtime(Some(RuntimePlatform::MacosArm64), Some(RuntimePlatform::WindowsPortable), None, None).unwrap_err();
+        assert!(err.contains("can't run on this computer"), "{err}");
+        // And so is naming a variant the host platform does not own, even without a platform param.
+        let err = resolve_runtime(Some(RuntimePlatform::MacosArm64), None, Some("nvidia"), None).unwrap_err();
+        assert!(err.contains("macos_arm64"), "{err}");
+        for variant in ["nvidia", "nvidia_cu126", "amd", "intel", "dml", "voodoo"] {
+            assert!(resolve_runtime(Some(RuntimePlatform::MacosArm64), None, Some(variant), None).is_err(), "{variant} must not be planned on macOS");
+        }
+    }
+
+    #[test]
+    fn a_windows_host_cannot_be_asked_for_the_macos_build() {
+        let win = Some(RuntimePlatform::WindowsPortable);
+        let err = resolve_runtime(win, Some(RuntimePlatform::MacosArm64), None, None).unwrap_err();
+        assert!(err.contains("can't run on this computer"), "{err}");
+        let err = resolve_runtime(win, None, Some("macos_arm64"), None).unwrap_err();
+        assert!(err.contains("nvidia"), "{err}");
+        // A Windows host still resolves exactly as before: nvidia by default, its own variants on request.
+        assert_eq!(resolve_runtime(win, None, None, None).unwrap(), (RuntimePlatform::WindowsPortable, "nvidia".to_string()));
+        assert_eq!(resolve_runtime(win, None, Some("amd"), None).unwrap(), (RuntimePlatform::WindowsPortable, "amd".to_string()));
+        assert_eq!(resolve_runtime(win, win, Some("nvidia_cu126"), None).unwrap(), (RuntimePlatform::WindowsPortable, "nvidia_cu126".to_string()));
+    }
+
+    #[test]
+    fn a_saved_record_for_another_platform_is_not_reused() {
+        let mac = Some(RuntimePlatform::MacosArm64);
+        let win = Some(RuntimePlatform::WindowsPortable);
+        // A record carried over from a Windows machine must not make a Mac download or run the Windows build:
+        // the host platform and its own default apply instead, without an error (setup can continue).
+        let (platform, variant) = resolve_runtime(mac, None, None, Some((RuntimePlatform::WindowsPortable, "nvidia"))).unwrap();
+        assert_eq!(platform, RuntimePlatform::MacosArm64);
+        assert_eq!(variant, "macos_arm64");
+        // Same for a foreign platform with a foreign variant string, and for an empty saved variant.
+        assert_eq!(resolve_runtime(mac, None, None, Some((RuntimePlatform::WindowsPortable, "amd"))).unwrap().1, "macos_arm64");
+        assert_eq!(resolve_runtime(mac, None, None, Some((RuntimePlatform::MacosArm64, ""))).unwrap().1, "macos_arm64");
+        // A foreign variant saved under this platform is not reused either; an accepted one is.
+        assert_eq!(resolve_runtime(mac, None, None, Some((RuntimePlatform::MacosArm64, "nvidia"))).unwrap().1, "macos_arm64");
+        assert_eq!(resolve_runtime(mac, None, None, Some((RuntimePlatform::MacosArm64, "macos_arm64"))).unwrap().1, "macos_arm64");
+        assert_eq!(resolve_runtime(win, None, None, Some((RuntimePlatform::WindowsPortable, "amd"))).unwrap().1, "amd");
+        // An explicit accepted variant wins over the saved one; an explicit foreign variant is still an error.
+        assert_eq!(resolve_runtime(win, None, Some("intel"), Some((RuntimePlatform::WindowsPortable, "amd"))).unwrap().1, "intel");
+        assert!(resolve_runtime(mac, None, Some("nvidia"), Some((RuntimePlatform::WindowsPortable, "nvidia"))).is_err());
+    }
+
+    #[test]
+    fn a_host_without_a_managed_build_gets_an_actionable_error() {
+        let err = resolve_runtime(None, None, None, None).unwrap_err();
+        assert!(err.contains("Use my ComfyUI"), "{err}");
+        assert!(resolve_runtime(None, Some(RuntimePlatform::WindowsPortable), Some("nvidia"), Some((RuntimePlatform::WindowsPortable, "nvidia"))).is_err());
     }
 }
