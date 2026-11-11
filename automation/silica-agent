@@ -15,7 +15,7 @@ AGENT_TIMEOUT=${SILICA_AGENT_TIMEOUT:-5400}
 GATE_TIMEOUT=${SILICA_GATE_TIMEOUT:-3600}
 PUSH=${SILICA_PUSH:-0}
 GATE=${SILICA_GATE:-automation/gate}
-MIN_FREE_GB=${SILICA_MIN_FREE_GB:-80}
+MIN_FREE_GB=${SILICA_MIN_FREE_GB:-20}
 PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 

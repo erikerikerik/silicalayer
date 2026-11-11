@@ -37,7 +37,7 @@ The launch agent runs every 30 minutes and after login. Install it only after `p
 - `SILICA_AGENT_TIMEOUT` and `SILICA_GATE_TIMEOUT` (default `3600` seconds, maximum `7200`)
 - `SILICA_PUSH` (`0` by default)
 - `SILICA_GATE` (default `automation/gate`)
-- `SILICA_MIN_FREE_GB` (default `80`)
+- `SILICA_MIN_FREE_GB` (default `20`)
 
 No setting enables release publication, signing, notarization, secret access, destructive Git, or paid APIs. The worker accepts only `automation/*` or `silicalayer/*` branches and an exact private SilicaLayer origin URL.
 
