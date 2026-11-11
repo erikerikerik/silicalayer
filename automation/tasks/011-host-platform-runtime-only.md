@@ -20,3 +20,14 @@ Tests (each must fail without the fix), using the pure helper with an explicit h
 - `assets_for(MacosArm64)` is exactly `macos_arm64`; `assets_for(WindowsPortable)` excludes it.
 
 Exit evidence: the full supervisor gate passes, including the engine and UI setup tests.
+
+## Exact locations (verified; do not search for other files)
+
+Edit only these files. Line numbers are approximate; read each file before editing it, and copy the text you replace exactly from the file.
+
+- `crates/aisetup/src/platform.rs`: `pub enum RuntimePlatform` (about line 14) and `fn accepts_variant` (about line 35). Add `host()` and the pure helper here, with their unit tests in this file's `#[cfg(test)]` module.
+- `crates/aisetup/src/manifest.rs`: `pub struct Manifest` (about line 149) and `impl Manifest` (about line 195). Add `assets_for` in that `impl`, with tests in this file's test module.
+- `crates/engine/src/ai_setup_cmds.rs`: the `text_param(p, "variant", cmd)` and `text_param(p, "platform", cmd)` handling (about lines 382–390). Name any new engine tests with `ai_setup` in their path or name so the gate's `ai_setup` filter runs them.
+- `crates/ui-egui/src/ai_setup_ui.rs`: `fn params` (about line 735); the `"nvidia"` fallback is about line 755.
+
+There is no `crates/engine/src/ai.rs`. Do not read `target/`, build output, or anything outside this repository.

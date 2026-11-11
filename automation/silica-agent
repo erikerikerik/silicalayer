@@ -128,7 +128,9 @@ preflight() {
       health=$(curl --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/health") || die "Strata health check failed"
       printf '%s\n' "$health" | grep -F '"status": "ok"' >/dev/null || die "Strata is not healthy"
       printf '%s\n' "$health" | grep -F '"api_key": false' >/dev/null || die "Strata authentication mode changed"
-      printf '%s\n' "$health" | grep -F '"max_context": 65536' >/dev/null || die "Strata context is not 65536"
+      ctx=$(printf '%s\n' "$health" | sed -n 's/.*"max_context"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+      case "$ctx" in ''|*[!0-9]*) die "Strata did not report max_context";; esac
+      [ "$ctx" -ge "${SILICA_MIN_CONTEXT:-131072}" ] || die "Strata context $ctx is below ${SILICA_MIN_CONTEXT:-131072}"
       models=$(curl --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/v1/models") || die "Strata model query failed"
       printf '%s\n' "$models" | grep -F "\"id\":\"$MODEL\"" >/dev/null || \
         printf '%s\n' "$models" | grep -F "\"id\": \"$MODEL\"" >/dev/null || die "Strata model $MODEL is not served"
