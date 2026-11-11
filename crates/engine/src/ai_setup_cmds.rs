@@ -382,13 +382,19 @@ mod native {
         let variant = text_param(p, "variant", cmd)?
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| if record.choices.variant.is_empty() { "nvidia".into() } else { record.choices.variant.clone() });
+        let platform = match text_param(p, "platform", cmd)?.as_deref() {
+            None | Some("") => record.choices.platform,
+            Some("windowsPortable") => runtime::RuntimePlatform::WindowsPortable,
+            Some("macosArm64") => runtime::RuntimePlatform::MacosArm64,
+            Some(_) => return Err(bad(cmd, "`platform` must be windowsPortable|macosArm64")),
+        };
         if route == Route::Managed && !m.comfy.assets.contains_key(&variant) {
             let known: Vec<&str> = m.comfy.assets.keys().map(String::as_str).collect();
             return Err(bad(cmd, format!("`variant` must be {}", known.join("|"))));
         }
         Ok(Choices {
             route,
-            platform: record.choices.platform,
+            platform,
             models,
             engine_dir: or_default(text_param(p, "engineDir", cmd)?, &record.choices.engine_dir, &env.engine_dir),
             models_dir: or_default(text_param(p, "modelsDir", cmd)?, &record.choices.models_dir, &env.models_dir),
@@ -504,10 +510,12 @@ mod native {
                 Ok(found)
             },
             move |_, found: probe::Probe| {
-                let (variant, tried) = found.variant();
+                let target = found.runtime_target();
+                let (variant, tried) = target.as_ref().map_or_else(|| found.variant(), |target| (target.variant(), target.is_qualified()));
                 let vram_gb = found.gpu().and_then(|g| g.vram_mb).map(|mb| (mb as f64 / 1024.0).round() as u64);
                 Ok(json!({
-                    "probe": found, "checks": found.checks(), "variant": variant, "variantTested": tried, "canInstall": found.can_install(),
+                    "probe": found, "checks": found.checks(), "runtimeTarget": target,
+                    "variant": variant, "variantTested": tried, "canInstall": found.can_install(),
                     "gpuUsable": found.usable_gpu().is_some(),
                     "vramGb": vram_gb, "defaults": defaults,
                 }))
@@ -592,7 +600,7 @@ mod native {
             "needsSignIn": needs_sign_in,
             "route": choices.route, "models": planned.models, "steps": planned.steps,
             "downloadBytes": planned.download_bytes, "engineBytes": planned.engine_bytes, "modelsBytes": planned.models_bytes,
-            "engineDir": choices.engine_dir, "modelsDir": choices.models_dir, "variant": choices.variant, "cpu": choices.cpu,
+            "engineDir": choices.engine_dir, "modelsDir": choices.models_dir, "platform": choices.platform, "variant": choices.variant, "cpu": choices.cpu,
             "engineFree": engine_free, "modelsFree": models_free, "sameDrive": same_drive,
             "token": choices.token, "problems": problems, "folderProblems": folder_problems, "modelProblems": room.models,
         }))
@@ -628,7 +636,7 @@ mod native {
         let engines: Vec<Value> = match record.choices.route {
             Route::Managed if !record.choices.engine_dir.trim().is_empty() => runtime::installed_engines(Path::new(&record.choices.engine_dir))
                 .into_iter()
-                .map(|(path, marker)| json!({"version": marker.version, "variant": marker.variant, "folder": path.to_string_lossy()}))
+                .map(|(path, marker)| json!({"platform": marker.platform, "version": marker.version, "variant": marker.variant, "folder": path.to_string_lossy()}))
                 .collect(),
             _ => Vec::new(),
         };
@@ -650,7 +658,8 @@ mod native {
             "engine": engine,
             "record": {
                 "phase": record.phase, "route": record.choices.route, "models": record.choices.models, "engineDir": record.choices.engine_dir,
-                "modelsDir": record.choices.models_dir, "extraModelsDirs": record.choices.extra_models_dirs, "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
+                "modelsDir": record.choices.models_dir, "extraModelsDirs": record.choices.extra_models_dirs, "platform": record.choices.platform,
+                "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
                 "comfyVersion": record.comfy_version, "installed": record.installed, "error": record.error, "offered": record.offered,
             },
             "engines": engines, "installedNow": installed_now(s), "progress": progress,
@@ -1214,7 +1223,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Check This PC for Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],variant (the ComfyUI build for the graphics card),variantTested,canInstall,gpuUsable (a graphics card the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb,defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
+            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],runtimeTarget:{platform:windowsPortable|macosArm64,variant,qualified}?,variant (legacy selected build),variantTested,canInstall,gpuUsable (a graphics card the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb,defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
             enabled: can_install,
             run: imp::probe,
             journal: false,
@@ -1234,7 +1243,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Plan Local AI Setup",
             menu: &[],
             shortcut: None,
-            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"variant":"nvidia|nvidia_cu126|amd|intel"?,"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
+            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?,"variant":"nvidia|nvidia_cu126|amd|intel|macos_arm64"?,"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {platform,steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
             enabled: can_install,
             run: imp::plan_cmd,
             journal: false,
@@ -1244,7 +1253,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Local AI Setup Status",
             menu: &[],
             shortcut: None,
-            params: r##"{} → {available,state:none|running|paused|failed|interrupted|done,running,record:{phase,route,models,engineDir,modelsDir,extraModelsDirs,variant,port,comfyVersion,installed,error},engines:[{version,variant,folder}],installedNow:[id],modelFiles:{folder:[file]}? (the installed engine's model files, in its own folder and the user's own folders it reads; null for the user's own ComfyUI),progress:{steps:[{key,label,state:pending|active|done|failed|skipped,done,total,note,download}],bytesDone,bytesTotal,speed (bytes/s),etaSeconds,message}?,result:{ok,cancelled,error,installed,skipped,ready,testImage:{model,modelName,seconds,width,height}?,testError}?,engine:{output:[line] (the last 40 lines the engine the app started printed),log (where all of it is)}? (while a setup runs or after it failed),token (a Hugging Face token is stored)}"##,
+            params: r##"{} → {available,state:none|running|paused|failed|interrupted|done,running,record:{phase,route,models,engineDir,modelsDir,extraModelsDirs,platform,variant,port,comfyVersion,installed,error},engines:[{platform,version,variant,folder}],installedNow:[id],modelFiles:{folder:[file]}? (the installed engine's model files, in its own folder and the user's own folders it reads; null for the user's own ComfyUI),progress:{steps:[{key,label,state:pending|active|done|failed|skipped,done,total,note,download}],bytesDone,bytesTotal,speed (bytes/s),etaSeconds,message}?,result:{ok,cancelled,error,installed,skipped,ready,testImage:{model,modelName,seconds,width,height}?,testError}?,engine:{output:[line] (the last 40 lines the engine the app started printed),log (where all of it is)}? (while a setup runs or after it failed),token (a Hugging Face token is stored)}"##,
             enabled: always,
             run: imp::status,
             journal: false,
@@ -1254,7 +1263,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Set Up Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"variant":str?,"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
+            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?,"variant":str?,"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
             enabled: can_install,
             run: imp::start,
             journal: false,

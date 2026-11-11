@@ -233,6 +233,7 @@ mod native {
             json!({"modelsDir": "relative/path", "models": []}),
             json!({"modelsDir": "x\u{0}y"}),
             json!({"variant": "voodoo"}),
+            json!({"platform": "linux"}),
             json!({"recheck": "yes"}),
             json!({"testImage": 1}),
             json!({"serverFiles": []}),
@@ -262,6 +263,7 @@ mod native {
         assert_eq!(rows, ["os", "gpu", "disk", "comfy", "net"]);
         assert_eq!(seen["defaults"]["modelsDir"], rig.models_dir().to_string_lossy().as_ref());
         assert!(seen["variant"].is_string() && seen["canInstall"].is_boolean() && seen["gpuUsable"].is_boolean());
+        assert!(seen["runtimeTarget"].is_null() || seen["runtimeTarget"]["platform"].is_string());
         assert!(!rig.s.ai_setup.running(), "nothing was started by odd parameters");
         assert_eq!(rig.net.served.load(Ordering::SeqCst), 0);
         assert!(!rig.dir.path().join("engine").exists());
@@ -270,6 +272,8 @@ mod native {
             ("ai.setup.plan", json!({"models": ["no-such-model"]})),
             ("ai.setup.plan", json!({"route": "sideways"})),
             ("ai.setup.plan", json!({"variant": "voodoo"})),
+            ("ai.setup.plan", json!({"platform": "linux"})),
+            ("ai.setup.plan", json!({"platform": "macosArm64", "variant": "nvidia"})),
             ("ai.setup.plan", json!({"modelsDir": "relative/path", "models": []})),
             ("ai.setup.start", json!({"models": [1]})),
             ("ai.setup.start", json!({"url": "ftp://x", "route": "existing", "models": []})),
@@ -295,7 +299,7 @@ mod native {
         let plan = rig.run("ai.setup.plan", json!({"models": ["qwen-image-2-1"]})).unwrap();
         // The app's default folders, the build for NVIDIA, the real runtime's size.
         assert_eq!(plan["engineDir"], rig.dir.path().join("engine").to_string_lossy().as_ref());
-        assert_eq!((plan["variant"].as_str(), plan["route"].as_str()), (Some("nvidia"), Some("managed")));
+        assert_eq!((plan["platform"].as_str(), plan["variant"].as_str(), plan["route"].as_str()), (Some("windowsPortable"), Some("nvidia"), Some("managed")));
         let steps: Vec<&str> = plan["steps"].as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
         assert_eq!(steps.len(), 8, "{steps:?}");
         assert_eq!(plan["modelsBytes"], 60_000);
@@ -309,8 +313,8 @@ mod native {
         // A folder too deep for Windows is a problem named before Install is pressed.
         let deep = format!("{}{}", rig.dir.path().join("engine").to_string_lossy(), "\\deeper".repeat(30));
         let plan = rig.run("ai.setup.plan", json!({"models": [], "engineDir": deep})).unwrap();
-        assert_eq!(plan["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")), cfg!(windows));
-        assert_eq!(plan["folderProblems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")), cfg!(windows));
+        assert!(plan["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")));
+        assert!(plan["folderProblems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")));
     }
 
     #[test]
@@ -581,7 +585,15 @@ mod native {
             ai.comfy_launch.python = root.join("python_embeded").join("python.exe").to_string_lossy().into_owned();
         });
         let status = rig.run("ai.setup.status", json!({})).unwrap();
-        assert_eq!((status["engines"][0]["version"].as_str(), status["installedNow"].as_array().map(Vec::len)), (Some("0.39.0"), Some(2)));
+        assert_eq!(
+            (
+                status["record"]["platform"].as_str(),
+                status["engines"][0]["platform"].as_str(),
+                status["engines"][0]["version"].as_str(),
+                status["installedNow"].as_array().map(Vec::len),
+            ),
+            (Some("windowsPortable"), Some("windowsPortable"), Some("0.39.0"), Some(2))
+        );
         // What its models folder has, for telling what is installed while the engine is off.
         assert!(status["modelFiles"]["vae"].as_array().unwrap().iter().any(|f| f == "my_own.safetensors"), "{}", status["modelFiles"]);
         // One model: its own files go, the engine and the other model stay.
