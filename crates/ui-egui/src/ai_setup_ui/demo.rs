@@ -467,11 +467,12 @@ fn probe_with(dir: &Path, comfy: Existing) -> Value {
 
 /// `ai.setup.probe`'s answer for `p`.
 fn describe(dir: &Path, p: &photocraft_aisetup::probe::Probe) -> Value {
-    let (variant, tested) = p.variant();
+    let target = p.runtime_target();
+    let (variant, tested) = target.as_ref().map_or_else(|| p.variant(), |target| (target.variant(), target.is_qualified()));
     let vram = p.usable_gpu().and_then(|g| g.vram_mb).map(|mb| (mb as f64 / 1024.0).round() as u64);
     json!({
-        "probe": p, "checks": p.checks(), "variant": variant, "variantTested": tested, "canInstall": p.can_install(),
-        "gpuUsable": p.usable_gpu().is_some(), "vramGb": vram,
+        "probe": p, "checks": p.checks(), "runtimeTarget": target, "variant": variant, "variantTested": tested, "canInstall": p.can_install(),
+        "gpuUsable": p.has_usable_acceleration(), "vramGb": vram,
         "defaults": {"engineDir": dir.join("engine").to_string_lossy(), "modelsDir": dir.join("models").to_string_lossy()},
     })
 }

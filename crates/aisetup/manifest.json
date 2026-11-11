@@ -33,6 +33,16 @@
         "sha256": "50dd4f7fd8b08c066f29d0b4f9464fbf63014b413b4c00cf81dbe10362aa593c",
         "unpackedBytes": 5394938794,
         "longestPath": 159
+      },
+      "macos_arm64": {
+        "url": "https://github.com/erikerikerik/silicalayer-runtime/releases/download/comfyui-0.43.0-macos-arm64-r1/SilicaLayer-ComfyUI-0.43.0-macos-arm64.7z",
+        "size": 760253266,
+        "sha256": "891e8e2af644353deeba13ff122b3b4c23589f7b6611c334334f75c2f0b0a32f",
+        "unpackedBytes": 1887798757,
+        "longestPath": 173,
+        "python": "python/bin/python3",
+        "script": "ComfyUI/main.py",
+        "executables": ["python/bin/python3"]
       }
     }
   },

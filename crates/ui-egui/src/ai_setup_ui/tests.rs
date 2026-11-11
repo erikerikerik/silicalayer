@@ -427,6 +427,24 @@ fn without_a_graphics_card_a_new_comfyui_installs_only_on_the_processor_when_ask
 }
 
 #[test]
+fn apple_silicon_uses_the_managed_macos_runtime_without_cpu_fallback() {
+    let (mut app, dir) = app(demo::Scale::Small);
+    app.ui.ai_setup.probe = Some(json!({
+        "canInstall": true,
+        "gpuUsable": true,
+        "variant": "macos_arm64",
+        "runtimeTarget": {"platform": "macosArm64", "variant": "macos_arm64", "qualified": true},
+        "defaults": {"engineDir": dir.path().join("engine"), "modelsDir": dir.path().join("models")},
+        "checks": []
+    }));
+    let choices = params(&app);
+    assert_eq!(choices["platform"], "macosArm64");
+    assert_eq!(choices["variant"], "macos_arm64");
+    assert_eq!(choices["cpu"], false);
+    assert!(gpu_usable(&app) && can_install_new(&app));
+}
+
+#[test]
 fn an_engine_slow_to_start_says_what_it_is_doing_and_shows_its_own_lines() {
     let (mut app, dir) = app(demo::Scale::Small);
     assert!(demo::slow_engine(&mut app, dir.path(), false), "the setup reached the engine's step");
@@ -990,7 +1008,12 @@ fn the_model_folders_page_says_whose_each_folder_is_and_lists_what_it_has() {
     let z_file = std::fs::read_dir(std::path::Path::new(&mine).join("unet")).unwrap().next().unwrap().unwrap().file_name().into_string().unwrap();
     let lora = |file: &str| photocraft_aigen::Lora { file: file.into(), ..Default::default() };
     let draft = [
-        photocraft_aigen::Model { id: "found".into(), name: "my finetune".into(), unet: "z_image_bf16.safetensors".into(), ..photocraft_aigen::Family::ZImage.preset() },
+        photocraft_aigen::Model {
+            id: "found".into(),
+            name: "my finetune".into(),
+            unet: "z_image_bf16.safetensors".into(),
+            ..photocraft_aigen::Family::ZImage.preset()
+        },
         photocraft_aigen::Model { id: "z-image-turbo".into(), unet: z_file.clone(), enabled: true, ..photocraft_aigen::Family::ZImage.preset() },
         // Scan Server's own entry for the same file: another build of the recommended model, not it.
         photocraft_aigen::Model { id: "z-image-turbo-found".into(), name: "z image turbo".into(), unet: z_file, ..photocraft_aigen::Family::ZImage.preset() },

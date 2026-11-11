@@ -131,7 +131,8 @@ pub struct Comfy {
     /// Inside the unpacked build: its Python, and the script it runs.
     pub python: String,
     pub script: String,
-    /// By graphics card: `nvidia`, `nvidia_cu126`, `amd`, `intel`.
+    /// By runtime target: Windows GPU builds (`nvidia`, `nvidia_cu126`, `amd`, `intel`) and
+    /// the qualified Apple Silicon build (`macos_arm64`).
     pub assets: BTreeMap<String, Asset>,
 }
 
@@ -416,8 +417,21 @@ mod tests {
     fn the_bundled_manifest_is_valid_and_pins_one_comfyui() {
         let m = bundled();
         assert_eq!(m.comfy.version, "0.43.0");
-        assert_eq!(m.comfy.assets.keys().map(String::as_str).collect::<Vec<_>>(), ["amd", "intel", "nvidia", "nvidia_cu126"]);
-        assert!(m.comfy.assets.values().all(|a| a.url.contains("/v0.43.0/")));
+        assert_eq!(m.comfy.assets.keys().map(String::as_str).collect::<Vec<_>>(), ["amd", "intel", "macos_arm64", "nvidia", "nvidia_cu126"]);
+        assert!(m.comfy.assets.iter().filter(|(name, _)| name.as_str() != "macos_arm64").all(|(_, a)| a.url.contains("/v0.43.0/")));
+        let mac = &m.comfy.assets["macos_arm64"];
+        assert_eq!(
+            (mac.url.as_str(), mac.size, mac.sha256.as_str(), mac.unpacked_bytes, mac.longest_path),
+            (
+                "https://github.com/erikerikerik/silicalayer-runtime/releases/download/comfyui-0.43.0-macos-arm64-r1/SilicaLayer-ComfyUI-0.43.0-macos-arm64.7z",
+                760_253_266,
+                "891e8e2af644353deeba13ff122b3b4c23589f7b6611c334334f75c2f0b0a32f",
+                1_887_798_757,
+                173,
+            )
+        );
+        assert_eq!(m.runtime_paths("macos_arm64").unwrap(), RuntimePaths { python: "python/bin/python3", script: "ComfyUI/main.py" });
+        assert_eq!(mac.executables, ["python/bin/python3"]);
         assert!(m.asset("nvidia").is_ok() && m.asset("voodoo").is_err());
         // Measured from each archive's header (`--example archive_contents`).
         assert!(m.comfy.assets.values().all(|a| a.unpacked_bytes > a.size && (100..=200).contains(&a.longest_path)));
@@ -672,8 +686,9 @@ mod tests {
     #[test]
     fn executable_paths_default_empty_and_hostile_values_are_refused() {
         let bundled = bundled();
-        // The bundled manifest declares nothing: they are all Windows builds.
-        assert!(bundled.comfy.assets.values().all(|a| a.executables.is_empty()));
+        // Windows builds need no Unix executable allowlist; the macOS build names only Python.
+        assert!(bundled.comfy.assets.iter().filter(|(name, _)| name.as_str() != "macos_arm64").all(|(_, a)| a.executables.is_empty()));
+        assert_eq!(bundled.comfy.assets["macos_arm64"].executables, ["python/bin/python3"]);
         assert_eq!(Manifest::parse(&serde_json::to_string(&bundled).unwrap()).unwrap(), bundled.clone());
 
         let with_executables = |executables: serde_json::Value| {

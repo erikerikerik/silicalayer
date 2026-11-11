@@ -753,6 +753,9 @@ fn params(app: &PhotocraftApp) -> Value {
         p["engineDir"] = json!(s.engine_dir);
         p["extraModelsDirs"] = json!(s.extra_models_dirs);
         p["variant"] = json!(s.probe.as_ref().map_or("nvidia", |v| text(v, "/variant")));
+        if let Some(platform) = s.probe.as_ref().and_then(|v| v.pointer("/runtimeTarget/platform")).and_then(Value::as_str) {
+            p["platform"] = json!(platform);
+        }
         // Without a card it can use, the engine runs on the processor (Install anyway was ticked).
         p["cpu"] = json!(s.probe.as_ref().and_then(|v| v.get("gpuUsable")).and_then(Value::as_bool) == Some(false));
     }

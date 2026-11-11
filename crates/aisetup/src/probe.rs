@@ -307,6 +307,12 @@ impl Probe {
         self.gpu().filter(|g| g.vendor != Vendor::Other)
     }
 
+    /// Whether this host has hardware acceleration the managed runtime can use. Windows reports
+    /// discrete/display adapters above; Apple Silicon exposes its GPU through Metal/MPS instead.
+    pub fn has_usable_acceleration(&self) -> bool {
+        self.usable_gpu().is_some() || (self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon())
+    }
+
     /// The build of ComfyUI for this machine's card (a key of the manifest's assets), and
     /// whether that pairing has been tried: only NVIDIA has.
     pub fn variant(&self) -> (&'static str, bool) {
@@ -329,17 +335,15 @@ impl Probe {
     /// The runtime target this machine's facts select, if any: the Windows
     /// portable GPU runtime when this is a 64-bit Windows host (same variant
     /// and qualification as [`Probe::variant`] reports), or the Apple Silicon
-    /// macOS runtime on a 64-bit `arm64` host. A target is a selection, not
-    /// an install permission: `macos_arm64` has no installer yet and stays
-    /// unqualified. Older Intel Macs, 32-bit hosts and malformed facts select
-    /// nothing.
+    /// macOS runtime on a 64-bit `arm64` host. Older Intel Macs, 32-bit hosts
+    /// and malformed facts select nothing.
     pub fn runtime_target(&self) -> Option<RuntimeTarget> {
         if self.os.windows && self.os.sixty_four_bit {
             let (variant, qualified) = self.variant();
             return Some(RuntimeTarget::new(RuntimePlatform::WindowsPortable, variant, qualified));
         }
         if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
-            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, false));
+            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, true));
         }
         None
     }
@@ -351,7 +355,7 @@ impl Probe {
 
     /// Can the app install the engine itself here?
     pub fn can_install(&self) -> bool {
-        self.os.windows && self.os.sixty_four_bit
+        (self.os.windows && self.os.sixty_four_bit) || self.runtime_target().is_some_and(|target| target.is_macos_arm64() && target.is_qualified())
     }
 
     /// The rows of the first screen.
@@ -362,36 +366,47 @@ impl Probe {
         out.push(if self.can_install() {
             row("os", Level::Ok, format!("{}, 64-bit", self.os.name), "", "supported".into())
         } else if self.os.windows {
-            row("os", Level::Stop, self.os.name.clone(), "The engine needs 64-bit Windows.", "not supported".into())
+            row("os", Level::Stop, self.os.name.clone(), "The engine needs a 64-bit system.", "not supported".into())
         } else {
             let name = if self.os.name.is_empty() { "This system".to_string() } else { self.os.name.clone() };
-            row("os", Level::Stop, name, "Installing the engine for you is Windows only for now. Use my ComfyUI works here.", "use your own".into())
+            row(
+                "os",
+                Level::Stop,
+                name,
+                "Managed installation supports 64-bit Windows and Apple Silicon macOS. Use my ComfyUI works here.",
+                "use your own".into(),
+            )
         });
         // The graphics card.
-        out.push(match self.gpu() {
-            Some(gpu) => {
-                let (variant, tried) = self.variant();
-                let memory = gpu.vram_mb.map_or_else(String::new, |mb| format!("{} GB", (mb as f64 / 1024.0).round() as u64));
-                match (gpu.vendor, variant, tried) {
-                    (Vendor::Nvidia, "nvidia", _) => row("gpu", Level::Ok, gpu.name.clone(), "Graphics driver is recent enough", memory),
-                    (Vendor::Nvidia, _, _) => row(
-                        "gpu",
-                        Level::Info,
-                        gpu.name.clone(),
-                        "An older card or driver: the engine build for CUDA 12.6 will be installed. Updating the graphics driver is still a good idea.",
-                        memory,
-                    ),
-                    (Vendor::Amd | Vendor::Intel, _, _) => row(
-                        "gpu",
-                        Level::Warn,
-                        gpu.name.clone(),
-                        "Not tested: ComfyUI has a build for this card, but these models have only been run on NVIDIA cards. Cloud models work on any PC.",
-                        memory,
-                    ),
-                    _ => row("gpu", Level::Stop, gpu.name.clone(), NO_CARD, "can't run local models".into()),
+        out.push(if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
+            let memory = self.os.unified_memory_mb.map_or_else(String::new, |mb| format!("{} GB unified", (mb as f64 / 1024.0).round() as u64));
+            row("gpu", Level::Ok, "Apple Silicon GPU".into(), "Metal Performance Shaders acceleration is available", memory)
+        } else {
+            match self.gpu() {
+                Some(gpu) => {
+                    let (variant, tried) = self.variant();
+                    let memory = gpu.vram_mb.map_or_else(String::new, |mb| format!("{} GB", (mb as f64 / 1024.0).round() as u64));
+                    match (gpu.vendor, variant, tried) {
+                        (Vendor::Nvidia, "nvidia", _) => row("gpu", Level::Ok, gpu.name.clone(), "Graphics driver is recent enough", memory),
+                        (Vendor::Nvidia, _, _) => row(
+                            "gpu",
+                            Level::Info,
+                            gpu.name.clone(),
+                            "An older card or driver: the engine build for CUDA 12.6 will be installed. Updating the graphics driver is still a good idea.",
+                            memory,
+                        ),
+                        (Vendor::Amd | Vendor::Intel, _, _) => row(
+                            "gpu",
+                            Level::Warn,
+                            gpu.name.clone(),
+                            "Not tested: ComfyUI has a build for this card, but these models have only been run on NVIDIA cards. Cloud models work on any PC.",
+                            memory,
+                        ),
+                        _ => row("gpu", Level::Stop, gpu.name.clone(), NO_CARD, "can't run local models".into()),
+                    }
                 }
+                None => row("gpu", Level::Stop, "No graphics card found".into(), NO_CARD, "can't run local models".into()),
             }
-            None => row("gpu", Level::Stop, "No graphics card found".into(), NO_CARD, "can't run local models".into()),
         });
         // Memory: models load through it on their way to the card, and Windows' paging file makes
         // up what it lacks only while the paging file may grow.
@@ -446,7 +461,7 @@ impl Probe {
             }
         });
         // The Microsoft C++ runtime PyTorch needs: said only when the engine would go without it.
-        if self.vc_runtime == VcRuntime::Missing && self.can_install() {
+        if self.os.windows && self.vc_runtime == VcRuntime::Missing && self.can_install() {
             out.push(row(
                 "vcRuntime",
                 Level::Warn,
@@ -814,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn the_runtime_target_selects_apple_silicon_unqualified() {
+    fn the_runtime_target_selects_qualified_apple_silicon() {
         let p = Probe {
             os: Os { name: "macOS".into(), version: "26.1".into(), architecture: "arm64".into(), sixty_four_bit: true, ..Os::default() },
             ..Probe::default()
@@ -822,9 +837,11 @@ mod tests {
         let target = p.runtime_target().expect("Apple Silicon selects a target");
         assert!(matches!(target.platform(), RuntimePlatform::MacosArm64) && target.is_macos_arm64() && !target.is_windows());
         assert_eq!(target.variant(), "macos_arm64");
-        // A selection, not an install permission: macOS stays unqualified and un-installable.
-        assert!(!target.is_qualified());
-        assert!(!p.can_install());
+        assert!(target.is_qualified());
+        assert!(p.can_install());
+        assert!(p.has_usable_acceleration());
+        let gpu = p.checks().into_iter().find(|check| check.id == "gpu").expect("the acceleration check is present");
+        assert_eq!((gpu.level, gpu.title.as_str(), gpu.value.as_str()), (Level::Ok, "Apple Silicon GPU", ""));
     }
 
     #[test]
