@@ -18,6 +18,9 @@ if [ -n "$changed_rust" ]; then
 fi
 cargo test -p photocraft-aisetup --lib --tests
 cargo test -p photocraft-aigen --lib --tests
+# Setup tasks change the engine command boundary and the setup UI; test those too.
+cargo test -p photocraft-engine --lib --tests ai_setup
+cargo test -p photocraft-ui-egui --lib --tests ai_setup
 # Rust 1.95 introduced two lints that the recorded upstream baseline does not pass.
 # Keep them visible as explicit debt while denying every other warning.
 cargo clippy -p photocraft-aisetup -p photocraft-aigen --all-targets -- \
