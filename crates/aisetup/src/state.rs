@@ -211,6 +211,7 @@ mod tests {
         let managed = SetupState::parse(&legacy("managed"));
         let external = SetupState::parse(&legacy("existing"));
         assert_eq!((managed.version, managed.ownership, managed.phase), (VERSION, RuntimeOwnership::Managed, Phase::Installing));
+        assert_eq!(managed.choices.platform, crate::platform::RuntimePlatform::WindowsPortable);
         assert_eq!((external.version, external.ownership, external.phase), (VERSION, RuntimeOwnership::External, Phase::Installing));
     }
 

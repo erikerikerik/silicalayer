@@ -388,6 +388,7 @@ mod native {
         }
         Ok(Choices {
             route,
+            platform: record.choices.platform,
             models,
             engine_dir: or_default(text_param(p, "engineDir", cmd)?, &record.choices.engine_dir, &env.engine_dir),
             models_dir: or_default(text_param(p, "modelsDir", cmd)?, &record.choices.models_dir, &env.models_dir),
@@ -570,7 +571,7 @@ mod native {
         // they are chosen.
         let mut folder_problems: Vec<String> = Vec::new();
         let managed = choices.route == Route::Managed;
-        if managed && let Some(why) = m.asset(&choices.variant).ok().and_then(|asset| plan::path_too_long(asset, &layout)) {
+        if managed && let Some(why) = m.asset(&choices.variant).ok().and_then(|asset| plan::path_too_long(choices.platform, asset, &layout)) {
             folder_problems.push(why);
         }
         let (engine_free, models_free) = (free(&choices.engine_dir).filter(|_| managed), free(&choices.models_dir));
@@ -906,9 +907,7 @@ mod native {
     /// then the user's own folders (`yours`), only read. `found: false` is a folder that isn't
     /// there now (a drive that isn't plugged in, say): it lists nothing.
     fn listing(record: &SetupState) -> Value {
-        let entry = |path: &str, kind: &str, files: BTreeMap<String, Vec<String>>| {
-            json!({"path": path, "kind": kind, "found": Path::new(path).is_dir(), "files": files})
-        };
+        let entry = |path: &str, kind: &str, files: BTreeMap<String, Vec<String>>| json!({"path": path, "kind": kind, "found": Path::new(path).is_dir(), "files": files});
         let mut out = Vec::new();
         let own = record.choices.models_dir.trim();
         if record.phase != Phase::None && !own.is_empty() {

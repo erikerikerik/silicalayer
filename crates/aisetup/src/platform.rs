@@ -20,6 +20,21 @@ pub enum RuntimePlatform {
 }
 
 impl RuntimePlatform {
+    /// Whether `variant` is a build this platform owns. Keeping this pairing in one typed
+    /// boundary prevents a saved or hand-written choice from launching an archive as another
+    /// platform.
+    pub fn accepts_variant(self, variant: &str) -> bool {
+        match self {
+            RuntimePlatform::WindowsPortable => matches!(variant, "nvidia" | "nvidia_cu126" | "amd" | "intel"),
+            RuntimePlatform::MacosArm64 => variant == RuntimeTarget::MACOS_ARM64_VARIANT,
+        }
+    }
+
+    /// Windows portable alone needs Windows path and Visual C++ compatibility handling.
+    pub fn needs_windows_support(self) -> bool {
+        self == RuntimePlatform::WindowsPortable
+    }
+
     /// The arguments for the platform: whether `--windows-standalone-build` is needed.
     pub fn extra_args(self) -> &'static [&'static str] {
         match self {
@@ -116,5 +131,18 @@ mod tests {
         assert_eq!(serde_json::to_string(&RuntimePlatform::WindowsPortable).unwrap(), r#""windowsPortable""#);
         assert_eq!(serde_json::to_string(&RuntimePlatform::MacosArm64).unwrap(), r#""macosArm64""#);
         assert_eq!(RuntimePlatform::default(), RuntimePlatform::WindowsPortable);
+    }
+
+    #[test]
+    fn platforms_accept_only_their_own_runtime_variants() {
+        for variant in ["nvidia", "nvidia_cu126", "amd", "intel"] {
+            assert!(RuntimePlatform::WindowsPortable.accepts_variant(variant));
+            assert!(!RuntimePlatform::MacosArm64.accepts_variant(variant));
+        }
+        assert!(RuntimePlatform::MacosArm64.accepts_variant(RuntimeTarget::MACOS_ARM64_VARIANT));
+        assert!(!RuntimePlatform::WindowsPortable.accepts_variant(RuntimeTarget::MACOS_ARM64_VARIANT));
+        assert!(!RuntimePlatform::WindowsPortable.accepts_variant("voodoo"));
+        assert!(RuntimePlatform::WindowsPortable.needs_windows_support());
+        assert!(!RuntimePlatform::MacosArm64.needs_windows_support());
     }
 }

@@ -362,7 +362,7 @@ fn writable(dir: &Path, what: &str) -> Result<()> {
 pub fn preflight(job: &Job, plan: &Plan, layout: &Layout, free_space: fn(&Path) -> Option<u64>) -> Result<()> {
     let managed = job.choices.route == Route::Managed;
     if managed {
-        if let Some(why) = plan::path_too_long(job.manifest.asset(&job.choices.variant)?, layout) {
+        if let Some(why) = plan::path_too_long(job.choices.platform, job.manifest.asset(&job.choices.variant)?, layout) {
             return Err(Error::Config(why));
         }
         writable(&layout.engine_dir, "engine")?;
@@ -460,7 +460,7 @@ fn apply_executable_permissions(staging: &Path, executables: &[String]) -> Resul
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
-    let marker = Marker::managed(runtime::RuntimePlatform::WindowsPortable, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
+    let marker = Marker::managed(job.choices.platform, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
     // The Python this asset's own manifest entry names, not the catalogue's default:
     // an asset may ship its runtime somewhere else.
     let paths = job.manifest.runtime_paths(&job.choices.variant)?;
@@ -589,7 +589,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
         // The C++ runtime PyTorch needs, beside the engine's Python: a PC without the Visual C++
         // Redistributable (a new one, Windows Sandbox) runs the engine too. Every run looks, so
         // Continue or Repair mends an engine unpacked before this, with nothing downloaded again.
-        if let (Some(sources), Some(python_dir)) = (&env.vc_runtime, layout.python.parent()) {
+        if let (true, Some(sources), Some(python_dir)) = (job.choices.platform.needs_windows_support(), &env.vc_runtime, layout.python.parent()) {
             shared.message("Checking the engine's runtime");
             if let Err(e) = vcrt::ensure(python_dir, sources) {
                 if let Some(row) = index_of(&plan, &Step::Verify).or_else(|| index_of(&plan, &Step::WriteModelPaths)) {
@@ -604,7 +604,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
             runtime::free_port(runtime::FIRST_PORT)
                 .ok_or_else(|| Error::Engine("No free port was found for the engine (8190 to 8389 are all taken).".into()))?
         };
-        (runtime::url(port), Some(runtime::launch(&job.manifest, &layout, job.choices.cpu)), port)
+        (runtime::url(port), Some(runtime::launch_for(job.choices.platform, &job.manifest, &layout, job.choices.cpu)), port)
     } else {
         (job.url.clone(), job.launch.clone(), 0)
     };

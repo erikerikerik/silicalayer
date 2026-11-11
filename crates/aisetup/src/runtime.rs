@@ -53,17 +53,10 @@ fn is_valid_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_known_variant(platform: RuntimePlatform, variant: &str) -> bool {
-    match platform {
-        RuntimePlatform::WindowsPortable => matches!(variant, "nvidia" | "nvidia_cu126" | "amd" | "intel"),
-        RuntimePlatform::MacosArm64 => variant == "macos_arm64",
-    }
-}
-
 fn valid_marker(marker: &Marker) -> bool {
     marker.format_version == MARKER_FORMAT_VERSION
         && !marker.version.trim().is_empty()
-        && is_known_variant(marker.platform, &marker.variant)
+        && marker.platform.accepts_variant(&marker.variant)
         && is_valid_sha256(&marker.sha256)
 }
 
@@ -227,7 +220,12 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
 /// `run_nvidia_gpu.bat`), without the browser it would open, with the models folder added.
 /// `cpu`: on the processor, as its `run_cpu.bat` does, for a PC without a graphics card it can use.
 pub fn launch(manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let platform = RuntimePlatform::WindowsPortable; // current default: backwards compatible
+    launch_for(RuntimePlatform::WindowsPortable, manifest, layout, cpu)
+}
+
+/// How a managed runtime for `platform` is started. The older [`launch`] entry point remains the
+/// Windows default for callers that have no explicit managed choice.
+pub fn launch_for(platform: RuntimePlatform, manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
     build_launch_command(platform, manifest, layout, cpu)
 }
 

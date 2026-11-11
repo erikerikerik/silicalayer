@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{LEGACY_FOLDERS, Manifest, ModelEntry, split_key};
+use crate::platform::RuntimePlatform;
 use crate::{Error, Result};
 
 /// Written into the engine folder when the runtime is unpacked whole: its presence is what
@@ -44,6 +45,9 @@ pub enum Route {
 #[serde(default, rename_all = "camelCase")]
 pub struct Choices {
     pub route: Route,
+    /// The runtime family a managed choice installs. Absent in older records: the existing
+    /// Windows portable behavior.
+    pub platform: RuntimePlatform,
     /// Ids of the manifest's models.
     pub models: Vec<String>,
     /// Managed: where the engine goes (a folder per ComfyUI version inside it).
@@ -219,6 +223,9 @@ pub const MAX_EXTRA_MODELS_DIRS: usize = 16;
 
 impl Layout {
     pub fn new(manifest: &Manifest, choices: &Choices) -> Result<Layout> {
+        if choices.route == Route::Managed && !choices.platform.accepts_variant(&choices.variant) {
+            return Err(Error::Config(format!("the `{}` runtime build does not belong to the {:?} platform", choices.variant, choices.platform)));
+        }
         let models_dir = folder(&choices.models_dir, "models")?;
         let engine_dir = match choices.route {
             Route::Managed => folder(&choices.engine_dir, "engine")?,
@@ -336,10 +343,10 @@ fn folder(text: &str, what: &str) -> Result<PathBuf> {
 }
 
 /// Why the engine folder can't be used, when its paths would be too long for Windows.
-pub fn path_too_long(asset: &crate::manifest::Asset, layout: &Layout) -> Option<String> {
+pub fn path_too_long(platform: RuntimePlatform, asset: &crate::manifest::Asset, layout: &Layout) -> Option<String> {
     let longest = asset.longest_path as usize;
     let root = layout.engine_root.as_os_str().len();
-    (cfg!(windows) && longest > 0 && root.saturating_add(1).saturating_add(longest) > MAX_PATH).then(|| {
+    (platform.needs_windows_support() && longest > 0 && root.saturating_add(1).saturating_add(longest) > MAX_PATH).then(|| {
         format!(
             "The engine folder's path is too long: files inside it would be {} characters, and Windows stops at {MAX_PATH}. Choose a shorter folder, such as C:\\LayerShop\\engine.",
             root.saturating_add(1).saturating_add(longest)
@@ -497,7 +504,7 @@ mod tests {
         asset["script"] = serde_json::json!("ComfyUI-macos/main.py");
         json["comfy"]["assets"]["macos_arm64"] = asset;
         let m = Manifest::parse(&serde_json::to_string(&json).unwrap()).unwrap();
-        let layout = Layout::new(&m, &Choices { variant: "macos_arm64".into(), ..choices(&[]) }).unwrap();
+        let layout = Layout::new(&m, &Choices { platform: RuntimePlatform::MacosArm64, variant: "macos_arm64".into(), ..choices(&[]) }).unwrap();
         assert_eq!(layout.python.strip_prefix(&layout.engine_root).unwrap(), Path::new("python/bin/python3"));
         assert_eq!(layout.script.strip_prefix(&layout.engine_root).unwrap(), Path::new("ComfyUI-macos/main.py"));
     }
@@ -707,6 +714,7 @@ mod tests {
         let fails = |c: Choices| plan(m, &c, &Fake::default()).unwrap_err().to_string();
         assert!(fails(choices(&["no-such-model"])).contains("no-such-model"));
         assert!(fails(Choices { variant: "voodoo".into(), ..choices(&[]) }).contains("voodoo"));
+        assert!(fails(Choices { platform: RuntimePlatform::MacosArm64, ..choices(&[]) }).contains("nvidia"));
         assert!(fails(Choices { models_dir: String::new(), ..choices(&[]) }).contains("models"));
         assert!(fails(Choices { engine_dir: "  ".into(), ..choices(&[]) }).contains("engine"));
         for odd in ["relative/models", "..", "models\0x", &"x".repeat(2000)] {
@@ -738,14 +746,15 @@ mod tests {
         let mut asset = m.asset("nvidia").unwrap().clone();
         let short = Layout::new(m, &choices(&[])).unwrap();
         let deep = Layout::new(m, &Choices { engine_dir: format!("{}{}", root("engine"), "\\deep".repeat(20)), ..choices(&[]) }).unwrap();
-        assert_eq!(path_too_long(&asset, &short), None);
-        assert_eq!(path_too_long(&asset, &deep).is_some(), cfg!(windows));
+        assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &short), None);
+        assert!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &deep).is_some());
+        assert_eq!(path_too_long(RuntimePlatform::MacosArm64, &asset, &deep), None);
         // The default folder leaves room for a long user name.
         if cfg!(windows) {
             let home = Choices { engine_dir: format!(r"C:\Users\{}\AppData\Local\LayerShop\engine", "n".repeat(40)), ..choices(&[]) };
-            assert_eq!(path_too_long(&asset, &Layout::new(m, &home).unwrap()), None);
+            assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &Layout::new(m, &home).unwrap()), None);
         }
         asset.longest_path = 0;
-        assert_eq!(path_too_long(&asset, &deep), None);
+        assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &deep), None);
     }
 }

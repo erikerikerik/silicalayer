@@ -601,6 +601,27 @@ fn without_a_graphics_card_the_engine_runs_on_the_processor_and_renders_no_test_
 }
 
 #[test]
+fn a_macos_managed_job_writes_its_platform_launches_without_windows_flags_and_skips_vcrt() {
+    let rig = Rig::new();
+    let mut manifest = rig.manifest.clone();
+    let asset = manifest.comfy.assets["nvidia"].clone();
+    manifest.comfy.assets.insert("macos_arm64".into(), asset);
+    let choices = Choices { platform: runtime::RuntimePlatform::MacosArm64, variant: "macos_arm64".into(), test_image: false, ..rig.choices(&[]) };
+    let layout = Layout::new(&manifest, &choices).unwrap();
+    let mut job = rig.job(choices);
+    job.manifest = manifest;
+    // A Windows setup would fail to repair from these empty sources. macOS must never try.
+    *rig.vc_runtime.borrow_mut() = Some(crate::vcrt::Sources { bundled: None, system: None });
+
+    let done = rig.run_job(job, plenty).0.unwrap();
+    let marker = runtime::read_marker(&layout.engine_root).unwrap();
+    assert_eq!((marker.platform, marker.variant.as_str()), (runtime::RuntimePlatform::MacosArm64, "macos_arm64"));
+    let launch = done.launch.unwrap();
+    assert!(!launch.args.contains("--windows-standalone-build"));
+    assert!(launch.args.contains("--disable-auto-launch"));
+}
+
+#[test]
 fn a_test_image_that_does_not_render_is_not_a_failed_install() {
     let rig = Rig::with(true, FakeComfy { running: true, fails: Some(CARD_OUT_OF_MEMORY), prompts: AtomicU64::new(0) }, FakeServer::default());
     let (result, progress) = rig.run(&["qwen-image-2-1"]);
