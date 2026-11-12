@@ -14,11 +14,12 @@ mod native {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    const COMMANDS: [&str; 16] = [
+    const COMMANDS: [&str; 17] = [
         "ai.setup.probe",
         "ai.setup.manifest",
         "ai.setup.plan",
         "ai.setup.status",
+        "ai.setup.diagnostics",
         "ai.setup.start",
         "ai.setup.cancel",
         "ai.setup.repair",
@@ -224,6 +225,26 @@ mod native {
         assert!(!poll(&mut s) && s.ai_setup.seq() == 0 && s.ai_setup.last().is_none());
     }
 
+    /// Task 017: the diagnostics report reads only: a session with no setup env, no record, no
+    /// engine and no log file still gets a full report rather than an error — that is exactly
+    /// when a user has nothing else to send. And it answers whatever the session holds, so an
+    /// agent can gather it too.
+    #[test]
+    fn the_ai_setup_diagnostics_report_answers_with_no_setup_at_all() {
+        let mut s = Session::new();
+        assert!(s.is_enabled("ai.setup.diagnostics"), "read-only, for agents included");
+        let r = s.execute("ai.setup.diagnostics", json!({})).unwrap();
+        // What this machine is, whether or not anything was ever set up.
+        assert!(r["app"].as_str().is_some_and(|v| !v.is_empty()), "{r}");
+        assert!(r["osArchitecture"].as_str().is_some_and(|a| !a.is_empty()), "{r}");
+        // What is not there reads as null — never as a failed command.
+        assert_eq!((r["record"].clone(), r["engine"].clone(), r["engineLog"].clone()), (Value::Null, Value::Null, Value::Null));
+        assert_eq!((r["tokenExists"].as_bool(), r["lastFinished"].is_null(), r["engineFolder"].is_null()), (Some(false), true, true));
+        // Odd parameters change nothing: the report ignores them, and stays a report.
+        let odd = s.execute("ai.setup.diagnostics", json!({"models": ["no-such-model"]})).unwrap();
+        assert_eq!(odd["tokenExists"], json!(false));
+    }
+
     /// Rule 9: every command answers odd parameters with an error, never a panic, and none of
     /// them starts anything.
     #[test]
@@ -259,8 +280,9 @@ mod native {
             json!({"cancel": "yes"}),
             json!({"product": 7}),
         ];
-        // The probe takes no parameters and really looks at this machine: once is enough.
-        for id in COMMANDS.into_iter().filter(|id| *id != "ai.setup.probe") {
+        // The probe and the diagnostics report take no parameters and really look at this
+        // machine: once each is enough.
+        for id in COMMANDS.into_iter().filter(|id| !["ai.setup.probe", "ai.setup.diagnostics"].contains(id)) {
             for params in &odd {
                 // Each either refuses or does something harmless; it never panics.
                 let _ = rig.run(id, params.clone());
@@ -1011,6 +1033,7 @@ fn every_setup_command_is_registered_with_its_parameters_documented() {
             "ai.setup.manifest",
             "ai.setup.plan",
             "ai.setup.status",
+            "ai.setup.diagnostics",
             "ai.setup.start",
             "ai.setup.cancel",
             "ai.setup.repair",

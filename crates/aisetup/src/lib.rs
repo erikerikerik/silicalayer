@@ -20,6 +20,8 @@
 //!   that lets an interrupted setup be continued after a restart.
 //! - [`hf`]: Hugging Face, for the gated models: Sign in with Hugging Face (OAuth with PKCE), an
 //!   access token as the fallback, and whether the user may download each gated model yet.
+//! - [`diagnostics`]: the secret-free report about a setup — machine, folders, last log lines,
+//!   every token and password redacted — that a user can copy and send to support.
 //!
 //! Everything that touches the network, the file system or another process is native only. The
 //! web build keeps the manifest and the plan; its setup commands say they need the desktop app.
@@ -30,6 +32,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod configure;
+pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod download;
 #[cfg(not(target_arch = "wasm32"))]

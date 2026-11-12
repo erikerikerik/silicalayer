@@ -866,6 +866,16 @@ fn repair(app: &mut PhotocraftApp) {
     }
 }
 
+/// Put the secret-free diagnostics report on the clipboard, for support: the machine, the
+/// folders and the engine's last log lines, with every token, key, password and home folder
+/// redacted. It reads the machine and writes nothing but the clipboard.
+fn copy_diagnostics(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    match app.session.execute("ai.setup.diagnostics", json!({})) {
+        Ok(report) => ctx.copy_text(serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())),
+        Err(e) => app.ui.ai_setup.note = e.to_string(),
+    }
+}
+
 fn remove(app: &mut PhotocraftApp, models: bool) {
     // The data folder is only removed when the confirmation is ticked to ask for it.
     let data = app.ui.ai_setup.remove_data;
@@ -2691,6 +2701,15 @@ fn footer(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     let r = ui.add(egui::Label::new(RichText::new(tr("Show error")).color(t.accent).size(12.0)).sense(Sense::click()));
                     if r.on_hover_text(tr("The whole message, to read or copy")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         app.ui.ai_setup.ask = Some(Ask::Error);
+                    }
+                    let r = ui.add(egui::Label::new(RichText::new(tr("Copy diagnostics")).color(t.accent).size(12.0)).sense(Sense::click()));
+                    if r.on_hover_text(tr(
+                        "The machine, the folders and the engine's last log lines, with every token, key and password removed. Nothing is sent",
+                    ))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                    {
+                        copy_diagnostics(app, ui.ctx());
                     }
                 } else if app.ui.ai_setup.status.as_ref().is_some_and(|s| text(s, "/state") == "paused") {
                     ui.label(RichText::new(tr("Paused. What arrived is kept.")).color(t.text_dim).size(12.0));

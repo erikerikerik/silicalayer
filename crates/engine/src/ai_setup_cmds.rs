@@ -10,6 +10,8 @@
 //! - `ai.setup.plan` says what a choice of models and folders would download and how much room
 //!   it needs.
 //! - `ai.setup.status` reports the setup that is running, or how the last one ended.
+//! - `ai.setup.diagnostics` gathers why the setup stands as it does into one secret-free JSON
+//!   report the user can copy and send (`photocraft_aisetup::diagnostics` does the redacting).
 //! - `ai.setup.start`, `ai.setup.cancel`, `ai.setup.repair` and `ai.setup.remove` install, stop,
 //!   fix and delete.
 //! - Hugging Face, for the gated models: `ai.setup.hfStatus` (signed in, as whom),
@@ -18,7 +20,8 @@
 //!   `ai.setup.setToken` (an access token, the fallback) and `ai.setup.hfUseFound` (the sign-in
 //!   found on this PC, on the user's click).
 //!
-//! The reading ones (probe, manifest, plan, status, hfStatus, hfAccess) are open to agents. The
+//! The reading ones (probe, manifest, plan, status, diagnostics, hfStatus, hfAccess) are open to
+//! agents. The
 //! rest download and start a program, delete files, or sign in and out: they are the user's to
 //! decide, and the automation guard refuses them (`photocraft_automation::workspace`), as it
 //! refuses changing the launch settings. No command ever reports a token.
@@ -127,6 +130,23 @@ mod native {
 
     /// How many of the engine's last lines `ai.setup.status` reports.
     const ENGINE_LINES: usize = 40;
+    /// How much of the engine's log `ai.setup.diagnostics` reads from the end: the report keeps
+    /// the last 200 lines, and no line of a log is a paragraph.
+    const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+    /// What `ai.setup.diagnostics` reports as `record`: the setup's own choices, and nothing that
+    /// could be a secret — the sign-in is only ever the boolean `tokenExists`. `ai.setup.status`
+    /// shows the same fields.
+    fn record_value(record: &SetupState, token_exists: bool) -> Value {
+        json!({
+            "phase": record.phase, "route": record.choices.route, "models": record.choices.models,
+            "engineDir": record.choices.engine_dir, "modelsDir": record.choices.models_dir,
+            "extraModelsDirs": record.choices.extra_models_dirs, "platform": record.choices.platform,
+            "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
+            "comfyVersion": record.comfy_version, "installed": record.installed, "error": record.error,
+            "tokenExists": token_exists,
+        })
+    }
 
     /// What a setup needs from the app. Installed by the desktop shell.
     #[derive(Clone)]
@@ -689,6 +709,92 @@ mod native {
         }))
     }
 
+    /// `ai.setup.diagnostics`: the secret-free report a user with a failed setup can send to
+    /// support. Reads only, from this session, this disk and the engine's log file: this machine
+    /// (its system and memory, through the probe's hardware stage alone — no host is asked), the
+    /// setup record's choices with the sign-in reduced to a boolean, the engine's marker, how the
+    /// last setup ended, free room in both folders, and the engine's last log lines. Every string
+    /// passes through [`redact`](photocraft_aisetup::diagnostics::redact); nothing is written and
+    /// nothing is sent. It answers whatever the session holds — no setup at all included.
+    pub(super) fn diagnostics(s: &mut Session, _: &Value) -> Result<Value> {
+        // The hardware part of `ai.setup.probe`, asked on the spot and without its network
+        // stages: a report never reaches out, so these refuse instead of fetching.
+        struct NoNetwork;
+        impl photocraft_aigen::Transport for NoNetwork {
+            fn send(&self, _: &photocraft_aigen::Request) -> photocraft_aigen::Result<photocraft_aigen::Response> {
+                Err(photocraft_aigen::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+        }
+        impl Fetch for NoNetwork {
+            fn head(&self, _: &str, _: Option<&str>) -> photocraft_aisetup::Result<photocraft_aisetup::fetch::Head> {
+                Err(photocraft_aisetup::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+            fn fetch(
+                &self,
+                _: &photocraft_aisetup::fetch::Request<'_>,
+                _: &mut dyn photocraft_aisetup::fetch::Sink,
+                _: &dyn Fn() -> bool,
+            ) -> photocraft_aisetup::Result<()> {
+                Err(photocraft_aisetup::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+        }
+        // Cancelled after the hardware stage: the system, its memory and its cards are read,
+        // no ComfyUI is looked for and no host is asked. Without the bundled manifest (never in
+        // a built app) the report simply says less about the machine.
+        let probe = bundled().ok().map(|m| probe::collect(&m, &NoNetwork, &NoNetwork, &[], &|| true, &|_: probe::Stage| ()));
+        let record = s.ai_setup.record();
+        let token_exists = !s.ai.hf_token().is_empty();
+        // The engine this app installed, if it is there: its build, not the record's wish.
+        let marker = match record.choices.route {
+            Route::Managed if !record.choices.engine_dir.trim().is_empty() => runtime::installed_engines(Path::new(&record.choices.engine_dir))
+                .pop()
+                .map(|(_, marker)| (json!(marker.platform).as_str().unwrap_or_default().to_string(), marker.version, marker.variant)),
+            _ => None,
+        };
+        let folder = |dir: &str| {
+            let dir = dir.trim();
+            (!dir.is_empty()).then(|| photocraft_aisetup::diagnostics::DirFacts { path: dir.to_string(), free: free(dir) })
+        };
+        // The log the app's own ComfyUI writes to, from its end: `report` keeps 200 lines and
+        // redacts them. A server that never started, or a log that cannot be read, is `null`.
+        let log = s.ai.server.as_ref().and_then(|server| server.log_file()).and_then(|path| log_tail(Path::new(&path)));
+        Ok(photocraft_aisetup::diagnostics::report(photocraft_aisetup::diagnostics::Facts {
+            app_version: crate::build_info::long_version(),
+            os: probe.as_ref().map(|p| p.os.name.clone()).filter(|n| !n.is_empty()),
+            os_version: probe.as_ref().map(|p| p.os.version.clone()).filter(|n| !n.is_empty()),
+            os_architecture: Some(probe.as_ref().map_or_else(
+                || std::env::consts::ARCH.to_string(),
+                |p| match p.os.architecture.as_str() {
+                    "" => std::env::consts::ARCH.to_string(),
+                    a => a.to_string(),
+                },
+            )),
+            memory_mb: probe.as_ref().and_then(photocraft_aisetup::probe::Probe::model_memory_mb),
+            runtime_target: probe.as_ref().and_then(|p| p.runtime_target()).and_then(|t| serde_json::to_value(t).ok()),
+            runtime_qualified: probe.as_ref().and_then(|p| p.runtime_target()).is_some_and(|t| t.is_qualified()),
+            record: (record.phase != Phase::None).then(|| record_value(&record, token_exists)),
+            marker,
+            last_finished: s.ai_setup.last().map(|f| json!({"ok": f.ok, "cancelled": f.cancelled, "error": f.error})),
+            engine_folder: folder(&record.choices.engine_dir),
+            models_folder: folder(&record.choices.models_dir),
+            log,
+            token_exists,
+        }))
+    }
+
+    /// The last bytes of the engine's log, so a long one is not read whole for 200 lines.
+    fn log_tail(path: &Path) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > LOG_TAIL_BYTES {
+            file.seek(SeekFrom::End(-(LOG_TAIL_BYTES as i64))).ok()?;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// Start the setup `choices` describe.
     fn begin(s: &mut Session, choices: Choices, url: Option<String>, launch: Option<Launch>, cmd: &str) -> Result<Value> {
         poll(s);
@@ -1234,6 +1340,10 @@ mod web {
     pub(super) fn hf_use_found(_: &mut Session, _: &Value) -> Result<Value> {
         Err(unsupported())
     }
+
+    pub(super) fn diagnostics(_: &mut Session, _: &Value) -> Result<Value> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1295,6 +1405,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{} → {available,state:none|running|paused|failed|interrupted|done,running,record:{phase,route,models,engineDir,modelsDir,extraModelsDirs,platform,variant,port,comfyVersion,installed,error},engines:[{platform,version,variant,folder}],installedNow:[id],modelFiles:{folder:[file]}? (the installed engine's model files, in its own folder and the user's own folders it reads; null for the user's own ComfyUI),progress:{steps:[{key,label,state:pending|active|done|failed|skipped,done,total,note,download}],bytesDone,bytesTotal,speed (bytes/s),etaSeconds,message}?,result:{ok,cancelled,error,installed,skipped,ready,testImage:{model,modelName,seconds,width,height}?,testError}?,engine:{output:[line] (the last 40 lines the engine the app started printed),log (where all of it is)}? (while a setup runs or after it failed),token (a Hugging Face token is stored)}"##,
             enabled: always,
             run: imp::status,
+            journal: false,
+        },
+        CommandSpec {
+            id: "ai.setup.diagnostics",
+            label: "Local AI Setup Diagnostics",
+            menu: &[],
+            shortcut: None,
+            params: r##"{} → {app,os,osVersion,osArchitecture,memoryMb,runtimeTarget,runtimeQualified,record,engine,lastFinished,engineFolder,modelsFolder,engineLog,tokenExists}: why the setup stands as it does, as one JSON for sending to support. Reads only: nothing is written, nothing is sent, and every secret (tokens, keys, passwords) and the home folder in paths is replaced. It answers even with no setup"##,
+            enabled: always,
+            run: imp::diagnostics,
             journal: false,
         },
         CommandSpec {
