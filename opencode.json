@@ -14,7 +14,7 @@
       "name": "Strata (private Tailscale host)",
       "options": {
         "baseURL": "{env:SILICA_STRATA_BASE_URL}/v1",
-        "apiKey": "strata-local"
+        "apiKey": "{env:SILICA_STRATA_API_KEY}"
       },
       "models": {
         "qwen3.8-flash-next-unsloth-ud-q5_k_xl": {

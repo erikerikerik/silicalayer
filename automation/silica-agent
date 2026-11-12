@@ -112,6 +112,14 @@ unload_model() {
     sleep 1
   done
 }
+json_value() {
+  # The scalar value of a top-level field in a one-line JSON object: a string's contents, or a
+  # bare number/true/false/null. Whitespace around ":" does not matter.
+  value=$(printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$value" ] || value=$(printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([A-Za-z0-9.]*\).*/\1/p')
+  printf '%s' "$value"
+}
+STRATA_KEYCHAIN_SERVICE=${SILICA_STRATA_KEYCHAIN_SERVICE:-silicalayer-strata}
 preflight() {
   command -v git >/dev/null || die "git is missing"
   command -v opencode >/dev/null || die "OpenCode is missing"
@@ -126,14 +134,28 @@ preflight() {
     strata)
       valid_strata_url "$SILICA_STRATA_BASE_URL" || die "Strata URL must be an explicit Tailscale IPv4 address on port 8080"
       health=$(curl --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/health") || die "Strata health check failed"
-      printf '%s\n' "$health" | grep -F '"status": "ok"' >/dev/null || die "Strata is not healthy"
-      printf '%s\n' "$health" | grep -F '"api_key": false' >/dev/null || die "Strata authentication mode changed"
-      ctx=$(printf '%s\n' "$health" | sed -n 's/.*"max_context"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+      [ "$(json_value "$health" status)" = ok ] || die "Strata is not healthy"
+      case "$(json_value "$health" api_key)" in
+        false)
+          SILICA_STRATA_API_KEY=strata-local
+          ;;
+        true)
+          SILICA_STRATA_API_KEY=$(security find-generic-password -s "$STRATA_KEYCHAIN_SERVICE" -w 2>/dev/null) || \
+            die "Strata requires an API key: store it with security add-generic-password -s $STRATA_KEYCHAIN_SERVICE -a strata -w"
+          [ -n "$SILICA_STRATA_API_KEY" ] || die "Strata API key in Keychain item $STRATA_KEYCHAIN_SERVICE is empty"
+          ;;
+        *)
+          die "Strata did not report its authentication mode"
+          ;;
+      esac
+      export SILICA_STRATA_API_KEY
+      ctx=$(json_value "$health" max_context)
       case "$ctx" in ''|*[!0-9]*) die "Strata did not report max_context";; esac
       [ "$ctx" -ge "${SILICA_MIN_CONTEXT:-131072}" ] || die "Strata context $ctx is below ${SILICA_MIN_CONTEXT:-131072}"
-      models=$(curl --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/v1/models") || die "Strata model query failed"
-      printf '%s\n' "$models" | grep -F "\"id\":\"$MODEL\"" >/dev/null || \
-        printf '%s\n' "$models" | grep -F "\"id\": \"$MODEL\"" >/dev/null || die "Strata model $MODEL is not served"
+      models=$(printf 'header = "Authorization: Bearer %s"\n' "$SILICA_STRATA_API_KEY" | \
+        curl -K - --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/v1/models") || die "Strata model query failed"
+      printf '%s\n' "$models" | tr ',{}[]' '\n\n\n\n\n' | grep -E '^[[:space:]]*"id"[[:space:]]*:' | \
+        sed 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | grep -Fx "$MODEL" >/dev/null || die "Strata model $MODEL is not served"
       ;;
   esac
   [ "$(uname -m)" = arm64 ] || die "this worker is qualified only on Apple Silicon"
