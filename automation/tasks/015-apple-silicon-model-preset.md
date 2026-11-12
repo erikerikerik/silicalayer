@@ -16,6 +16,20 @@ Tests (each must fail without the fix), in `crates/aisetup/src/manifest.rs`'s te
 - `None` and WindowsPortable: exactly today's results for the same memory figures (`light` below 16, otherwise `recommended`).
 - A manifest without an `apple-silicon` preset on a Mac falls back to today's rule.
 
-Edit only these files and their existing test modules. Do not read `target/` or anything outside the repository.
+## Macs below the 24 GiB floor: install allowed, cloud recommended (Erik's decision)
+
+A Mac with less than `MIN_QUALIFIED_UNIFIED_MEMORY_MB` (24 GiB, `crates/aisetup/src/probe.rs`) or with unknown memory can still install the local engine. The wizard must recommend cloud models for speed instead:
+
+- `crates/aisetup/src/probe.rs`, the `gpu` check row's `Warn` text for an unqualified Mac (about line 417, "Local models may not fit…"): say plainly that local generation will be slow or may not fit on this Mac, and that cloud models are recommended for speed; installing locally is still possible. Keep the level `Warn` (not `Stop`) and keep `can_install()` true.
+- `crates/ui-egui/src/ai_setup_ui.rs`, the PC page's left column (about line 2602, the `"Cloud Models Only"` secondary button that calls `crate::ai_gen_ui::open_api_keys(app)`): when the probe's runtime target is `macosArm64` and not qualified, show that button as the recommended choice (primary styling or a "Recommended for this Mac" label) and add a one-line note above the local install path. Use the probe JSON the page already has (`runtimeTarget.qualified`); do not add a new command.
+- Recommendation only. Never choose a cloud provider, enter a key, or route generation to the cloud automatically: the user must click and add their own API key. No cloud provider becomes a fallback for a failed or slow local run.
+- Qualified Macs (24 GiB and above) and Windows: unchanged.
+
+Extra tests (each must fail without the change):
+
+- Probe: an 8 GB and an unknown-memory Mac give a `Warn` row whose detail mentions cloud models being recommended and still allows install; a 24 GB Mac's row is unchanged.
+- UI (`crates/ui-egui/src/ai_setup_ui/tests.rs`): with an unqualified macOS probe the PC page marks Cloud Models Only as recommended; with a qualified macOS probe or a Windows probe it does not. Nothing in either case opens the API-key window or changes provider settings by itself.
+
+Edit only these files (plus `crates/aisetup/src/probe.rs` and `crates/ui-egui/src/ai_setup_ui/tests.rs`) and their existing test modules. Do not read `target/` or anything outside the repository.
 
 Exit evidence: the full supervisor gate passes.
