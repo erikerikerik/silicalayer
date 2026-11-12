@@ -33,3 +33,12 @@ Extra tests (each must fail without the change):
 Edit only these files (plus `crates/aisetup/src/probe.rs` and `crates/ui-egui/src/ai_setup_ui/tests.rs`) and their existing test modules. Do not read `target/` or anything outside the repository.
 
 Exit evidence: the full supervisor gate passes.
+
+## Remaining gate failures after the first run (fix only these)
+
+The first run's code is in the working tree. The engine and `aisetup` parts pass. Three `ui-egui` setup tests fail on the Mac. Do not touch `crates/ui-egui/src/tools/` or any file not listed in this task: an unrelated font-menu change was removed from this task's diff.
+
+1. `a_small_card_starts_on_the_suggested_preset` and `opening_fills_in_the_folders_and_the_recommended_models` get preset `"custom"` instead of `"apple-silicon"`. Cause: `crates/ui-egui/src/ai_setup_ui.rs` has a fixed `const PRESETS: [(&str, &str); 4]` (about line 2045). It is used both to draw the preset pills in `fn page_models` and to name the current selection (`PRESETS.into_iter().map(|(key, _)| key).find(|p| same(p)).unwrap_or("custom")`, about line 1305). Fix: build the preset list at runtime, as `PRESETS` plus `("apple-silicon", "Apple Silicon")` first when the manifest's `/presets/apple-silicon/models` is non-empty and `RuntimePlatform::host() == Some(RuntimePlatform::MacosArm64)`. Use that list in both places. Windows shows exactly the four presets it shows today.
+2. `an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_new_one` (about line 406 of `crates/ui-egui/src/ai_setup_ui/tests.rs`) compares the `installed` flags by list position. On a Mac the list now starts with `z-image-turbo`, so the positions swap. Fix the test, not the order: read `installed` by model id (a map from `id` to `installed`) and assert `z-image-turbo` is `false` and the other model `true`.
+
+Keep `rustfmt` clean: wrap long lines the way the surrounding code does.
