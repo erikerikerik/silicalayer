@@ -13,3 +13,7 @@ Tests (each must exercise the macOS `macos_arm64` path, `Choices { platform: run
 If a test reveals a real bug, fix it in the smallest way in `crates/aisetup/src/install.rs`, `crates/aisetup/src/download.rs` or `crates/aisetup/src/unpack.rs`, and say so in a comment next to the test. Never weaken checksum, size, archive or permission checks. Edit no other files. Do not read `target/` or anything outside the repository.
 
 Exit evidence: the full supervisor gate passes.
+
+## After the first run (review scope)
+
+The tests and the repair fix in `crates/aisetup/src/install.rs` passed the gate. The review session then added an unrequested golden-test harness (`crates/aisetup/src/install/snapshot.rs`) that failed `rustfmt`; it has been removed. Review this task's diff only: do not add new files, modules, harnesses or tests beyond what this task lists. Known limitation, accepted for this task and queued separately: repair removes the marked old engine before unpacking, so a repair that fails mid-unpack leaves no engine until the next repair.
