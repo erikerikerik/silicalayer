@@ -615,10 +615,27 @@ fn a_macos_managed_job_writes_its_platform_launches_without_windows_flags_and_sk
 
     let done = rig.run_job(job, plenty).0.unwrap();
     let marker = runtime::read_marker(&layout.engine_root).unwrap();
-    assert_eq!((marker.platform, marker.variant.as_str()), (runtime::RuntimePlatform::MacosArm64, "macos_arm64"));
+    assert_eq!((marker.platform, marker.variant.as_str()), (RuntimePlatform::MacosArm64, "macos_arm64"));
     let launch = done.launch.unwrap();
     assert!(!launch.args.contains("--windows-standalone-build"));
     assert!(launch.args.contains("--disable-auto-launch"));
+    // The Configure step made the writable folders, outside the engine folder, and the launch
+    // points at them: an engine swap cannot take the user's workflows, uploads or output.
+    let args = photocraft_aigen::launch::split_args(&launch.args);
+    let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| i + 1).and_then(|i| args.get(i).cloned());
+    for folder in crate::plan::DATA_FOLDERS {
+        assert!(layout.data_dir.join(folder).is_dir(), "{folder}");
+        assert!(!layout.engine_root.join(folder).exists(), "{folder} inside the engine");
+        assert_eq!(after(flag_for(folder)).as_deref(), Some(layout.data_dir.join(folder).to_string_lossy().as_ref()), "{folder}");
+    }
+    assert_eq!(after("--listen").as_deref(), Some("127.0.0.1"));
+    assert!(args.iter().filter(|a| a.as_str() == "--disable-api-nodes").count() == 1);
+    assert_eq!(launch.env.get("HF_HUB_OFFLINE").map(String::as_str), Some("1"));
+}
+
+/// The launch flag that points ComfyUI at one writable folder (see runtime::MACOS_DATA_ARGS).
+fn flag_for(folder: &str) -> &'static str {
+    crate::plan::DATA_FOLDERS.iter().copied().zip(runtime::MACOS_DATA_ARGS).find(|(f, _)| *f == folder).map(|(_, arg)| arg).unwrap()
 }
 
 #[test]
@@ -631,6 +648,9 @@ fn a_test_image_that_does_not_render_is_not_a_failed_install() {
     assert!(done.test.is_none() && done.installed == ["qwen-image-2-1"]);
     assert_eq!(progress.steps.last().map(|s| s.state), Some(StepState::Done));
     assert_eq!(rig.phase(), Phase::Done);
+    // Windows is untouched: no data folder to make, and its launch carries no environment.
+    assert!(!rig.layout().data_dir.exists());
+    assert!(done.launch.as_ref().is_some_and(|l| l.env.is_empty() && !l.args.contains("--user-directory") && !l.args.contains("--listen")));
     // Windows' paging file ran out (error 1455): that is system memory, not the card's, and the
     // message says what to do about it.
     let paging = "The paging file is too small for this operation to complete. (os error 1455)";
@@ -715,7 +735,7 @@ fn the_users_own_comfyui_gets_the_missing_files_and_nothing_else() {
     };
     let mut job = rig.job(choices);
     job.url = "http://127.0.0.1:8000".into();
-    job.launch = Some(Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into() });
+    job.launch = Some(Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into(), ..Launch::default() });
     let (result, progress) = rig.run_job(job, plenty);
     let done = result.unwrap();
     // No engine was installed, and the file their server has was not downloaded again.

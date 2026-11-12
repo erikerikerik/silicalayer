@@ -21,7 +21,7 @@ use crate::download::{self, Spec};
 use crate::fetch::Fetch;
 use crate::manifest::Manifest;
 use crate::plan::{self, Choices, Layout, Plan, Planned, PlannedModel, RealDisk, Route, Step};
-use crate::runtime::{self, Marker};
+use crate::runtime::{self, Marker, RuntimePlatform};
 use crate::state::{self, Phase};
 use crate::unpack::{self, Limits};
 use crate::vcrt;
@@ -613,6 +613,13 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
     let configure_index = index_of(&plan, &Step::Configure);
     if let Some(i) = configure_index {
         shared.set(i, StepState::Active, "");
+    }
+    // The managed macOS engine writes its `user`, `input`, `output` and `temp` folders into the
+    // data folder beside the engine folder (runtime::MACOS_DATA_ARGS): make them before it can be
+    // started. Idempotent, so Repair and Continue re-run it. Nothing is made on Windows, whose
+    // launch does not mention those folders.
+    if managed && job.choices.platform == RuntimePlatform::MacosArm64 {
+        runtime::create_data_dirs(&layout)?;
     }
     shared.message("Setting up the models");
     let mut folders =

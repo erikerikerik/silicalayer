@@ -20,6 +20,13 @@ use crate::{Error, Result};
 pub const MARKER: &str = "layershop-engine.json";
 /// ComfyUI's list of extra model folders, pointing it at the models folder.
 pub const MODEL_PATHS: &str = "layershop-models.yaml";
+/// The folder of the managed engine's writable data (its `user`, `input`, `output` and `temp`
+/// folders), beside the versioned engine folder and not inside it, so an engine version can be
+/// replaced or removed without taking the user's workflows, uploaded files or generated output.
+pub const DATA_FOLDER: &str = "data";
+/// The writable ComfyUI folders [`DATA_FOLDER`] holds, in the order the launch arguments name
+/// them (see `runtime::MACOS_DATA_ARGS`).
+pub const DATA_FOLDERS: [&str; 4] = ["user", "input", "output", "temp"];
 /// The note of an Install screen row whose file is in one of the user's own models folders.
 pub const LINKED_NOTE: &str = "in your models folder";
 /// A download in progress, beside where the finished file goes.
@@ -214,6 +221,9 @@ pub struct Layout {
     pub python: PathBuf,
     pub script: PathBuf,
     pub models_dir: PathBuf,
+    /// Managed: the writable ComfyUI folders live here ([`DATA_FOLDER`]), outside every versioned
+    /// engine folder. Empty for [`Route::Existing`], like the other managed paths.
+    pub data_dir: PathBuf,
     /// Managed: the user's own models folders the engine reads too ([`Choices::extra_models_dirs`]).
     pub extra_models: Vec<PathBuf>,
 }
@@ -252,6 +262,10 @@ impl Layout {
             Route::Existing => String::new(),
         };
         let inside = |rel: &str| rel.split('/').fold(engine_root.clone(), |p, part| p.join(part));
+        let data_dir = match choices.route {
+            Route::Managed => engine_dir.join(DATA_FOLDER),
+            Route::Existing => PathBuf::new(),
+        };
         let extra_models = match choices.route {
             Route::Managed => extra_folders(&choices.extra_models_dirs, &models_dir)?,
             Route::Existing => Vec::new(),
@@ -265,6 +279,7 @@ impl Layout {
             engine_dir,
             engine_root,
             models_dir,
+            data_dir,
             extra_models,
         })
     }
@@ -273,6 +288,12 @@ impl Layout {
     pub fn model_file(&self, key: &str) -> Result<PathBuf> {
         let (folder, name) = split_key(key).ok_or_else(|| Error::Config(format!("`{key}` is not a model file")))?;
         Ok(self.models_dir.join(folder).join(name))
+    }
+
+    /// The writable ComfyUI folders inside [`Layout::data_dir`] (in [`DATA_FOLDERS`] order):
+    /// what the launch points ComfyUI at, and what creating and removing them covers.
+    pub fn data_dirs(&self) -> Vec<PathBuf> {
+        DATA_FOLDERS.iter().map(|f| self.data_dir.join(f)).collect()
     }
 
     /// Where the user's own models folders would have the file `name` of `folder`, each with the
@@ -738,6 +759,13 @@ mod tests {
         assert!(layout.model_file("vae/../ae.safetensors").is_err());
         assert!(!layout.models_dir.starts_with(&layout.engine_dir));
         assert_eq!(part_of(Path::new("a/b.7z")), PathBuf::from("a/b.7z.part"));
+        // The writable folders live outside the versioned engine folder, so replacing or removing
+        // an engine version leaves the user's workflows and output alone.
+        assert_eq!(layout.data_dir, PathBuf::from(root("engine")).join("data"));
+        assert!(!layout.data_dir.starts_with(&layout.engine_root));
+        assert_eq!(layout.data_dirs(), ["user", "input", "output", "temp"].iter().map(|f| layout.data_dir.join(f)).collect::<Vec<_>>());
+        // The user's own ComfyUI installs nothing.
+        assert!(Layout::new(m, &Choices { route: Route::Existing, ..choices(&[]) }).unwrap().data_dir.as_os_str().is_empty());
     }
 
     #[test]

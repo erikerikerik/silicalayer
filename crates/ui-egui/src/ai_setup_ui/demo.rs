@@ -437,6 +437,7 @@ pub fn probe_with_comfy_at(dir: &Path, version: &str) -> Value {
         python: dir.join("Documents").join("ComfyUI").join(".venv").join("Scripts").join("python.exe").to_string_lossy().into_owned(),
         folder: dir.join("ComfyUI-Installs").join("ComfyUI").to_string_lossy().into_owned(),
         args: "ComfyUI\\main.py --enable-manager".into(),
+        ..Default::default()
     };
     probe_with(dir, Existing { running: Vec::new(), installed: Some(launch), models: comfy_folders(dir), version: version.into() })
 }

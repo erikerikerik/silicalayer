@@ -362,7 +362,12 @@ impl photocraft_aigen::LocalServer for FakeServer {
         if self.started.load(std::sync::atomic::Ordering::Relaxed) { photocraft_aigen::ServerState::Started } else { photocraft_aigen::ServerState::NotStarted }
     }
     fn find(&self, _: &dyn Transport, _: &str) -> photocraft_aigen::Result<photocraft_aigen::Launch> {
-        Ok(photocraft_aigen::Launch { python: "C:/comfy/.venv/Scripts/python.exe".into(), folder: "C:/comfy".into(), args: "main.py --enable-manager".into() })
+        Ok(photocraft_aigen::Launch {
+            python: "C:/comfy/.venv/Scripts/python.exe".into(),
+            folder: "C:/comfy".into(),
+            args: "main.py --enable-manager".into(),
+            ..Default::default()
+        })
     }
 }
 
@@ -855,7 +860,10 @@ fn the_list_says_what_each_model_is_used_for_and_can_be_narrowed_to_it() {
     add_model(&mut app, Model { id: "qwen".into(), ..Family::QwenInpaint.preset() });
     add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
     // One page lists every model; the pages for local, inpainting and cloud models are gone.
-    assert_eq!(PAGES.map(|(key, title)| (key, title)), [("models", "Manage Models"), ("keys", "API Keys"), ("enhance", "Prompt Enhancement"), ("server", "Engine"), ("folders", "Model Folders")]);
+    assert_eq!(
+        PAGES.map(|(key, title)| (key, title)),
+        [("models", "Manage Models"), ("keys", "API Keys"), ("enhance", "Prompt Enhancement"), ("server", "Engine"), ("folders", "Model Folders")]
+    );
     let models = app.session.prefs().integrations.ai.models.clone();
     let listed = |filter: Filter| models.iter().filter(|m| filter.shows(Some(m))).map(|m| m.id.as_str()).collect::<Vec<_>>();
     assert_eq!(listed(Filter::All), ["z", "gpt", "fill", "qwen", "flux"]);
@@ -1628,7 +1636,13 @@ mod clicks {
             h.state_mut().remove(ACTION)
         };
         assert_eq!(press(&mut h, "Read the folder again", 1), Some(json!("folderList")));
-        let open = if cfg!(windows) { "Open in Explorer" } else if cfg!(target_os = "macos") { "Open in Finder" } else { "Open Folder" };
+        let open = if cfg!(windows) {
+            "Open in Explorer"
+        } else if cfg!(target_os = "macos") {
+            "Open in Finder"
+        } else {
+            "Open Folder"
+        };
         assert_eq!(press(&mut h, open, 1), Some(json!("folderShow:D:/mine/models")));
         // Remove asks first; Cancel leaves the folder, Remove in the question removes it.
         assert_eq!(press(&mut h, "Stop reading this folder (nothing in it is deleted)", 0), None);
@@ -2572,10 +2586,8 @@ fn a_group_folds_at_its_header_and_stays_folded() {
     add_model(&mut app, z_image("z"));
     let (_, mut f) = dialog_fields(&mut app);
     f.insert(PAGE.into(), json!("models"));
-    let mut h = Harness::builder()
-        .with_size(vec2(1100.0, 700.0))
-        .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
-        .build_ui_state(
+    let mut h =
+        Harness::builder().with_size(vec2(1100.0, 700.0)).with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default())).build_ui_state(
             |ui, f: &mut Map<String, Value>| {
                 let mut values = f.get("values").cloned().unwrap_or_default();
                 if let Some(obj) = values.get_mut("integrations").and_then(Value::as_object_mut) {
@@ -2610,7 +2622,8 @@ fn reset_puts_a_models_defaults_back_and_takes_its_loras_away() {
     let lora = |file: &str| photocraft_aigen::Lora { file: file.into(), ..Default::default() };
     // A recommended model: its own defaults, whatever was changed. Name and switch stay.
     let qwen = Model::defaults().into_iter().find(|m| m.id == "qwen-image-2-1").unwrap();
-    let changed = Model { name: "My Qwen".into(), enabled: false, steps: 99, cfg: 7.5, lora: String::new(), loras: vec![lora("a.safetensors")], ..qwen.clone() };
+    let changed =
+        Model { name: "My Qwen".into(), enabled: false, steps: 99, cfg: 7.5, lora: String::new(), loras: vec![lora("a.safetensors")], ..qwen.clone() };
     let reset = defaults_for(&changed, None);
     assert_eq!((reset.steps, reset.cfg, reset.lora.as_str()), (qwen.steps, qwen.cfg, qwen.lora.as_str()));
     assert_eq!((reset.name.as_str(), reset.enabled, reset.id.as_str()), ("My Qwen", false, "qwen-image-2-1"));
@@ -2636,10 +2649,8 @@ fn remove_not_installed_asks_then_takes_only_the_models_it_names() {
     use egui_kittest::{Harness, kittest::Queryable};
     let models = vec![json!({"id": "a", "name": "Left Over"}), json!({"id": "b", "name": "Keep"}), json!({"id": "c", "name": "Gone Too"})];
     let state = (models, serde_json::Map::from_iter([(PRUNE.to_string(), json!(true)), (SELECTED.to_string(), json!(1))]), false);
-    let mut h = Harness::builder()
-        .with_size(vec2(900.0, 600.0))
-        .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
-        .build_ui_state(
+    let mut h =
+        Harness::builder().with_size(vec2(900.0, 600.0)).with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default())).build_ui_state(
             |ui, (models, f, went): &mut (Vec<Value>, Map<String, Value>, bool)| {
                 *went |= prune_question(ui.ctx(), models, f, &[0, 2]);
             },
@@ -2821,7 +2832,14 @@ fn enhancement_job_events_are_the_panels() {
     use photocraft_engine::jobs::{JobEvent, JobId, JobOutcome};
     let mut app = app();
     app.ui.ai_gen.prompt = "cat".into();
-    let event = |id: u64, outcome: JobOutcome| JobEvent { id: JobId(id), command: enhance::ENHANCE.into(), label: "Enhance Prompt".into(), document: None, outcome, error: None };
+    let event = |id: u64, outcome: JobOutcome| JobEvent {
+        id: JobId(id),
+        command: enhance::ENHANCE.into(),
+        label: "Enhance Prompt".into(),
+        document: None,
+        outcome,
+        error: None,
+    };
     assert!(!on_job_event(&mut app, &event(3, JobOutcome::Cancelled)), "not the panel's");
     app.ui.ai_gen.enhance_job = Some(3);
     assert!(on_job_event(&mut app, &event(3, JobOutcome::Failed("Claude refused the request: bad key.".into()))));

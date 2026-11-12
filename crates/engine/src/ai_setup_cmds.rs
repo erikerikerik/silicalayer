@@ -822,7 +822,10 @@ mod native {
             if let Some(server) = &s.ai.server {
                 server.stop();
             }
-            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir)).map_err(setup_error)?);
+            // The engine's data folder (its workflows, uploads and output) stays, like the
+            // models do, unless the user is removing everything: the engine and every model.
+            let everything = all_ids.iter().all(|id| models.contains(id));
+            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir), everything).map_err(setup_error)?);
         }
         // The settings follow the disk: what can no longer run is unticked, and an engine that
         // is gone is no longer started.
