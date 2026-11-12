@@ -17,6 +17,12 @@ use crate::{Error, Result};
 /// (ComfyUI Desktop's), so nothing collides with a ComfyUI the user installs themselves.
 pub const FIRST_PORT: u16 = 8190;
 
+/// The name a repair gives an engine it moves out of the way while its replacement unpacks:
+/// the engine's folder with `.replaced` added. It still carries the marker, but it is not an
+/// installed engine where one stands; it goes back if the new one fails to arrive, and a job's
+/// start puts it right either way (see `install::recover_replaced`).
+pub const REPLACED: &str = ".replaced";
+
 /// The current marker format version.
 const MARKER_FORMAT_VERSION: u32 = 1;
 
@@ -347,15 +353,22 @@ pub fn size_of(path: &Path) -> u64 {
 }
 
 /// The ComfyUI versions installed in `engine_dir`: the folders that carry this app's marker.
+/// An engine set aside for a repair ([`REPLACED`]) is not one of them, marker or not.
 pub fn installed_engines(engine_dir: &Path) -> Vec<(PathBuf, Marker)> {
     let Ok(entries) = std::fs::read_dir(engine_dir) else { return Vec::new() };
-    let mut out: Vec<(PathBuf, Marker)> = entries.flatten().take(1000).filter_map(|e| read_marker(&e.path()).map(|m| (e.path(), m))).collect();
+    let mut out: Vec<(PathBuf, Marker)> = entries
+        .flatten()
+        .take(1000)
+        .filter(|e| !e.file_name().to_string_lossy().ends_with(REPLACED))
+        .filter_map(|e| read_marker(&e.path()).map(|m| (e.path(), m)))
+        .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
 /// Remove what the setup put in `engine_dir`: every engine that carries the marker, unfinished
-/// unpacks and runtime archives. Anything else in the folder is not this app's and stays.
+/// unpacks, engines set aside for a repair ([`REPLACED`]) and runtime archives. Anything else in
+/// the folder is not this app's and stays.
 /// The data folder of writable engine output ([`DATA_FOLDER`]) stays too — like the models —
 /// unless `remove_data` says the user chose to delete their workflows and output with it.
 /// Returns the bytes freed.
@@ -374,7 +387,7 @@ pub fn remove_engines(engine_dir: &Path, remove_data: bool) -> Result<u64> {
                 std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
                 freed = freed.saturating_add(size);
             }
-        } else if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking")) {
+        } else if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking") || name.ends_with(REPLACED)) {
             let size = size_of(&path);
             std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
             freed = freed.saturating_add(size);
@@ -635,6 +648,11 @@ mod tests {
         std::fs::create_dir_all(&notes).unwrap();
         write_marker(&trusted, &Marker::managed(RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))).unwrap();
         std::fs::write(notes.join(MARKER), b"{}").unwrap();
+        // An engine set aside for a repair carries a valid marker but stands where a newer one
+        // is (or will be): it is not one of the installed engines.
+        let aside = engines.join("0.40.0.replaced");
+        std::fs::create_dir_all(&aside).unwrap();
+        write_marker(&aside, &Marker::managed(RuntimePlatform::WindowsPortable, "0.40.0", "nvidia", &"b".repeat(64))).unwrap();
         let installed = installed_engines(&engines);
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].0, trusted);
@@ -651,6 +669,10 @@ mod tests {
         std::fs::write(ours.join("python_embeded").join("python.exe"), vec![0u8; 1000]).unwrap();
         write_marker(&ours, &Marker::managed(RuntimePlatform::WindowsPortable, "0.39.0", "nvidia", &"a".repeat(64))).unwrap();
         std::fs::create_dir_all(engines.join("0.40.0.unpacking")).unwrap();
+        // An engine a repair set aside: not an installed engine, but the setup's to remove.
+        std::fs::create_dir_all(engines.join("0.41.0.replaced")).unwrap();
+        write_marker(engines.join("0.41.0.replaced").as_path(), &Marker::managed(RuntimePlatform::WindowsPortable, "0.41.0", "nvidia", &"b".repeat(64)))
+            .unwrap();
         std::fs::write(theirs.join("keep.txt"), b"mine").unwrap();
         std::fs::write(engines.join("ComfyUI_windows_portable_nvidia.7z.part"), vec![0u8; 500]).unwrap();
         std::fs::write(engines.join("holiday.7z"), b"mine too").unwrap();
@@ -660,7 +682,12 @@ mod tests {
         assert_eq!(installed_engines(&engines).iter().map(|(_, m)| m.version.as_str()).collect::<Vec<_>>(), ["0.39.0"]);
         let freed = remove_engines(&engines, false).unwrap();
         assert!(freed >= 1500, "{freed}");
-        assert!(!ours.exists() && !engines.join("0.40.0.unpacking").exists() && !engines.join("ComfyUI_windows_portable_nvidia.7z.part").exists());
+        assert!(
+            !ours.exists()
+                && !engines.join("0.40.0.unpacking").exists()
+                && !engines.join("0.41.0.replaced").exists()
+                && !engines.join("ComfyUI_windows_portable_nvidia.7z.part").exists()
+        );
         assert!(theirs.join("keep.txt").is_file() && engines.join("holiday.7z").is_file());
         // The user's workflows and output stay with the setup removed, like the models do.
         assert!(engines.join(DATA_FOLDER).join("user").join("flow.json").is_file());

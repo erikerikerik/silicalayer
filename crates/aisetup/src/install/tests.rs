@@ -947,9 +947,10 @@ fn repairing_a_damaged_macos_engine_reunpacks_it_and_leaves_the_data_folder_alon
     // Repair (recheck: true): the engine comes back whole - Python, the executable bit, and a
     // valid marker - its archive taken down again, and `<engineDir>/data` untouched. This run
     // exposed a real bug: unpack refused the engine folder its own earlier unpack had filled
-    // ("already exists and is not empty"), so a damaged engine could never be repaired. The fix
-    // is in `unpack_step` (install.rs): a folder carrying this app's marker is cleared for the
-    // fresh unpack; a folder without it still gets unpack's refusal.
+    // ("already exists and is not empty"), so a damaged engine
+    // could never be repaired. The fix is in `unpack_step` (install.rs): a folder carrying this
+    // app's marker moves aside for the fresh unpack, back in place if the repair fails; a folder
+    // without it still gets unpack's refusal.
     let mut job = rig_mac.job();
     job.manifest.comfy.assets.get_mut("macos_arm64").unwrap().executables = vec!["ComfyUI/main.py".into()];
     job.choices.recheck = true;
@@ -965,6 +966,147 @@ fn repairing_a_damaged_macos_engine_reunpacks_it_and_leaves_the_data_folder_alon
     assert_eq!(std::fs::read(&kept).unwrap(), b"{}", "the repair never went near the data folder");
     assert_eq!(rig.net.served(&rig.manifest, "runtime") - served_before, size, "a fresh engine archive, nothing else");
     rig_mac.assert_finished(done.launch.as_ref().unwrap(), 2 * size);
+}
+
+/// The reversibility of task 018's repair: the marked engine gives way to the fresh unpack by
+/// being renamed aside (`<version>.replaced`) rather than deleted, so a repair that fails or is
+/// cancelled puts the old engine back. What a crash leaves behind is put right when the next job
+/// starts. All four tests ride on the macOS rig and its offline archive.
+#[test]
+fn a_repair_cancelled_while_unpacking_puts_the_old_engine_back() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    let marker = runtime::read_marker(&layout.engine_root).unwrap();
+
+    // Damage: the Python the plan checks for is gone (an antivirus took it). The marker still
+    // says the folder is this setup's own.
+    std::fs::remove_file(&layout.python).unwrap();
+
+    // A repair whose unpack is cancelled once the first bytes land in the staging folder, asked
+    // at the same moments `unpack` asks it, as the interrupt test above does.
+    let job = rig_mac.job();
+    let env = Arc::new(Env {
+        fetch: rig.net.clone(),
+        transport: rig.comfy.clone(),
+        server: Some(rig.server.clone()),
+        state_file: None,
+        sleep: |_| {},
+        free_space: plenty,
+        vc_runtime: rig.vc_runtime.borrow().clone(),
+    });
+    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk).unwrap();
+    let shared = Shared::default();
+    shared.set_steps(&plan);
+    let fetch = plan.steps.iter().position(|s| s.step == Step::FetchRuntime).unwrap_or_else(|| panic!("the plan has no runtime row"));
+    fetch_step(&env, &job, &layout, &shared, fetch, &plan.steps[fetch], &|| false).unwrap();
+    let unpack_row = plan.steps.iter().position(|s| s.step == Step::UnpackRuntime).unwrap_or_else(|| panic!("the plan has no unpack row"));
+    let stop = || shared.progress().steps.get(unpack_row).is_some_and(|s| s.done > 0);
+    let e = unpack_step(&job, &layout, &shared, unpack_row, &stop).unwrap_err();
+    assert_eq!(e, Error::Cancelled);
+
+    // The old engine is back where it stood - damaged as it was, marker and all - and nothing of
+    // the repair is left beside it: nothing set aside, no staging folder, and the verified
+    // archive waits to be unpacked again.
+    assert!(layout.engine_root.is_dir());
+    assert_eq!(runtime::read_marker(&layout.engine_root).as_ref(), Some(&marker));
+    assert!(!layout.python.exists(), "the old engine came back as damaged as it stood");
+    assert!(!replaced_of(&layout.engine_root).exists(), "what is back in place is not also set aside");
+    assert!(!unpack::staging_of(&layout.engine_root).exists());
+    assert!(layout.archive.is_file(), "the verified archive waits to be unpacked again");
+    assert_eq!(runtime::installed_engines(&layout.engine_dir), vec![(layout.engine_root.clone(), marker)]);
+}
+
+#[test]
+fn a_repair_whose_archive_is_corrupt_puts_the_old_engine_back_with_the_archive_error() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let asset = rig_mac.manifest.comfy.assets["macos_arm64"].clone();
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    let marker = runtime::read_marker(&layout.engine_root).unwrap();
+
+    // Damage on both sides: the engine lost its Python, and what stands where the archive
+    // belongs has its size but not its contents - the plan sees the archive as fetched, and
+    // unpacking is what reads it.
+    std::fs::remove_file(&layout.python).unwrap();
+    std::fs::write(&layout.archive, vec![0x55u8; asset.size as usize]).unwrap();
+
+    let (result, progress) = rig.run_job(rig_mac.job(), plenty);
+    let e = result.unwrap_err();
+    assert!(matches!(&e, Error::Archive(why) if why.contains("could not be read") && why.contains("downloaded again")), "{e:?}");
+    assert_eq!(progress.steps.iter().find(|s| s.key == "unpack").map(|s| s.state), Some(StepState::Failed));
+
+    // The answer is the archive error, and the engine that stood there is back - damaged as it
+    // was, marker and all. The corrupt archive is gone, so the next start downloads afresh.
+    assert!(layout.engine_root.is_dir());
+    assert_eq!(runtime::read_marker(&layout.engine_root).as_ref(), Some(&marker));
+    assert!(!layout.python.exists(), "the old engine came back as damaged as it stood");
+    assert!(!replaced_of(&layout.engine_root).exists() && !unpack::staging_of(&layout.engine_root).exists());
+    assert!(!layout.archive.exists(), "the corrupt archive is gone, so the next start downloads afresh");
+    assert_eq!(rig.net.served(&rig.manifest, "runtime"), asset.size, "only the first install's archive was ever served");
+}
+
+#[test]
+fn a_repair_that_finishes_leaves_the_new_engine_and_nothing_set_aside() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+
+    // The user's own things in the data folder beside the engine: a repair must not go near them.
+    let kept = layout.data_dir.join("my-workflow.json");
+    std::fs::write(&kept, b"{}").unwrap();
+    // What an earlier, interrupted repair left behind: an engine set aside beside the current
+    // one. It is this setup's to clear, and it must not survive the repair that finishes.
+    let aside = replaced_of(&layout.engine_root);
+    std::fs::create_dir_all(&aside).unwrap();
+    runtime::write_marker(&aside, &runtime::read_marker(&layout.engine_root).unwrap()).unwrap();
+    // Damage: the Python the plan checks for is gone.
+    std::fs::remove_file(&layout.python).unwrap();
+
+    let served_before = rig.net.served(&rig.manifest, "runtime");
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+
+    // The new engine stands in place; the engines it replaced are gone, the set-aside folder
+    // with them; and `<engineDir>/data` is untouched.
+    assert_eq!(std::fs::read(&layout.python).unwrap(), b"MZ python", "the engine's Python is back");
+    assert!(!aside.exists(), "no engine is left set aside once the new one is in place");
+    assert_eq!(std::fs::read(&kept).unwrap(), b"{}", "the repair never went near the data folder");
+    assert_eq!(rig.net.served(&rig.manifest, "runtime") - served_before, size, "a fresh engine archive, nothing else");
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), 2 * size);
+}
+
+#[test]
+fn an_engine_set_aside_by_an_interrupted_repair_is_restored_or_cleared_at_the_next_start() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    std::fs::write(layout.engine_root.join("my-file.txt"), b"mine").unwrap();
+
+    // A crash between setting the engine aside and unpacking its replacement leaves only the
+    // `.replaced` folder. The next job's start renames the engine back before anything else: it
+    // plans with the engine standing and asks the network for nothing.
+    let aside = replaced_of(&layout.engine_root);
+    std::fs::rename(&layout.engine_root, &aside).unwrap();
+    let served_before = rig.net.served(&rig.manifest, "runtime");
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    assert_eq!(std::fs::read(layout.engine_root.join("my-file.txt")).unwrap(), b"mine", "the engine that was set aside is back in place");
+    assert!(!aside.exists() && !unpack::staging_of(&layout.engine_root).exists());
+    assert_eq!(rig.net.served(&rig.manifest, "runtime"), served_before, "the restored engine needed nothing downloaded");
+
+    // What a crash leaves beside a new engine that did arrive: the newer one stands in place and
+    // the set-aside folder is deleted by the next start - and it was never an installed engine.
+    std::fs::create_dir_all(&aside).unwrap();
+    runtime::write_marker(&aside, &runtime::read_marker(&layout.engine_root).unwrap()).unwrap();
+    std::fs::write(aside.join("my-file.txt"), b"outdated").unwrap();
+    assert_eq!(
+        runtime::installed_engines(&layout.engine_dir).iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        vec![layout.engine_root.clone()],
+        "a folder set aside for a repair is not an installed engine"
+    );
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    assert!(!aside.exists(), "a set-aside engine goes once a newer one stands in place");
+    assert_eq!(std::fs::read(layout.engine_root.join("my-file.txt")).unwrap(), b"mine", "the engine in place is the one that stays");
 }
 
 #[test]

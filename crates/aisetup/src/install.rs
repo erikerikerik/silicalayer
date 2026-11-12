@@ -457,6 +457,43 @@ fn apply_executable_permissions(staging: &Path, executables: &[String]) -> Resul
     Ok(())
 }
 
+/// The folder an engine a repair moved out of the way sits in while its replacement unpacks:
+/// `root` with [`runtime::REPLACED`] appended to its name, beside where the engine stands.
+fn replaced_of(root: &Path) -> PathBuf {
+    let mut name = root.as_os_str().to_os_string();
+    name.push(runtime::REPLACED);
+    PathBuf::from(name)
+}
+
+/// Remove an engine set aside for a repair, when its marker says this app put it there. A folder
+/// without the marker is not this app's and stays.
+fn clear_replaced(replaced: &Path) -> Result<()> {
+    if replaced.is_dir() && runtime::read_marker(replaced).is_some() {
+        std::fs::remove_dir_all(replaced).map_err(|e| Error::Disk(format!("Could not clear the engine set aside in `{}`: {e}.", replaced.display())))?;
+    }
+    Ok(())
+}
+
+/// Put a job's engine folder right before anything else looks at it. A repair interrupted between
+/// moving the old engine aside and unpacking its replacement leaves a [`runtime::REPLACED`]
+/// folder beside the empty space the engine belongs in: the old engine goes back. Where a new
+/// engine did arrive, that one stands and the set-aside folder, marked by this app, is its to
+/// delete. A folder without the marker is not this app's and stays.
+fn recover_replaced(layout: &Layout) {
+    let replaced = replaced_of(&layout.engine_root);
+    if !replaced.is_dir() || runtime::read_marker(&replaced).is_none() {
+        return;
+    }
+    if layout.engine_root.exists() {
+        let _ = clear_replaced(&replaced);
+    } else {
+        let _ = std::fs::rename(&replaced, &layout.engine_root);
+    }
+}
+
+/// Unpack the runtime archive into the engine folder, then delete the archive. A marked engine
+/// already standing there is moved aside rather than deleted, so a repair that fails or is
+/// cancelled puts it back (see the body).
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
@@ -475,27 +512,45 @@ fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: 
     };
     // The repair of a damaged engine: this step only runs when a file of the engine is missing,
     // and a folder carrying this app's own marker is the one an earlier unpack of this setup
-    // filled - it is the setup's to replace, and the old engine gives way to the fresh one.
+    // filled - it is the setup's to replace. Rather than delete it and hope the fresh unpack
+    // comes off, it is moved aside under a name that says this setup set it aside, so a failed
+    // or stopped repair puts the old engine straight back instead of leaving the user with none.
     // `unpack` still refuses any non-empty folder without that marker (it did not put it there).
+    let replaced = replaced_of(&layout.engine_root);
     if runtime::read_marker(&layout.engine_root).is_some() {
-        std::fs::remove_dir_all(&layout.engine_root)
-            .map_err(|e| Error::Disk(format!("Could not clear the damaged engine in `{}` to unpack a new one: {e}.", layout.engine_root.display())))?;
+        // One still set aside from an earlier attempt is this setup's to clear first (the job's
+        // start normally has; this also covers a repair called without one).
+        clear_replaced(&replaced)?;
+        std::fs::rename(&layout.engine_root, &replaced)
+            .map_err(|e| Error::Disk(format!("Could not move the damaged engine out of `{}` to unpack a new one: {e}.", layout.engine_root.display())))?;
     }
     let done =
         unpack::unpack(&layout.archive, &layout.engine_root, &Limits::default(), stop, &|done, total| shared.bytes(index, done.min(total), false), &finish);
     match done {
         Ok(_) => {
+            // The new engine stands in the old one's place: what it replaced is no longer wanted.
+            let _ = clear_replaced(&replaced);
             // 2 GB the engine no longer needs.
             let _ = std::fs::remove_file(&layout.archive);
             Ok(())
         }
-        Err(Error::Archive(why)) => {
-            // Its checksum was right when it arrived: damaged since, or not what was expected.
-            // Either way the next try starts from a fresh download.
-            let _ = std::fs::remove_file(&layout.archive);
-            Err(Error::Archive(why))
+        Err(e) => {
+            // The engine that stood here goes back, as long as nothing took its place while the
+            // new one failed to arrive. Should even that fail, the next job's start finds the
+            // set-aside folder and restores it; the error stays the one this attempt hit.
+            if replaced.is_dir() && runtime::read_marker(&replaced).is_some() && !layout.engine_root.exists() {
+                let _ = std::fs::rename(&replaced, &layout.engine_root);
+            }
+            match e {
+                // Its checksum was right when it arrived: damaged since, or not what was expected.
+                // Either way the next try starts from a fresh download.
+                Error::Archive(why) => {
+                    let _ = std::fs::remove_file(&layout.archive);
+                    Err(Error::Archive(why))
+                }
+                e => Err(e),
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -504,10 +559,16 @@ fn index_of(plan: &Plan, step: &Step) -> Option<usize> {
 }
 
 fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
-    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk)?;
     let layout = Layout::new(&job.manifest, &job.choices)?;
-    shared.set_steps(&plan);
     let managed = job.choices.route == Route::Managed;
+    // First thing, before anything reads the engine folder: an engine a repair interrupted
+    // between setting it aside and unpacking its replacement goes back, or is cleared when the
+    // replacement arrived (see [`recover_replaced`]).
+    if managed {
+        recover_replaced(&layout);
+    }
+    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk)?;
+    shared.set_steps(&plan);
     shared.message("Checking the folders");
     preflight(job, &plan, &layout, env.free_space)?;
 
