@@ -781,6 +781,8 @@ mod native {
     /// `ai.setup.remove`: delete what the setup installed. `{"engine": true}` removes the
     /// engine (and stops it), `{"models": true}` every model file the setup lists,
     /// `{"models": [id, …]}` those models' files (a file another installed model uses stays).
+    /// `{"data": true}` goes only with `engine: true` and then also deletes the engine's data
+    /// folder: the user's ComfyUI workflows, uploads and output. Without it that folder stays.
     /// Only the folders of the setup's own record are touched, and in them only what the setup
     /// puts there.
     pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -792,6 +794,10 @@ mod native {
         }
         let m = manifest(s)?;
         let engine = flag_param(p, "engine", false, cmd)?;
+        let data = flag_param(p, "data", false, cmd)?;
+        if data && !engine {
+            return Err(bad(cmd, "`data` deletes ComfyUI's workflows and output along with the engine: say `engine: true` to remove it too"));
+        }
         let all_ids: Vec<String> = m.models.iter().map(|x| x.id.clone()).collect();
         let models: Vec<String> = match p.get("models") {
             None | Some(Value::Null) | Some(Value::Bool(false)) => Vec::new(),
@@ -823,9 +829,8 @@ mod native {
                 server.stop();
             }
             // The engine's data folder (its workflows, uploads and output) stays, like the
-            // models do, unless the user is removing everything: the engine and every model.
-            let everything = all_ids.iter().all(|id| models.contains(id));
-            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir), everything).map_err(setup_error)?);
+            // models do, unless the user explicitly asked for it with `data`.
+            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir), data).map_err(setup_error)?);
         }
         // The settings follow the disk: what can no longer run is unticked, and an engine that
         // is gone is no longer started.
@@ -1325,7 +1330,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Remove Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{"engine":bool=false,"models":true|[id,…]?} → {freed,freedText,installed,engine}: deletes the engine this app installed and/or model files it lists (a file another installed model uses stays). A ComfyUI the user set up themselves is never touched"##,
+            params: r##"{"engine":bool=false,"models":true|[id,…]?,"data":bool=false (only with `engine`: true, also deletes the engine's data folder: the user's ComfyUI workflows, uploads and output; on its own it is an error)} → {freed,freedText,installed,engine}: deletes the engine this app installed and/or model files it lists (a file another installed model uses stays). That data folder stays, like the models, unless `data` asks for it. A ComfyUI the user set up themselves is never touched"##,
             enabled: can_install,
             run: imp::remove,
             journal: false,

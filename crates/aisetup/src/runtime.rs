@@ -357,9 +357,9 @@ pub fn installed_engines(engine_dir: &Path) -> Vec<(PathBuf, Marker)> {
 /// Remove what the setup put in `engine_dir`: every engine that carries the marker, unfinished
 /// unpacks and runtime archives. Anything else in the folder is not this app's and stays.
 /// The data folder of writable engine output ([`DATA_FOLDER`]) stays too — like the models —
-/// unless `everything` says the user is removing the whole setup, when it goes with the engines.
+/// unless `remove_data` says the user chose to delete their workflows and output with it.
 /// Returns the bytes freed.
-pub fn remove_engines(engine_dir: &Path, everything: bool) -> Result<u64> {
+pub fn remove_engines(engine_dir: &Path, remove_data: bool) -> Result<u64> {
     let mut freed = 0u64;
     let Ok(entries) = std::fs::read_dir(engine_dir) else { return Ok(0) };
     for entry in entries.flatten().take(10_000) {
@@ -367,9 +367,9 @@ pub fn remove_engines(engine_dir: &Path, everything: bool) -> Result<u64> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() && name == DATA_FOLDER {
-            // Not a versioned engine: the user's workflows, uploads and output, kept unless
-            // everything goes.
-            if everything {
+            // Not a versioned engine: the user's workflows, uploads and output, kept unless the
+            // user asked for this folder too.
+            if remove_data {
                 let size = size_of(&path);
                 std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
                 freed = freed.saturating_add(size);
@@ -664,7 +664,7 @@ mod tests {
         assert!(theirs.join("keep.txt").is_file() && engines.join("holiday.7z").is_file());
         // The user's workflows and output stay with the setup removed, like the models do.
         assert!(engines.join(DATA_FOLDER).join("user").join("flow.json").is_file());
-        // Removing everything takes the data folder too; what never belonged to the app still stays.
+        // Only `remove_data` takes the data folder; what never belonged to the app still stays.
         let freed = remove_engines(&engines, true).unwrap();
         assert!(freed >= 4, "{freed}");
         assert!(!engines.join(DATA_FOLDER).exists());

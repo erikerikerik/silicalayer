@@ -361,6 +361,10 @@ fn a_comfyui_that_does_not_answer_is_said_on_the_screen() {
 fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_new_one() {
     let (mut app, dir) = app(demo::Scale::Small);
     let root = demo::pretend_installed(&app, dir.path()).unwrap();
+    // The engine's data folder (task 013): workflows and output the user made with ComfyUI.
+    let data = dir.path().join("engine").join(photocraft_aisetup::plan::DATA_FOLDER);
+    std::fs::create_dir_all(data.join("user")).unwrap();
+    std::fs::write(data.join("user").join("my workflow.json"), br#"{"nodes":[]}"#).unwrap();
     let c = ctx();
     open(&mut app);
     assert!(set_up(&app), "the record says it is installed");
@@ -391,6 +395,14 @@ fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_n
     assert!(app.ui.ai_setup.note.starts_with("Local AI was removed. Space freed:"), "{}", app.ui.ai_setup.note);
     assert!(!set_up(&app));
     assert_eq!(installed(&app), [false, false]);
+    // The confirmation is unticked by default (task 014): ComfyUI's workflows and output stayed
+    // with the engine folder gone. Ticked, a second removal takes them and the empty folder.
+    assert!(data.join("user").join("my workflow.json").is_file(), "the checkbox was not ticked");
+    app.ui.ai_setup.confirm_remove = true;
+    assert!(!app.ui.ai_setup.remove_data, "the checkbox starts unticked");
+    app.ui.ai_setup.remove_data = true;
+    remove(&mut app, true);
+    assert!(!data.exists() && !dir.path().join("engine").exists(), "asked for, they went with the engine");
 }
 
 #[test]

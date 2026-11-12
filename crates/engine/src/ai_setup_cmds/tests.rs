@@ -684,6 +684,82 @@ mod native {
         assert_eq!(rig.s.ai_setup.seq(), 2, "the shell is told to save the settings");
     }
 
+    /// The engine's data folder (task 013), as a finished setup leaves one: ComfyUI's own
+    /// workflows and output, beside the versioned engines, inside the setup's engines folder.
+    fn fake_data(rig: &Rig) -> PathBuf {
+        let data = rig.dir.path().join("engine").join(photocraft_aisetup::plan::DATA_FOLDER);
+        write(&data.join("user").join("workflows").join("my.json"), b"a workflow worth keeping");
+        write(&data.join("output").join("first.png"), b"a picture worth keeping");
+        data
+    }
+
+    /// Total bytes of every file under `path`, counted as the removal counts them.
+    fn bytes_of(path: &Path) -> u64 {
+        let mut stack = vec![path.to_path_buf()];
+        let mut total = 0u64;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(entry.path()),
+                    Ok(t) if t.is_file() => total = total.saturating_add(entry.metadata().map_or(0, |m| m.len())),
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+
+    /// Task 014: removing the engine and every model keeps ComfyUI's data folder — its workflows
+    /// and output are the user's — and the reported total leaves its bytes out.
+    #[test]
+    fn removing_the_engine_keeps_comfyui_data_until_data_is_asked() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let (engine, models, keep) = (bytes_of(&root), bytes_of(&rig.models_dir()), bytes_of(&data));
+        assert!(keep > 0, "{keep}");
+        let removed = rig.run("ai.setup.remove", json!({"engine": true, "models": true})).unwrap();
+        assert_eq!(removed["freed"].as_u64(), Some(engine + models), "the freed total counts no data file");
+        assert!(!root.exists(), "the engine went");
+        assert!(
+            data.join("user").join("workflows").join("my.json").is_file() && data.join("output").join("first.png").is_file(),
+            "the workflows and output stayed"
+        );
+    }
+
+    /// Task 014: `data: true` is the explicit choice that takes the data folder with the engine,
+    /// and its bytes then count as freed.
+    #[test]
+    fn removing_the_engine_with_data_takes_comfyui_data_too() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let all = bytes_of(&root) + bytes_of(&rig.models_dir()) + bytes_of(&data);
+        let removed = rig.run("ai.setup.remove", json!({"engine": true, "models": true, "data": true})).unwrap();
+        assert_eq!(removed["freed"].as_u64(), Some(all), "asked for, the data folder counts as freed");
+        assert!(!root.exists() && !data.exists(), "the workflows and output went with the engine");
+        assert!(!rig.dir.path().join("engine").exists(), "nothing of the setup was left in its engines folder");
+    }
+
+    /// Task 014: `data` belongs to a removal of the engine; on its own it is an error, and
+    /// nothing is deleted — the workflows are not something to lose to a mistyped parameter.
+    #[test]
+    fn removing_data_without_the_engine_is_an_error_and_removes_nothing() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let models = bytes_of(&rig.models_dir());
+        for params in [json!({"data": true}), json!({"models": true, "data": true})] {
+            let e = rig.run("ai.setup.remove", params.clone()).unwrap_err().to_string();
+            assert!(e.contains("`data`") && e.contains("engine"), "{params}: {e}");
+        }
+        assert!(
+            root.exists() && data.join("user").join("workflows").join("my.json").is_file() && bytes_of(&rig.models_dir()) == models,
+            "the refused removal deleted nothing"
+        );
+    }
+
     #[test]
     fn the_hugging_face_token_is_kept_with_the_keys_and_out_of_the_preferences() {
         let mut rig = Rig::new();

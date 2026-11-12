@@ -134,6 +134,9 @@ pub struct AiSetupUi {
     pub server_job: Option<u64>,
     /// Remove local AI… is asking to be confirmed.
     pub confirm_remove: bool,
+    /// In that confirmation: also delete ComfyUI's saved workflows and output (`data`).
+    /// Unticked whenever the confirmation opens; removing the engine keeps them without it.
+    pub remove_data: bool,
     /// The installed model whose files are asked to be deleted, until that is confirmed.
     pub remove_model: Option<String>,
     /// A local model rendered in this session: local AI works, however it was set up.
@@ -203,6 +206,7 @@ impl Default for AiSetupUi {
             probe_job: None,
             server_job: None,
             confirm_remove: false,
+            remove_data: false,
             remove_model: None,
             local_worked: false,
             hf: None,
@@ -607,7 +611,10 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 open(app);
                 match what.as_str() {
                     "repair" => repair(app),
-                    "remove" => app.ui.ai_setup.confirm_remove = true,
+                    "remove" => {
+                        app.ui.ai_setup.confirm_remove = true;
+                        app.ui.ai_setup.remove_data = false;
+                    }
                     _ => {
                         // A model's Install in Manage Models: on the Models screen with it ticked.
                         if let Some(id) = what.strip_prefix(INSTALL) {
@@ -860,7 +867,9 @@ fn repair(app: &mut PhotocraftApp) {
 }
 
 fn remove(app: &mut PhotocraftApp, models: bool) {
-    match app.session.execute("ai.setup.remove", json!({"engine": true, "models": models})) {
+    // The data folder is only removed when the confirmation is ticked to ask for it.
+    let data = app.ui.ai_setup.remove_data;
+    match app.session.execute("ai.setup.remove", json!({"engine": true, "models": models, "data": data})) {
         Ok(freed) => {
             let s = &mut app.ui.ai_setup;
             s.note = format!("{} {}", tr("Local AI was removed. Space freed:"), text(&freed, "/freedText"));
@@ -1492,6 +1501,7 @@ fn page_pc(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             if managed && widgets::secondary_button(ui, tr("Remove Local AI…"), 140.0).clicked() {
                 app.ui.ai_setup.confirm_remove = true;
+                app.ui.ai_setup.remove_data = false;
             }
         });
         ui.add_space(8.0);
@@ -1509,6 +1519,10 @@ fn page_pc(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ),
             "",
         );
+        let mut data = app.ui.ai_setup.remove_data;
+        widgets::checkbox(ui, &mut data, tr("Also delete ComfyUI's saved workflows and output"))
+            .on_hover_text(tr("Their folder stays beside the removed engine: unticked, you keep these files or move them to another ComfyUI yourself"));
+        app.ui.ai_setup.remove_data = data;
         ui.horizontal(|ui| {
             if widgets::secondary_button(ui, tr("Remove Engine and Models"), 190.0).clicked() {
                 remove(app, true);
