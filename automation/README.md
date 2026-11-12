@@ -25,7 +25,7 @@ launchctl kickstart -k gui/$(id -u)/net.silicalayer.local-agent
 
 `once` uses the first task in `automation/tasks/` without a matching `.silica-agent/completed/<task>` or `.silica-agent/quarantined/<task>` marker. Quarantined tasks require human review; remove their marker only after resolving the recorded cause. Set `SILICA_PUSH=1` only after a repository-scoped Git credential has been installed and tested. The worker refuses `main` and `master`, refuses a dirty tree containing paths outside the active task, never force-pushes, never merges, and never creates a release.
 
-The launch agent runs every 30 minutes and after login. Install it only after `preflight` passes. Uninstall with `sh automation/uninstall-launch-agent`.
+The launch agent checks for work every 5 minutes and after login; the worker lock keeps one task running at a time, so the next queued task starts within 5 minutes of the last one finishing. Install it only after `preflight` passes. Uninstall with `sh automation/uninstall-launch-agent`.
 
 ## Environment overrides
 
