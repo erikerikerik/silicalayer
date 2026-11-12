@@ -473,6 +473,14 @@ fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: 
         apply_executable_permissions(staging, &asset.executables)?;
         runtime::write_marker(staging, &marker)
     };
+    // The repair of a damaged engine: this step only runs when a file of the engine is missing,
+    // and a folder carrying this app's own marker is the one an earlier unpack of this setup
+    // filled - it is the setup's to replace, and the old engine gives way to the fresh one.
+    // `unpack` still refuses any non-empty folder without that marker (it did not put it there).
+    if runtime::read_marker(&layout.engine_root).is_some() {
+        std::fs::remove_dir_all(&layout.engine_root)
+            .map_err(|e| Error::Disk(format!("Could not clear the damaged engine in `{}` to unpack a new one: {e}.", layout.engine_root.display())))?;
+    }
     let done =
         unpack::unpack(&layout.archive, &layout.engine_root, &Limits::default(), stop, &|done, total| shared.bytes(index, done.min(total), false), &finish);
     match done {

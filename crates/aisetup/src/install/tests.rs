@@ -56,6 +56,10 @@ enum Net {
     Serve,
     /// Send this many bytes, then stop as a cancel would.
     StopAfter(usize),
+    /// Send this many bytes to one address in total and then lose the connection, on every
+    /// request after that as well: a network that dies mid-file and stays down. Unlike
+    /// `StopAfter` the download does not treat this as a cancel, and it retries until giving up.
+    DropAfter(usize),
     Down,
     /// Refuse without the right token.
     Gated,
@@ -113,6 +117,12 @@ impl Fetch for FakeNet {
             Net::StopAfter(n) => {
                 send(&data[from..(from + n).min(data.len())])?;
                 Err(Error::Cancelled)
+            }
+            Net::DropAfter(n) => {
+                let given = self.served.lock().unwrap().get(request.url).copied().unwrap_or(0);
+                let left = (n as u64).saturating_sub(given).min((data.len() - from) as u64) as usize;
+                send(&data[from..from + left])?;
+                Err(Error::Network("the connection dropped in the middle of the file".into()))
             }
             Net::Down => Err(Error::Network("no route to host".into())),
             Net::Gated if request.token != Some("hf_ok") => Err(crate::fetch::status_error(401, request.url)),
@@ -820,6 +830,186 @@ fn a_part_of_the_wrong_bytes_never_reaches_its_final_name_on_any_platform() {
     assert_eq!(std::fs::read(&dest).unwrap(), data);
     assert!(!part_of(&dest).exists() && !part_of(&dest).with_extension("part.etag").exists());
     assert_eq!(net.served.lock().unwrap().get(url).copied(), Some(data.len() as u64));
+}
+
+/// The failures the managed macOS install can meet, and the recovery each one promises, on
+/// the `macos_arm64` job: a drive without room, a connection that dies mid-file, a finished
+/// archive damaged since it landed, a damaged engine, and a repair that must not go near a
+/// model file it already verified. Everything answers from this folder and the offline fixtures.
+#[test]
+fn a_macos_setup_without_room_on_its_drive_stops_before_anything_is_downloaded() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let (result, progress) = rig.run_job(rig_mac.job(), cramped);
+    let why = match result.unwrap_err() {
+        Error::Disk(why) => why,
+        e => panic!("{e:?}"),
+    };
+    // The folder it wanted to write to, the room there is, and the room it needs - all in one
+    // sentence, before a single byte is asked for.
+    assert!(why.contains("Not enough room") && why.contains("1.00 MB is free") && why.contains("needs") && why.contains("2.00 GB to spare"), "{why}");
+    #[cfg(unix)]
+    assert!(why.contains(&layout.models_dir.display().to_string()), "the message names the folder: {why}");
+    assert_eq!(rig.net.total_served(), 0, "nothing was asked of the network");
+    assert_eq!(rig.phase(), Phase::Failed);
+    assert!(progress.steps.iter().all(|s| s.state == StepState::Pending), "{:?}", progress.steps);
+    // And nothing was marked as an engine along the way.
+    assert!(!layout.engine_root.exists() && runtime::read_marker(&layout.engine_root).is_none());
+    assert!(runtime::installed_engines(&layout.engine_dir).is_empty());
+}
+
+#[test]
+fn a_macos_engine_download_that_dies_mid_file_is_kept_and_finished_from_its_part() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+    rig.net.rule(&rig.manifest, "runtime", Net::DropAfter(10));
+    let (result, progress) = rig.run_job(rig_mac.job(), plenty);
+    // A network failure is told as one, with what to do about it - not as a cancel.
+    let e = result.unwrap_err();
+    assert!(matches!(&e, Error::Network(why) if why.contains("kept failing") && why.contains("check the connection")), "{e:?}");
+    assert_eq!(rig.phase(), Phase::Failed);
+    let row = progress.steps.iter().find(|s| s.key == "runtime").unwrap_or_else(|| panic!("{:?}", progress.steps));
+    assert!(row.state == StepState::Failed && row.note.contains("kept failing"), "{row:?}");
+    // What arrived is kept as the part - with its validator beside it, so the next start can
+    // ask for the rest only if the file has not changed - and nothing else landed.
+    assert_eq!(std::fs::metadata(part_of(&layout.archive)).unwrap().len(), 10);
+    assert!(part_of(&layout.archive).with_extension("part.etag").exists());
+    assert!(!layout.archive.exists());
+    assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists());
+    assert!(runtime::read_marker(&layout.engine_root).is_none());
+    assert!(rig.server.asked.lock().unwrap().is_empty(), "nothing is started on half an engine");
+    let failed_after = rig.net.served(&rig.manifest, "runtime");
+    assert_eq!(failed_after, 10);
+
+    // Started again with the network back: the part is checked and only the rest comes down,
+    // the checksum is verified, and the setup finishes as the clean macOS test says it should.
+    rig.net.rule(&rig.manifest, "runtime", Net::Serve);
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    assert_eq!(rig.net.served(&rig.manifest, "runtime") - failed_after, size - 10, "the rest only was fetched");
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), size);
+}
+
+#[test]
+fn a_macos_archive_damaged_after_it_landed_is_refused_before_unpacking_and_fetched_again() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let asset = rig_mac.manifest.comfy.assets["macos_arm64"].clone();
+    // What the next start finds: the archive under its final name at its full size - the plan
+    // therefore has no download left - but damaged since it landed.
+    std::fs::create_dir_all(&layout.engine_dir).unwrap();
+    std::fs::write(&layout.archive, vec![0x55u8; asset.size as usize]).unwrap();
+    let (result, progress) = rig.run_job(rig_mac.job(), plenty);
+    // Read as far as its header, refused, and set aside before a byte was unpacked; the error
+    // says what happens next.
+    let e = result.unwrap_err();
+    assert!(matches!(&e, Error::Archive(why) if why.contains("could not be read") && why.contains("downloaded again")), "{e:?}");
+    assert!(!layout.archive.exists(), "the corrupt archive is gone, so the next start downloads afresh");
+    assert!(!part_of(&layout.archive).exists());
+    assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && runtime::read_marker(&layout.engine_root).is_none());
+    assert_eq!(progress.steps.iter().find(|s| s.key == "runtime").map(|s| s.state), Some(StepState::Done));
+    assert_eq!(progress.steps.iter().find(|s| s.key == "unpack").map(|s| s.state), Some(StepState::Failed));
+    assert_eq!(rig.net.total_served(), 0, "the corrupt file never went back to the network");
+
+    // The next start: it comes down whole and the setup finishes.
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), asset.size);
+}
+
+#[test]
+fn repairing_a_damaged_macos_engine_reunpacks_it_and_leaves_the_data_folder_alone() {
+    let rig_mac = MacOs::new();
+    let rig = &rig_mac.rig;
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+    let mut job = rig_mac.job();
+    job.manifest.comfy.assets.get_mut("macos_arm64").unwrap().executables = vec!["ComfyUI/main.py".into()];
+    rig.run_job(job, plenty).0.unwrap();
+    let layout = rig_mac.layout.clone();
+    let main_py = layout.engine_root.join("ComfyUI").join("main.py");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&main_py).unwrap().permissions().mode() & 0o777, 0o755, "unpacked executable");
+    }
+    // The user's own things in the data folder beside the engine: a repair must not go near them.
+    let kept = layout.data_dir.join("my-workflow.json");
+    std::fs::write(&kept, b"{}").unwrap();
+
+    // Damage: the Python the plan checks for is gone (an antivirus took it), and main.py lost
+    // its executable bit. The marker still says the folder is this setup's own.
+    std::fs::remove_file(&layout.python).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&main_py, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Repair (recheck: true): the engine comes back whole - Python, the executable bit, and a
+    // valid marker - its archive taken down again, and `<engineDir>/data` untouched. This run
+    // exposed a real bug: unpack refused the engine folder its own earlier unpack had filled
+    // ("already exists and is not empty"), so a damaged engine could never be repaired. The fix
+    // is in `unpack_step` (install.rs): a folder carrying this app's marker is cleared for the
+    // fresh unpack; a folder without it still gets unpack's refusal.
+    let mut job = rig_mac.job();
+    job.manifest.comfy.assets.get_mut("macos_arm64").unwrap().executables = vec!["ComfyUI/main.py".into()];
+    job.choices.recheck = true;
+    let served_before = rig.net.served(&rig.manifest, "runtime");
+    let done = rig.run_job(job, plenty).0.unwrap();
+    assert_eq!(std::fs::read(&layout.python).unwrap(), b"MZ python", "the engine's Python is back");
+    assert_eq!(std::fs::read(&main_py).unwrap(), b"print('comfy')");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&main_py).unwrap().permissions().mode() & 0o777, 0o755, "the executable bit is restored");
+    }
+    assert_eq!(std::fs::read(&kept).unwrap(), b"{}", "the repair never went near the data folder");
+    assert_eq!(rig.net.served(&rig.manifest, "runtime") - served_before, size, "a fresh engine archive, nothing else");
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), 2 * size);
+}
+
+#[test]
+fn a_macos_repair_never_touches_a_model_file_it_already_verified() {
+    let rig_mac = MacOs::new();
+    let rig = &rig_mac.rig;
+    let mut job = rig_mac.job();
+    job.choices.models = vec!["qwen-image-2-1".into()];
+    let done = rig.run_job(job, plenty).0.unwrap();
+    assert_eq!(done.installed, ["qwen-image-2-1"]);
+    let layout = rig_mac.layout.clone();
+    let keys: Vec<String> = rig.manifest.model("qwen-image-2-1").unwrap().files.clone();
+    // Every model file as it stands after the install: bytes, length and modification time.
+    let whole: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = keys
+        .iter()
+        .map(|k| layout.model_file(k).unwrap())
+        .map(|p| (p.clone(), std::fs::metadata(&p).unwrap().modified().unwrap(), std::fs::metadata(&p).unwrap().len()))
+        .collect();
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+    let model_bytes: u64 = keys.iter().map(|k| rig.manifest.files[k].size).sum();
+    let runtime_before = rig.net.served(&rig.manifest, "runtime");
+    let models_before: Vec<u64> = keys.iter().map(|k| rig.net.served(&rig.manifest, k)).collect();
+
+    // Damage the engine only; a recheck run then looks at every file again.
+    std::fs::remove_file(&layout.python).unwrap();
+    let mut job = rig_mac.job();
+    job.choices.models = vec!["qwen-image-2-1".into()];
+    job.choices.recheck = true;
+    let done = rig.run_job(job, plenty).0.unwrap();
+    assert_eq!(done.installed, ["qwen-image-2-1"]);
+    // The engine came down again; each model file was checked where it stands: not asked for,
+    // not rewritten - the same length and the same modification time.
+    assert_eq!(rig.net.served(&rig.manifest, "runtime") - runtime_before, size);
+    for (key, served) in keys.iter().zip(&models_before) {
+        assert_eq!(rig.net.served(&rig.manifest, key), *served, "{key} was fetched again");
+    }
+    for ((path, when, len), key) in whole.iter().zip(&keys) {
+        let after = std::fs::metadata(path).unwrap();
+        assert_eq!((after.len(), after.modified().unwrap()), (*len, *when), "`{}` was rewritten", path.display());
+        assert_eq!(std::fs::read(path).unwrap(), contents(key));
+    }
+    // Two engine archives over the whole test and one copy of every model file: the repair
+    // cost a second engine and not a single model byte.
+    assert_eq!(rig.net.total_served(), 2 * size + model_bytes, "the repair fetched more than a fresh engine");
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), 2 * size);
 }
 
 #[test]
