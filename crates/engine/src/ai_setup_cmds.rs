@@ -10,6 +10,8 @@
 //! - `ai.setup.plan` says what a choice of models and folders would download and how much room
 //!   it needs.
 //! - `ai.setup.status` reports the setup that is running, or how the last one ended.
+//! - `ai.setup.diagnostics` gathers why the setup stands as it does into one secret-free JSON
+//!   report the user can copy and send (`photocraft_aisetup::diagnostics` does the redacting).
 //! - `ai.setup.start`, `ai.setup.cancel`, `ai.setup.repair` and `ai.setup.remove` install, stop,
 //!   fix and delete.
 //! - Hugging Face, for the gated models: `ai.setup.hfStatus` (signed in, as whom),
@@ -18,7 +20,8 @@
 //!   `ai.setup.setToken` (an access token, the fallback) and `ai.setup.hfUseFound` (the sign-in
 //!   found on this PC, on the user's click).
 //!
-//! The reading ones (probe, manifest, plan, status, hfStatus, hfAccess) are open to agents. The
+//! The reading ones (probe, manifest, plan, status, diagnostics, hfStatus, hfAccess) are open to
+//! agents. The
 //! rest download and start a program, delete files, or sign in and out: they are the user's to
 //! decide, and the automation guard refuses them (`photocraft_automation::workspace`), as it
 //! refuses changing the launch settings. No command ever reports a token.
@@ -63,10 +66,12 @@ fn fit(model: &photocraft_aisetup::manifest::ModelEntry, vram_gb: Option<u64>) -
 /// What the wizard offers, with sizes: `{comfy, models, presets, suggested}`. `installed`
 /// (manifest ids) marks the models that are there already, and `linked` those of them that are
 /// there only because the user's own models folders have their files (they are not the setup's
-/// to delete). A small card is offered the light preset, its models listed first.
+/// to delete). The suggested preset follows this host: the Apple-silicon set on an
+/// Apple-silicon Mac, else the light preset on a small card; its models are listed first.
 fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb: Option<u64>) -> Value {
+    let host = photocraft_aisetup::RuntimePlatform::host();
     let models: Vec<Value> = m
-        .offered(vram_gb)
+        .offered_for(host, vram_gb)
         .into_iter()
         .map(|model| {
             let files: Vec<Value> =
@@ -82,11 +87,16 @@ fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb
         .collect();
     let presets: serde_json::Map<String, Value> =
         m.presets.iter().map(|(name, ids)| (name.clone(), json!({"models": ids, "bytes": m.download_bytes(ids)}))).collect();
-    let assets: serde_json::Map<String, Value> =
-        m.comfy.assets.iter().map(|(name, a)| (name.clone(), json!({"bytes": a.size, "unpackedBytes": a.unpacked_bytes}))).collect();
+    // Only the builds this computer could actually run are worth offering; a host with no
+    // managed build (Linux, an Intel Mac, the browser) still sees every build.
+    let build = |a: &photocraft_aisetup::manifest::Asset| json!({"bytes": a.size, "unpackedBytes": a.unpacked_bytes});
+    let assets: serde_json::Map<String, Value> = match host {
+        Some(platform) => m.assets_for(platform).into_iter().map(|(name, a)| (name.to_string(), build(a))).collect(),
+        None => m.comfy.assets.iter().map(|(name, a)| (name.clone(), build(a))).collect(),
+    };
     json!({
         "version": m.version, "checked": m.checked, "comfy": {"version": m.comfy.version, "builds": assets}, "models": models, "presets": presets,
-        "suggested": m.suggested_preset(vram_gb),
+        "suggested": m.suggested_preset_for(host, vram_gb),
     })
 }
 
@@ -120,6 +130,23 @@ mod native {
 
     /// How many of the engine's last lines `ai.setup.status` reports.
     const ENGINE_LINES: usize = 40;
+    /// How much of the engine's log `ai.setup.diagnostics` reads from the end: the report keeps
+    /// the last 200 lines, and no line of a log is a paragraph.
+    const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+    /// What `ai.setup.diagnostics` reports as `record`: the setup's own choices, and nothing that
+    /// could be a secret — the sign-in is only ever the boolean `tokenExists`. `ai.setup.status`
+    /// shows the same fields.
+    fn record_value(record: &SetupState, token_exists: bool) -> Value {
+        json!({
+            "phase": record.phase, "route": record.choices.route, "models": record.choices.models,
+            "engineDir": record.choices.engine_dir, "modelsDir": record.choices.models_dir,
+            "extraModelsDirs": record.choices.extra_models_dirs, "platform": record.choices.platform,
+            "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
+            "comfyVersion": record.comfy_version, "installed": record.installed, "error": record.error,
+            "tokenExists": token_exists,
+        })
+    }
 
     /// What a setup needs from the app. Installed by the desktop shell.
     #[derive(Clone)]
@@ -379,15 +406,37 @@ mod native {
         let or_default = |given: Option<String>, saved: &str, default: &str| {
             given.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| if saved.trim().is_empty() { default.to_string() } else { saved.to_string() })
         };
-        let variant = text_param(p, "variant", cmd)?
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| if record.choices.variant.is_empty() { "nvidia".into() } else { record.choices.variant.clone() });
-        if route == Route::Managed && !m.comfy.assets.contains_key(&variant) {
-            let known: Vec<&str> = m.comfy.assets.keys().map(String::as_str).collect();
+        let want_variant = text_param(p, "variant", cmd)?.filter(|v| !v.is_empty());
+        let want_platform = match text_param(p, "platform", cmd)?.as_deref() {
+            None | Some("") => None,
+            Some("windowsPortable") => Some(runtime::RuntimePlatform::WindowsPortable),
+            Some("macosArm64") => Some(runtime::RuntimePlatform::MacosArm64),
+            Some(_) => return Err(bad(cmd, "`platform` must be windowsPortable|macosArm64")),
+        };
+        // A managed build must run on this computer: a parameter naming another platform, or a
+        // variant this platform does not own, is refused, and a record saved for another platform
+        // is not reused (the host's own build applies), so a Mac never plans or downloads a
+        // Windows build and Windows keeps its historic choices.
+        let saved = (!record.choices.variant.trim().is_empty()).then(|| (record.choices.platform, record.choices.variant.as_str()));
+        let (platform, variant) = match (route, runtime::RuntimePlatform::host()) {
+            (Route::Managed, Some(host)) => {
+                photocraft_aisetup::platform::resolve_runtime(Some(host), want_platform, want_variant.as_deref(), saved).map_err(|why| bad(cmd, why))?
+            }
+            // A ComfyUI of the user's own runs wherever it runs; its record's platform and
+            // variant are only carried along, as before. A host without a managed build of its
+            // own (Linux, an Intel Mac) stays as it was too: the wizard never offers it one.
+            _ => (
+                want_platform.unwrap_or(record.choices.platform),
+                want_variant.unwrap_or_else(|| if record.choices.variant.is_empty() { "nvidia".into() } else { record.choices.variant.clone() }),
+            ),
+        };
+        if route == Route::Managed && !m.assets_for(platform).contains_key(variant.as_str()) {
+            let known: Vec<&str> = m.assets_for(platform).keys().copied().collect();
             return Err(bad(cmd, format!("`variant` must be {}", known.join("|"))));
         }
         Ok(Choices {
             route,
+            platform,
             models,
             engine_dir: or_default(text_param(p, "engineDir", cmd)?, &record.choices.engine_dir, &env.engine_dir),
             models_dir: or_default(text_param(p, "modelsDir", cmd)?, &record.choices.models_dir, &env.models_dir),
@@ -503,11 +552,13 @@ mod native {
                 Ok(found)
             },
             move |_, found: probe::Probe| {
-                let (variant, tried) = found.variant();
-                let vram_gb = found.gpu().and_then(|g| g.vram_mb).map(|mb| (mb as f64 / 1024.0).round() as u64);
+                let target = found.runtime_target();
+                let (variant, tried) = target.as_ref().map_or_else(|| found.variant(), |target| (target.variant(), target.is_qualified()));
+                let vram_gb = found.model_memory_mb().map(|mb| (mb as f64 / 1024.0).round() as u64);
                 Ok(json!({
-                    "probe": found, "checks": found.checks(), "variant": variant, "variantTested": tried, "canInstall": found.can_install(),
-                    "gpuUsable": found.usable_gpu().is_some(),
+                    "probe": found, "checks": found.checks(), "runtimeTarget": target,
+                    "variant": variant, "variantTested": tried, "canInstall": found.can_install(),
+                    "gpuUsable": found.has_usable_acceleration(),
                     "vramGb": vram_gb, "defaults": defaults,
                 }))
             },
@@ -570,7 +621,7 @@ mod native {
         // they are chosen.
         let mut folder_problems: Vec<String> = Vec::new();
         let managed = choices.route == Route::Managed;
-        if managed && let Some(why) = m.asset(&choices.variant).ok().and_then(|asset| plan::path_too_long(asset, &layout)) {
+        if managed && let Some(why) = m.asset(&choices.variant).ok().and_then(|asset| plan::path_too_long(choices.platform, asset, &layout)) {
             folder_problems.push(why);
         }
         let (engine_free, models_free) = (free(&choices.engine_dir).filter(|_| managed), free(&choices.models_dir));
@@ -591,7 +642,7 @@ mod native {
             "needsSignIn": needs_sign_in,
             "route": choices.route, "models": planned.models, "steps": planned.steps,
             "downloadBytes": planned.download_bytes, "engineBytes": planned.engine_bytes, "modelsBytes": planned.models_bytes,
-            "engineDir": choices.engine_dir, "modelsDir": choices.models_dir, "variant": choices.variant, "cpu": choices.cpu,
+            "engineDir": choices.engine_dir, "modelsDir": choices.models_dir, "platform": choices.platform, "variant": choices.variant, "cpu": choices.cpu,
             "engineFree": engine_free, "modelsFree": models_free, "sameDrive": same_drive,
             "token": choices.token, "problems": problems, "folderProblems": folder_problems, "modelProblems": room.models,
         }))
@@ -627,7 +678,7 @@ mod native {
         let engines: Vec<Value> = match record.choices.route {
             Route::Managed if !record.choices.engine_dir.trim().is_empty() => runtime::installed_engines(Path::new(&record.choices.engine_dir))
                 .into_iter()
-                .map(|(path, marker)| json!({"version": marker.version, "variant": marker.variant, "folder": path.to_string_lossy()}))
+                .map(|(path, marker)| json!({"platform": marker.platform, "version": marker.version, "variant": marker.variant, "folder": path.to_string_lossy()}))
                 .collect(),
             _ => Vec::new(),
         };
@@ -649,12 +700,99 @@ mod native {
             "engine": engine,
             "record": {
                 "phase": record.phase, "route": record.choices.route, "models": record.choices.models, "engineDir": record.choices.engine_dir,
-                "modelsDir": record.choices.models_dir, "extraModelsDirs": record.choices.extra_models_dirs, "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
+                "modelsDir": record.choices.models_dir, "extraModelsDirs": record.choices.extra_models_dirs, "platform": record.choices.platform,
+                "variant": record.choices.variant, "cpu": record.choices.cpu, "port": record.port,
                 "comfyVersion": record.comfy_version, "installed": record.installed, "error": record.error, "offered": record.offered,
             },
             "engines": engines, "installedNow": installed_now(s), "progress": progress,
             "result": s.ai_setup.last.as_ref().map(finished_value), "token": !s.ai.hf_token().is_empty(),
         }))
+    }
+
+    /// `ai.setup.diagnostics`: the secret-free report a user with a failed setup can send to
+    /// support. Reads only, from this session, this disk and the engine's log file: this machine
+    /// (its system and memory, through the probe's hardware stage alone — no host is asked), the
+    /// setup record's choices with the sign-in reduced to a boolean, the engine's marker, how the
+    /// last setup ended, free room in both folders, and the engine's last log lines. Every string
+    /// passes through [`redact`](photocraft_aisetup::diagnostics::redact); nothing is written and
+    /// nothing is sent. It answers whatever the session holds — no setup at all included.
+    pub(super) fn diagnostics(s: &mut Session, _: &Value) -> Result<Value> {
+        // The hardware part of `ai.setup.probe`, asked on the spot and without its network
+        // stages: a report never reaches out, so these refuse instead of fetching.
+        struct NoNetwork;
+        impl photocraft_aigen::Transport for NoNetwork {
+            fn send(&self, _: &photocraft_aigen::Request) -> photocraft_aigen::Result<photocraft_aigen::Response> {
+                Err(photocraft_aigen::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+        }
+        impl Fetch for NoNetwork {
+            fn head(&self, _: &str, _: Option<&str>) -> photocraft_aisetup::Result<photocraft_aisetup::fetch::Head> {
+                Err(photocraft_aisetup::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+            fn fetch(
+                &self,
+                _: &photocraft_aisetup::fetch::Request<'_>,
+                _: &mut dyn photocraft_aisetup::fetch::Sink,
+                _: &dyn Fn() -> bool,
+            ) -> photocraft_aisetup::Result<()> {
+                Err(photocraft_aisetup::Error::Server("a diagnostics report never reaches the network".into()))
+            }
+        }
+        // Cancelled after the hardware stage: the system, its memory and its cards are read,
+        // no ComfyUI is looked for and no host is asked. Without the bundled manifest (never in
+        // a built app) the report simply says less about the machine.
+        let probe = bundled().ok().map(|m| probe::collect(&m, &NoNetwork, &NoNetwork, &[], &|| true, &|_: probe::Stage| ()));
+        let record = s.ai_setup.record();
+        let token_exists = !s.ai.hf_token().is_empty();
+        // The engine this app installed, if it is there: its build, not the record's wish.
+        let marker = match record.choices.route {
+            Route::Managed if !record.choices.engine_dir.trim().is_empty() => runtime::installed_engines(Path::new(&record.choices.engine_dir))
+                .pop()
+                .map(|(_, marker)| (json!(marker.platform).as_str().unwrap_or_default().to_string(), marker.version, marker.variant)),
+            _ => None,
+        };
+        let folder = |dir: &str| {
+            let dir = dir.trim();
+            (!dir.is_empty()).then(|| photocraft_aisetup::diagnostics::DirFacts { path: dir.to_string(), free: free(dir) })
+        };
+        // The log the app's own ComfyUI writes to, from its end: `report` keeps 200 lines and
+        // redacts them. A server that never started, or a log that cannot be read, is `null`.
+        let log = s.ai.server.as_ref().and_then(|server| server.log_file()).and_then(|path| log_tail(Path::new(&path)));
+        Ok(photocraft_aisetup::diagnostics::report(photocraft_aisetup::diagnostics::Facts {
+            app_version: crate::build_info::long_version(),
+            os: probe.as_ref().map(|p| p.os.name.clone()).filter(|n| !n.is_empty()),
+            os_version: probe.as_ref().map(|p| p.os.version.clone()).filter(|n| !n.is_empty()),
+            os_architecture: Some(probe.as_ref().map_or_else(
+                || std::env::consts::ARCH.to_string(),
+                |p| match p.os.architecture.as_str() {
+                    "" => std::env::consts::ARCH.to_string(),
+                    a => a.to_string(),
+                },
+            )),
+            memory_mb: probe.as_ref().and_then(photocraft_aisetup::probe::Probe::model_memory_mb),
+            runtime_target: probe.as_ref().and_then(|p| p.runtime_target()).and_then(|t| serde_json::to_value(t).ok()),
+            runtime_qualified: probe.as_ref().and_then(|p| p.runtime_target()).is_some_and(|t| t.is_qualified()),
+            record: (record.phase != Phase::None).then(|| record_value(&record, token_exists)),
+            marker,
+            last_finished: s.ai_setup.last().map(|f| json!({"ok": f.ok, "cancelled": f.cancelled, "error": f.error})),
+            engine_folder: folder(&record.choices.engine_dir),
+            models_folder: folder(&record.choices.models_dir),
+            log,
+            token_exists,
+        }))
+    }
+
+    /// The last bytes of the engine's log, so a long one is not read whole for 200 lines.
+    fn log_tail(path: &Path) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > LOG_TAIL_BYTES {
+            file.seek(SeekFrom::End(-(LOG_TAIL_BYTES as i64))).ok()?;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Start the setup `choices` describe.
@@ -727,6 +865,15 @@ mod native {
         if record.phase == Phase::None || record.choices.models_dir.trim().is_empty() {
             return Err(EngineError::Other("There is no setup to repair yet: set up local AI first.".into()));
         }
+        // A managed record names the build its machine was asked to install, and repair unpacks
+        // exactly that build. On a computer that is not its own — settings moved to a Mac, say —
+        // repairing would install something that can never run here: refuse, the way a plan or
+        // the wizard refuses an explicit request for another computer's build. A host with no
+        // managed build of its own repairs what it always could.
+        if let (Route::Managed, Some(host)) = (record.choices.route, photocraft_aisetup::RuntimePlatform::host()) {
+            let variant = (!record.choices.variant.is_empty()).then_some(record.choices.variant.as_str());
+            photocraft_aisetup::platform::resolve_runtime(Some(host), Some(record.choices.platform), variant, None).map_err(EngineError::Other)?;
+        }
         let choices = Choices { recheck: true, test_image: true, token: !s.ai.hf_token().is_empty(), ..record.choices };
         begin(s, choices, None, None, cmd)
     }
@@ -742,6 +889,8 @@ mod native {
     /// `ai.setup.remove`: delete what the setup installed. `{"engine": true}` removes the
     /// engine (and stops it), `{"models": true}` every model file the setup lists,
     /// `{"models": [id, …]}` those models' files (a file another installed model uses stays).
+    /// `{"data": true}` goes only with `engine: true` and then also deletes the engine's data
+    /// folder: the user's ComfyUI workflows, uploads and output. Without it that folder stays.
     /// Only the folders of the setup's own record are touched, and in them only what the setup
     /// puts there.
     pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -753,6 +902,10 @@ mod native {
         }
         let m = manifest(s)?;
         let engine = flag_param(p, "engine", false, cmd)?;
+        let data = flag_param(p, "data", false, cmd)?;
+        if data && !engine {
+            return Err(bad(cmd, "`data` deletes ComfyUI's workflows and output along with the engine: say `engine: true` to remove it too"));
+        }
         let all_ids: Vec<String> = m.models.iter().map(|x| x.id.clone()).collect();
         let models: Vec<String> = match p.get("models") {
             None | Some(Value::Null) | Some(Value::Bool(false)) => Vec::new(),
@@ -783,7 +936,9 @@ mod native {
             if let Some(server) = &s.ai.server {
                 server.stop();
             }
-            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir)).map_err(setup_error)?);
+            // The engine's data folder (its workflows, uploads and output) stays, like the
+            // models do, unless the user explicitly asked for it with `data`.
+            freed = freed.saturating_add(runtime::remove_engines(Path::new(&record.choices.engine_dir), data).map_err(setup_error)?);
         }
         // The settings follow the disk: what can no longer run is unticked, and an engine that
         // is gone is no longer started.
@@ -906,9 +1061,7 @@ mod native {
     /// then the user's own folders (`yours`), only read. `found: false` is a folder that isn't
     /// there now (a drive that isn't plugged in, say): it lists nothing.
     fn listing(record: &SetupState) -> Value {
-        let entry = |path: &str, kind: &str, files: BTreeMap<String, Vec<String>>| {
-            json!({"path": path, "kind": kind, "found": Path::new(path).is_dir(), "files": files})
-        };
+        let entry = |path: &str, kind: &str, files: BTreeMap<String, Vec<String>>| json!({"path": path, "kind": kind, "found": Path::new(path).is_dir(), "files": files});
         let mut out = Vec::new();
         let own = record.choices.models_dir.trim();
         if record.phase != Phase::None && !own.is_empty() {
@@ -1187,6 +1340,10 @@ mod web {
     pub(super) fn hf_use_found(_: &mut Session, _: &Value) -> Result<Value> {
         Err(unsupported())
     }
+
+    pub(super) fn diagnostics(_: &mut Session, _: &Value) -> Result<Value> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1215,7 +1372,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Check This PC for Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],variant (the ComfyUI build for the graphics card),variantTested,canInstall,gpuUsable (a graphics card the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb,defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
+            params: r##"{} → {probe:{os:{name,version,sixtyFourBit,windows},gpus:[{name,vendor,vramMb,driver}],drives:[{name,free,total}],comfy:{running:[url],installed:{python,folder,args}?,models:[folder] (where it reads model files, where it saves new ones first)},hosts:[{name,ok,note}]},checks:[{id:os|gpu|disk|comfy|net,level:ok|info|warn|stop,title,detail,value}],runtimeTarget:{platform:windowsPortable|macosArm64,variant,qualified}?,variant (legacy selected build),variantTested,canInstall,gpuUsable (a GPU or Apple Silicon accelerator the engine can use; without one a new ComfyUI installs only with cpu:true),vramGb (the card's memory in GB, or an Apple Silicon Mac's unified memory where no card is reported),defaults:{engineDir,modelsDir}}: what this machine has for running local models. Changes nothing"##,
             enabled: can_install,
             run: imp::probe,
             journal: false,
@@ -1225,7 +1382,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Local AI Models to Install",
             menu: &[],
             shortcut: None,
-            params: r##"{"vramGb":int?,"extraModelsDirs":[path,…]? (count these as the engine's, instead of the last setup's)} → {comfy:{version,builds},models:[{id,name,about,family,does:[create|edit|fill],licence:{name,url,commercial (true|false|null: read the licence)},page,gated (needs a Hugging Face sign-in),minVramGb,testedVramGb,bytes (downloaded alone),files:[{key,bytes,gated}],installed,linked (installed only because the user's own models folders have its files: not the setup's to delete),fit:tested|untested|tooLarge,minComfy (the first ComfyUI version that runs it)}],presets:{light|starter|recommended|everything:{models,bytes (shared files counted once)}},suggested:light|recommended (the preset to start on: light on a card under 16 GB, its models then listed first)}: what the setup can install"##,
+            params: r##"{"vramGb":int?,"extraModelsDirs":[path,…]? (count these as the engine's, instead of the last setup's)} → {comfy:{version,builds},models:[{id,name,about,family,does:[create|edit|fill],licence:{name,url,commercial (true|false|null: read the licence)},page,gated (needs a Hugging Face sign-in),minVramGb,testedVramGb,bytes (downloaded alone),files:[{key,bytes,gated}],installed,linked (installed only because the user's own models folders have its files: not the setup's to delete),fit:tested|untested|tooLarge,minComfy (the first ComfyUI version that runs it)}],presets:{apple-silicon|light|starter|recommended|everything:{models,bytes (shared files counted once)}},suggested:apple-silicon|light|recommended (the preset to start on: the Apple-silicon set on an Apple-silicon Mac, else light on a card under 16 GB, its models then listed first)}: what the setup can install"##,
             enabled: always,
             run: imp::manifest_cmd,
             journal: false,
@@ -1235,7 +1392,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Plan Local AI Setup",
             menu: &[],
             shortcut: None,
-            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"variant":"nvidia|nvidia_cu126|amd|intel"?,"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
+            params: r##"{"models":[id,…]?=the last setup's,"route":"managed|existing"?,"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?=this computer's (one it can't run is refused),"variant":"nvidia|nvidia_cu126|amd|intel|macos_arm64"?=this computer's build (one it can't run is refused),"cpu":bool=false (managed: run the engine on the processor, for a PC with no graphics card it can use),"recheck":bool=false,"serverFiles":{folder:[file,…]}? (existing: what the server has),"extraModelsDirs":[path,…]?=the last setup's (managed: the user's own models folders, see ai.setup.modelFolders)} → {platform,steps:[{step,label,bytes,have,done,recheck,skipped,linked (the user's folder that has the file, so it is not downloaded)?}],models:[{id,name,skipped}],downloadBytes,engineBytes,modelsBytes,engineFree,modelsFree,problems:[str],folderProblems:[str] (only other folders fix these),modelProblems:[str] (fewer models fix these)}: what a setup would download and the room it needs, given what is already on disk. Changes nothing"##,
             enabled: can_install,
             run: imp::plan_cmd,
             journal: false,
@@ -1245,9 +1402,19 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Local AI Setup Status",
             menu: &[],
             shortcut: None,
-            params: r##"{} → {available,state:none|running|paused|failed|interrupted|done,running,record:{phase,route,models,engineDir,modelsDir,extraModelsDirs,variant,port,comfyVersion,installed,error},engines:[{version,variant,folder}],installedNow:[id],modelFiles:{folder:[file]}? (the installed engine's model files, in its own folder and the user's own folders it reads; null for the user's own ComfyUI),progress:{steps:[{key,label,state:pending|active|done|failed|skipped,done,total,note,download}],bytesDone,bytesTotal,speed (bytes/s),etaSeconds,message}?,result:{ok,cancelled,error,installed,skipped,ready,testImage:{model,modelName,seconds,width,height}?,testError}?,engine:{output:[line] (the last 40 lines the engine the app started printed),log (where all of it is)}? (while a setup runs or after it failed),token (a Hugging Face token is stored)}"##,
+            params: r##"{} → {available,state:none|running|paused|failed|interrupted|done,running,record:{phase,route,models,engineDir,modelsDir,extraModelsDirs,platform,variant,port,comfyVersion,installed,error},engines:[{platform,version,variant,folder}],installedNow:[id],modelFiles:{folder:[file]}? (the installed engine's model files, in its own folder and the user's own folders it reads; null for the user's own ComfyUI),progress:{steps:[{key,label,state:pending|active|done|failed|skipped,done,total,note,download}],bytesDone,bytesTotal,speed (bytes/s),etaSeconds,message}?,result:{ok,cancelled,error,installed,skipped,ready,testImage:{model,modelName,seconds,width,height}?,testError}?,engine:{output:[line] (the last 40 lines the engine the app started printed),log (where all of it is)}? (while a setup runs or after it failed),token (a Hugging Face token is stored)}"##,
             enabled: always,
             run: imp::status,
+            journal: false,
+        },
+        CommandSpec {
+            id: "ai.setup.diagnostics",
+            label: "Local AI Setup Diagnostics",
+            menu: &[],
+            shortcut: None,
+            params: r##"{} → {app,os,osVersion,osArchitecture,memoryMb,runtimeTarget,runtimeQualified,record,engine,lastFinished,engineFolder,modelsFolder,engineLog,tokenExists}: why the setup stands as it does, as one JSON for sending to support. Reads only: nothing is written, nothing is sent, and every secret (tokens, keys, passwords) and the home folder in paths is replaced. It answers even with no setup"##,
+            enabled: always,
+            run: imp::diagnostics,
             journal: false,
         },
         CommandSpec {
@@ -1255,7 +1422,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Set Up Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"variant":str?,"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
+            params: r##"{"route":"managed|existing"="managed" (managed: install a private ComfyUI; existing: use the one at `url`, downloading only missing model files),"models":[id,…],"engineDir":str?,"modelsDir":str?,"platform":"windowsPortable|macosArm64"?=this computer's (one it can't run is refused),"variant":str?=this computer's build (one it can't run is refused),"cpu":bool=false (managed: run the engine on the processor; no test image then),"testImage":bool=true,"recheck":bool=false,"url":str? (existing),"launch":{python,folder,args}? (existing),"serverFiles":{folder:[file,…]}? (existing),"extraModelsDirs":[path,…]? (managed: the user's own models folders, read and never changed)} → ai.setup.status. Downloads, unpacks and starts a program: the user's to run from the wizard; automation is refused. Continues an interrupted setup from what is on disk"##,
             enabled: can_install,
             run: imp::start,
             journal: false,
@@ -1285,7 +1452,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Remove Local AI",
             menu: &[],
             shortcut: None,
-            params: r##"{"engine":bool=false,"models":true|[id,…]?} → {freed,freedText,installed,engine}: deletes the engine this app installed and/or model files it lists (a file another installed model uses stays). A ComfyUI the user set up themselves is never touched"##,
+            params: r##"{"engine":bool=false,"models":true|[id,…]?,"data":bool=false (only with `engine`: true, also deletes the engine's data folder: the user's ComfyUI workflows, uploads and output; on its own it is an error)} → {freed,freedText,installed,engine}: deletes the engine this app installed and/or model files it lists (a file another installed model uses stays). That data folder stays, like the models, unless `data` asks for it. A ComfyUI the user set up themselves is never touched"##,
             enabled: can_install,
             run: imp::remove,
             journal: false,

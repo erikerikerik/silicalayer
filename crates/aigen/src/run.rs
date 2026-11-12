@@ -638,11 +638,14 @@ mod tests {
     }
 
     /// A ComfyUI that says over its websocket what it does with the render (`messages`), and has
-    /// the image ready once it has said all of it.
+    /// the image ready once it has said all of it. It paces its messages by `polled`, so the
+    /// render's own loop decides when the next one may replace what it is reporting.
     struct Talking {
         messages: Vec<String>,
         said: AtomicBool,
         asked: Mutex<String>,
+        /// History polls since the last websocket message landed; see `listen`.
+        polled: AtomicU32,
     }
 
     impl Transport for Talking {
@@ -654,7 +657,10 @@ mod tests {
                     assert!(self.asked.lock().unwrap().ends_with(body["client_id"].as_str().unwrap()), "{body}");
                     ok(r#"{"prompt_id":"abc"}"#)
                 }
-                u if u.ends_with("/history/abc") => ok(if self.said.load(Ordering::Relaxed) { DONE } else { "{}" }),
+                u if u.ends_with("/history/abc") => {
+                    self.polled.fetch_add(1, Ordering::Relaxed);
+                    ok(if self.said.load(Ordering::Relaxed) { DONE } else { "{}" })
+                }
                 u if u.contains("/view?") => ok("PNGDATA"),
                 u => panic!("unexpected request {u}"),
             }
@@ -663,12 +669,23 @@ mod tests {
         fn listen(&self, url: &str, stop: &dyn Fn() -> bool, on_text: &mut dyn FnMut(&str)) -> Result<()> {
             *self.asked.lock().unwrap() = url.to_string();
             on_text(r#"{"type":"status","data":{}}"#);
-            // Each message once the render has had time to report the last (polls come every 40 ms).
+            // One message per two history polls, not one per 150 ms of the clock: every poll is
+            // preceded by the render reading what ComfyUI says it is doing (poll_comfy reports
+            // it before the poll that follows), so two polls of a state say the render has
+            // reported it - no matter how long a busy host stalls either thread. (With fixed
+            // sleeps the render could sleep straight past a 150 ms state, and this test flaked
+            // missing "Rendering with Z-Image Turbo: step 4 of 8".) The bound only runs if the
+            // render has already given up, which `stop` says, so it cannot hang the scope.
             for message in &self.messages {
-                std::thread::sleep(Duration::from_millis(150));
                 on_text(message);
+                self.polled.store(0, Ordering::Relaxed);
+                for _ in 0..2_000 {
+                    if stop() || self.polled.load(Ordering::Relaxed) >= 2 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
-            std::thread::sleep(Duration::from_millis(150));
             self.said.store(true, Ordering::Relaxed);
             while !stop() {
                 std::thread::sleep(Duration::from_millis(5));
@@ -692,7 +709,7 @@ mod tests {
             r#"{"type":"progress","data":{"value":4,"max":8}}"#.into(),
             executing("VAEDecode"),
         ];
-        let talking = Talking { messages, said: AtomicBool::new(false), asked: Mutex::new(String::new()) };
+        let talking = Talking { messages, said: AtomicBool::new(false), polled: AtomicU32::new(0), asked: Mutex::new(String::new()) };
         let said = Mutex::new(Vec::<String>::new());
         let c = Control {
             cancelled: &|| false,
@@ -702,7 +719,7 @@ mod tests {
                     said.push(words.to_string());
                 }
             },
-            // Polls of 40 ms: several for each message.
+            // Polls of 40 ms, not the production 500: `listen` waits for the two it needs per message.
             sleep: &|d| std::thread::sleep(d.min(Duration::from_millis(40))),
         };
         let g = generate(&talking, &Settings { timeout_seconds: 60, ..settings() }, &model, "", &job(), &c).unwrap();
@@ -756,7 +773,16 @@ mod tests {
             sleep: &|d| std::thread::sleep(d),
         };
         let settings = Settings { comfy_url: url, timeout_seconds: 600, ..Settings::default() };
-        let job = Job { prompt: "a lighthouse on a cliff at dusk".into(), width: 768, height: 768, seed: random_seed(), alpha: false, source: None, loras: Vec::new(), animation: None };
+        let job = Job {
+            prompt: "a lighthouse on a cliff at dusk".into(),
+            width: 768,
+            height: 768,
+            seed: random_seed(),
+            alpha: false,
+            source: None,
+            loras: Vec::new(),
+            animation: None,
+        };
         let family = if std::env::var("PHOTOCRAFT_LIVE_MODEL").is_ok_and(|m| m == "moss") { Family::MossImage } else { Family::ZImage };
         let g = generate(&crate::UreqTransport::new(), &settings, &family.preset(), "", &job, &c).unwrap();
         println!("{:>6.2} s  done: {} bytes, {}x{}", began.elapsed().as_secs_f64(), g.bytes.len(), g.width, g.height);
@@ -764,7 +790,16 @@ mod tests {
     }
 
     fn source() -> Source {
-        Source { image: b"IMAGEPNG".to_vec(), mask: b"MASKPNG".to_vec(), width: 768, height: 512, strength: 0.7, edit: false, references: Vec::new(), shown: Vec::new() }
+        Source {
+            image: b"IMAGEPNG".to_vec(),
+            mask: b"MASKPNG".to_vec(),
+            width: 768,
+            height: 512,
+            strength: 0.7,
+            edit: false,
+            references: Vec::new(),
+            shown: Vec::new(),
+        }
     }
 
     #[test]
@@ -839,7 +874,8 @@ mod tests {
 
     #[test]
     fn a_masked_edit_uploads_what_the_model_is_shown_before_the_references() {
-        const NAMES: [&str; 4] = ["photocraft_inpaint_image.png", "photocraft_inpaint_mask.png", "photocraft_edit_shown.png", "photocraft_edit_reference_1.png"];
+        const NAMES: [&str; 4] =
+            ["photocraft_inpaint_image.png", "photocraft_inpaint_mask.png", "photocraft_edit_shown.png", "photocraft_edit_reference_1.png"];
         let fake = Fake::new(|r, n| match r.url.as_str() {
             u if u.ends_with("/upload/image") => {
                 let body = String::from_utf8_lossy(&r.body).into_owned();

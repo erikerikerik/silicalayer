@@ -13,6 +13,8 @@
 //! [`find_running`] reads the launch settings off a ComfyUI that is running now, which is how
 //! the settings are filled in without the user knowing where their Python lives.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::http::{Request, Transport};
@@ -32,6 +34,12 @@ pub struct Launch {
     /// Arguments after the Python executable: the script (`main.py`) and its options, without
     /// `--port` (the port comes from the server address).
     pub args: String,
+    /// Extra environment variables for the started process. Empty for a hand-written or
+    /// Desktop-discovered launch, so stored settings and their JSON keep the shape they had
+    /// before this field existed (`skip_serializing_if`); the managed macOS launch fills it
+    /// with the offline and no-telemetry switches (see `photocraft_aisetup::runtime`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// What the app knows about the local server without asking it.
@@ -305,7 +313,12 @@ pub fn desktop_install(record: &str, config: &std::path::Path, exists: &dyn Fn(&
             }
         }
         args.extend(without_port(split_args(&text_of(e, &["launchArgs"]).unwrap_or_default())));
-        return Some(Launch { python: python.to_string_lossy().into_owned(), folder: install.to_string_lossy().into_owned(), args: join_args(&args) });
+        return Some(Launch {
+            python: python.to_string_lossy().into_owned(),
+            folder: install.to_string_lossy().into_owned(),
+            args: join_args(&args),
+            ..Launch::default()
+        });
     }
     None
 }
@@ -787,11 +800,15 @@ mod native {
             let script = args.iter().find(|a| a.to_ascii_lowercase().ends_with(".py")).cloned().unwrap_or_else(|| "main.py".into());
             let installed =
                 desktop_config_dir().map(|d| d.join("installations.json")).and_then(|f| small_text(&f)).map(|r| desktop_folders(&r)).unwrap_or_default();
-            let folder = newer_copy(Path::new(folder), Path::new(python), &script, &installed, &small_text, &|p| p.is_file()).unwrap_or_else(|| PathBuf::from(folder));
+            let folder =
+                newer_copy(Path::new(folder), Path::new(python), &script, &installed, &small_text, &|p| p.is_file()).unwrap_or_else(|| PathBuf::from(folder));
             args.push("--port".into());
             args.push(port.to_string());
             let mut cmd = Command::new(python);
             cmd.current_dir(&folder).args(&args).stdin(Stdio::null());
+            for (key, value) in &launch.env {
+                cmd.env(key, value);
+            }
             let output = |log: &Option<PathBuf>| {
                 log.as_ref().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok()).map_or_else(Stdio::null, Stdio::from)
             };
@@ -1072,7 +1089,7 @@ mod native {
         let pids: Vec<u32> = servers.iter().map(|p| p.pid).collect();
         servers.sort_by_key(|p| pids.contains(&p.parent));
         let Some(server) = servers.first() else {
-            return Ok(Launch { python: String::new(), folder: String::new(), args });
+            return Ok(Launch { python: String::new(), folder: String::new(), args, ..Launch::default() });
         };
         // The folder: the OS's answer where it gives one, else the first candidate that holds
         // the script: the script's own folder, the starting app's `resources` (ComfyUI Desktop),
@@ -1100,7 +1117,7 @@ mod native {
         // user folder, and starting the older one fails on the newer one's database.
         let version = server_version(transport, &base);
         let folder = pick_folder(&candidates, &script, version.as_deref(), &small_text, &|p| p.is_file());
-        Ok(Launch { python: server.exe.clone(), folder: folder.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(), args })
+        Ok(Launch { python: server.exe.clone(), folder: folder.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(), args, ..Launch::default() })
     }
 }
 
@@ -1123,6 +1140,21 @@ mod tests {
         for odd in ["", "http://", "http://:0", "http://127.0.0.1:99999", "http://127.0.0.1:abc", "::::"] {
             assert_eq!(port_of(odd).0, 8188, "{odd}");
         }
+    }
+
+    #[test]
+    fn an_empty_environment_is_not_written_and_old_settings_still_load() {
+        // A launch without an environment (everything but the managed macOS one) stores exactly
+        // the JSON it stored before the field existed, so Windows settings do not move.
+        let plain = Launch { python: "p".into(), folder: "f".into(), args: "main.py".into(), ..Launch::default() };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"python":"p","folder":"f","args":"main.py"}"#);
+        // With one it is kept, and reads back.
+        let managed = Launch { env: BTreeMap::from([("HF_HUB_OFFLINE".to_string(), "1".to_string())]), ..plain.clone() };
+        let json = serde_json::to_string(&managed).unwrap();
+        assert_eq!(json, r#"{"python":"p","folder":"f","args":"main.py","env":{"HF_HUB_OFFLINE":"1"}}"#);
+        assert_eq!(serde_json::from_str::<Launch>(&json).unwrap(), managed);
+        // Older settings, written without it, load with an empty environment.
+        assert_eq!(serde_json::from_str::<Launch>(r#"{"python":"p","folder":"f","args":"main.py"}"#).unwrap(), plain);
     }
 
     #[test]
@@ -1154,13 +1186,16 @@ mod tests {
         // Paths are joined with the platform's separator: compare them with forward slashes.
         let from_picked = |path: &str, current: &Launch, exists: &dyn Fn(&Path) -> bool| {
             let l = super::from_picked(path, current, exists);
-            Launch { python: l.python.replace('\\', "/"), folder: l.folder.replace('\\', "/"), args: l.args }
+            Launch { python: l.python.replace('\\', "/"), folder: l.folder.replace('\\', "/"), args: l.args, ..Launch::default() }
         };
         let on_disk = |files: &'static [&'static str]| move |p: &Path| files.iter().any(|f| Path::new(f) == p);
         // main.py of a git clone with its own virtual environment: everything follows.
         let files = on_disk(&["/home/u/ComfyUI/main.py", "/home/u/ComfyUI/.venv/bin/python"]);
         let l = from_picked("/home/u/ComfyUI/main.py", &Launch::default(), &files);
-        assert_eq!(l, Launch { python: "/home/u/ComfyUI/.venv/bin/python".into(), folder: "/home/u/ComfyUI".into(), args: "main.py".into() });
+        assert_eq!(
+            l,
+            Launch { python: "/home/u/ComfyUI/.venv/bin/python".into(), folder: "/home/u/ComfyUI".into(), args: "main.py".into(), ..Launch::default() }
+        );
         // The portable build: the embedded Python one level up, and its flag.
         let files = on_disk(&["/p/ComfyUI/main.py", "/p/python_embeded/python.exe"]);
         let l = from_picked("/p/ComfyUI/main.py", &Launch::default(), &files);
@@ -1168,9 +1203,9 @@ mod tests {
         // Picking the Python finds the folder beside it; existing choices are kept.
         let l = from_picked("/p/python_embeded/python.exe", &Launch::default(), &files);
         assert_eq!((l.folder.as_str(), l.args.as_str()), ("/p/ComfyUI", "main.py"));
-        let mine = Launch { python: "/my/python".into(), folder: "/old".into(), args: "main.py --lowvram".into() };
+        let mine = Launch { python: "/my/python".into(), folder: "/old".into(), args: "main.py --lowvram".into(), ..Launch::default() };
         let l = from_picked("/p/ComfyUI/main.py", &mine, &files);
-        assert_eq!(l, Launch { python: "/my/python".into(), folder: "/p/ComfyUI".into(), args: "main.py --lowvram".into() });
+        assert_eq!(l, Launch { python: "/my/python".into(), folder: "/p/ComfyUI".into(), args: "main.py --lowvram".into(), ..Launch::default() });
         let l = from_picked("/other/python3", &mine, &files);
         assert_eq!(l, Launch { python: "/other/python3".into(), ..mine.clone() });
         // Arguments without a script get the picked one in front.
@@ -1270,8 +1305,10 @@ mod tests {
         // What isn't a version is not known to be late enough.
         assert!(!at_least("", "0.43.0") && !at_least("nightly", "0.43.0") && !at_least("v0.43.0", "0.43.0"));
         // An installed ComfyUI's version is read beside the script it starts.
-        let desktop = Launch { python: "/d/.venv/python".into(), folder: "/installs/ComfyUI".into(), args: "ComfyUI/main.py --port 8000".into() };
-        let read = |p: &std::path::Path| (p == std::path::Path::new("/installs/ComfyUI/ComfyUI/comfyui_version.py")).then(|| "__version__ = \"0.41.0\"\n".to_string());
+        let desktop =
+            Launch { python: "/d/.venv/python".into(), folder: "/installs/ComfyUI".into(), args: "ComfyUI/main.py --port 8000".into(), ..Launch::default() };
+        let read =
+            |p: &std::path::Path| (p == std::path::Path::new("/installs/ComfyUI/ComfyUI/comfyui_version.py")).then(|| "__version__ = \"0.41.0\"\n".to_string());
         assert_eq!(version_of(&desktop, &read).as_deref(), Some("0.41.0"));
         assert_eq!(version_of(&Launch { args: String::new(), ..desktop.clone() }, &read), None);
         assert_eq!(version_of(&Launch { folder: "/elsewhere".into(), ..desktop }, &read), None);
@@ -1287,8 +1324,14 @@ mod tests {
         use std::path::{Path, PathBuf};
         let script = "ComfyUI/main.py";
         let versions = [("/engine/ComfyUI/comfyui_version.py", "0.42.1"), ("/installs/ComfyUI/ComfyUI/comfyui_version.py", "0.43.0")];
-        let read = |p: &Path| versions.iter().find(|(f, _)| Path::new(f) == p).map(|(_, v)| format!("__version__ = \"{v}\"
-"));
+        let read = |p: &Path| {
+            versions.iter().find(|(f, _)| Path::new(f) == p).map(|(_, v)| {
+                format!(
+                    "__version__ = \"{v}\"
+"
+                )
+            })
+        };
         let is_file = |p: &Path| ["/engine/ComfyUI/main.py", "/installs/ComfyUI/ComfyUI/main.py"].iter().any(|f| Path::new(f) == p);
         let installed = [PathBuf::from("/installs/ComfyUI")];
         let engine = Path::new("/engine");
@@ -1335,6 +1378,7 @@ mod tests {
             python: "/docs/ComfyUI/.venv/bin/python".into(),
             folder: "/installs/ComfyUI".into(),
             args: "ComfyUI/main.py --base-directory /docs/ComfyUI --extra-model-paths-config /cfg/inst-1.yaml --enable-manager".into(),
+            ..Launch::default()
         };
         let read = files(&[("/cfg/inst-1.yaml", SHARED)]);
         assert_eq!(slashes(models_folders(&desktop, &read, &dirs(&["/shared/models", "/docs/ComfyUI/models"]))), ["/shared/models", "/docs/ComfyUI/models"]);
@@ -1344,7 +1388,12 @@ mod tests {
         // the older way (`base_path` is a ComfyUI folder, the entries under `models/`). A folder of
         // one kind of file only is not a models folder.
         const BESIDE: &str = "comfyui:\n    base_path: /other/ComfyUI\n    checkpoints: models/checkpoints/\n    diffusion_models: |\n      models/diffusion_models\n      models/unet\n    is_default: false # not this one\ncustom:\n    diffusion_models: /loose/unets\n";
-        let portable = Launch { python: "/p/python_embeded/python.exe".into(), folder: "/p".into(), args: "ComfyUI/main.py --windows-standalone-build".into() };
+        let portable = Launch {
+            python: "/p/python_embeded/python.exe".into(),
+            folder: "/p".into(),
+            args: "ComfyUI/main.py --windows-standalone-build".into(),
+            ..Launch::default()
+        };
         let read = files(&[("/p/ComfyUI/extra_model_paths.yaml", BESIDE)]);
         assert_eq!(
             slashes(models_folders(&portable, &read, &dirs(&["/p/ComfyUI/models", "/other/ComfyUI/models", "/loose"]))),
@@ -1466,7 +1515,7 @@ mod tests {
             let e = server.ensure(&Fake(None), &s, &control(&|| false)).unwrap_err().to_string();
             assert!(e.contains("not running at http://127.0.0.1:8000") && e.contains("not set up to start it") && e.contains("Find Installation"), "{e}");
             // Set up but switched off: name the switch.
-            s.comfy_launch = Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into() };
+            s.comfy_launch = Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into(), ..Launch::default() };
             let e = server.ensure(&Fake(None), &s, &control(&|| false)).unwrap_err().to_string();
             assert!(e.contains("switched off") && e.contains("Start ComfyUI when a local model needs it") && !e.contains("Find Installation"), "{e}");
             // Another computer: nothing here can start it, whatever the switch says.
@@ -1492,7 +1541,7 @@ mod tests {
                     && e.contains("Find Installation"),
                 "{e}"
             );
-            s.comfy_launch = Launch { python: "/no/such/python".into(), folder: "/no/such/folder".into(), args: "main.py".into() };
+            s.comfy_launch = Launch { python: "/no/such/python".into(), folder: "/no/such/folder".into(), args: "main.py".into(), ..Launch::default() };
             let e = server.ensure(&Fake(None), &s, &control(&|| false)).unwrap_err().to_string();
             assert!(e.contains("could not start it") && e.contains("Python was not found at `/no/such/python`"), "{e}");
             s.comfy_url = "not a url".into();
@@ -1504,7 +1553,12 @@ mod tests {
         /// never serves the port, and exits (or is killed).
         fn stand_in() -> Launch {
             let exe = std::env::current_exe().unwrap();
-            Launch { python: exe.to_string_lossy().into_owned(), folder: exe.parent().unwrap().to_string_lossy().into_owned(), args: "--list".into() }
+            Launch {
+                python: exe.to_string_lossy().into_owned(),
+                folder: exe.parent().unwrap().to_string_lossy().into_owned(),
+                args: "--list".into(),
+                ..Launch::default()
+            }
         }
 
         #[test]

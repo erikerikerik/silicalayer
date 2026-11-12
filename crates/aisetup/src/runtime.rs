@@ -8,8 +8,9 @@ use photocraft_aigen::launch::join_args;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{FOLDERS, LEGACY_FOLDERS, Manifest, split_key};
-use crate::plan::{Layout, MARKER, PART};
+use crate::plan::{DATA_FOLDER, Layout, MARKER, PART};
 pub use crate::plan::{has_model_folders, models_root};
+pub use crate::platform::RuntimePlatform;
 use crate::{Error, Result};
 
 /// The first port tried for the engine. Not 8188 (the portable build's default) and not 8000
@@ -52,17 +53,10 @@ fn is_valid_sha256(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_known_variant(platform: RuntimePlatform, variant: &str) -> bool {
-    match platform {
-        RuntimePlatform::WindowsPortable => matches!(variant, "nvidia" | "nvidia_cu126" | "amd" | "intel"),
-        RuntimePlatform::MacosArm64 => variant == "macos_arm64",
-    }
-}
-
 fn valid_marker(marker: &Marker) -> bool {
     marker.format_version == MARKER_FORMAT_VERSION
         && !marker.version.trim().is_empty()
-        && is_known_variant(marker.platform, &marker.variant)
+        && marker.platform.accepts_variant(&marker.variant)
         && is_valid_sha256(&marker.sha256)
 }
 
@@ -222,39 +216,48 @@ pub fn list_all_models(models_dir: &Path, extra: &[PathBuf]) -> BTreeMap<String,
     out
 }
 
-/// Launch platforms as known to this setup: Windows portable build and macOS ARM64 managed runtime.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RuntimePlatform {
-    /// Windows portable build (the current implementation).
-    #[default]
-    WindowsPortable,
-    /// macOS ARM64 managed runtime (defined for future platform support; CPU mode is explicit).
-    MacosArm64,
-}
-
-impl RuntimePlatform {
-    /// The arguments for the platform: whether `--windows-standalone-build` is needed.
-    fn extra_args(self) -> &'static [&'static str] {
-        match self {
-            RuntimePlatform::WindowsPortable => &["--windows-standalone-build"],
-            RuntimePlatform::MacosArm64 => &[],
-        }
-    }
-}
-
 /// How the installed engine is started: the portable build's own command line (its
 /// `run_nvidia_gpu.bat`), without the browser it would open, with the models folder added.
 /// `cpu`: on the processor, as its `run_cpu.bat` does, for a PC without a graphics card it can use.
 pub fn launch(manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let platform = RuntimePlatform::WindowsPortable; // current default: backwards compatible
+    launch_for(RuntimePlatform::WindowsPortable, manifest, layout, cpu)
+}
+
+/// The managed macOS engine's writable folders, pointed at [`Layout::data_dir`]: each flag is
+/// [`MACOS_DATA_ARGS`] at the same position of [`crate::plan::DATA_FOLDERS`], so the two lists
+/// read as one. Together with [`MACOS_SERVER_ARGS`] and [`MACOS_LAUNCH_ENV`] these are every
+/// macOS-only addition to the launch; check them against ComfyUI 0.43.0's `comfy/cli_args.py`
+/// (the four directory flags, `--listen`, `--disable-api-nodes`) and the Hugging Face Hub and
+/// generic telemetry conventions (the environment) when the bundled ComfyUI version changes:
+/// an unknown flag makes ComfyUI refuse to start.
+pub const MACOS_DATA_ARGS: [&str; 4] = ["--user-directory", "--input-directory", "--output-directory", "--temp-directory"];
+/// Keep the managed macOS engine on the loopback interface only, and away from node code it
+/// would fetch itself (the wizard downloads everything; the server downloads nothing).
+pub const MACOS_SERVER_ARGS: [&str; 3] = ["--listen", "127.0.0.1", "--disable-api-nodes"];
+/// Environment of the managed macOS launch: no Hugging Face round-trips, and no telemetry.
+pub const MACOS_LAUNCH_ENV: [(&str, &str); 4] =
+    [("HF_HUB_OFFLINE", "1"), ("TRANSFORMERS_OFFLINE", "1"), ("HF_HUB_DISABLE_TELEMETRY", "1"), ("DO_NOT_TRACK", "1")];
+
+/// Make the managed engine's writable folders ([`Layout::data_dirs`]). Idempotent: folders that
+/// are already there are left as they are, so Repair and Continue re-run it. Nothing is ever
+/// made inside a versioned engine folder.
+pub fn create_data_dirs(layout: &Layout) -> Result<()> {
+    for dir in layout.data_dirs() {
+        std::fs::create_dir_all(&dir).map_err(|e| disk(&dir, "create the folder", &e))?;
+    }
+    Ok(())
+}
+
+/// How a managed runtime for `platform` is started. The older [`launch`] entry point remains the
+/// Windows default for callers that have no explicit managed choice.
+pub fn launch_for(platform: RuntimePlatform, manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
     build_launch_command(platform, manifest, layout, cpu)
 }
 
 /// Build the ComfyUI launch command for a given platform. This is a pure function that accepts
 /// the runtime platform explicitly (for future macOS support) and constructs the command line.
-pub fn build_launch_command(platform: RuntimePlatform, manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
-    let script = manifest.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
+pub fn build_launch_command(platform: RuntimePlatform, _manifest: &Manifest, layout: &Layout, cpu: bool) -> Launch {
+    let script = layout.script.strip_prefix(&layout.engine_root).unwrap_or(&layout.script).to_string_lossy().into_owned();
     let mut args = vec![
         // Python's `-s`: the user's own site-packages stay out of the engine.
         "-s".to_string(),
@@ -265,10 +268,21 @@ pub fn build_launch_command(platform: RuntimePlatform, manifest: &Manifest, layo
     args.push("--disable-auto-launch".into());
     args.push("--extra-model-paths-config".into());
     args.push(layout.model_paths.to_string_lossy().into_owned());
+    let mut env = BTreeMap::new();
+    if platform == RuntimePlatform::MacosArm64 {
+        // The managed macOS engine keeps everything ComfyUI writes in the data folder beside the
+        // engine folder, not inside it; and stays local, offline and untelemetered.
+        for (flag, dir) in MACOS_DATA_ARGS.iter().zip(layout.data_dirs()) {
+            args.push((*flag).to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        args.extend(MACOS_SERVER_ARGS.iter().map(|arg| (*arg).to_string()));
+        env.extend(MACOS_LAUNCH_ENV.iter().map(|(key, value)| ((*key).to_string(), (*value).to_string())));
+    }
     if cpu {
         args.push("--cpu".into());
     }
-    Launch { python: layout.python.to_string_lossy().into_owned(), folder: layout.engine_root.to_string_lossy().into_owned(), args: join_args(&args) }
+    Launch { python: layout.python.to_string_lossy().into_owned(), folder: layout.engine_root.to_string_lossy().into_owned(), args: join_args(&args), env }
 }
 
 /// The first port from `from` up that nothing on this computer listens on.
@@ -342,15 +356,25 @@ pub fn installed_engines(engine_dir: &Path) -> Vec<(PathBuf, Marker)> {
 
 /// Remove what the setup put in `engine_dir`: every engine that carries the marker, unfinished
 /// unpacks and runtime archives. Anything else in the folder is not this app's and stays.
+/// The data folder of writable engine output ([`DATA_FOLDER`]) stays too — like the models —
+/// unless `remove_data` says the user chose to delete their workflows and output with it.
 /// Returns the bytes freed.
-pub fn remove_engines(engine_dir: &Path) -> Result<u64> {
+pub fn remove_engines(engine_dir: &Path, remove_data: bool) -> Result<u64> {
     let mut freed = 0u64;
     let Ok(entries) = std::fs::read_dir(engine_dir) else { return Ok(0) };
     for entry in entries.flatten().take(10_000) {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking")) {
+        if kind.is_dir() && name == DATA_FOLDER {
+            // Not a versioned engine: the user's workflows, uploads and output, kept unless the
+            // user asked for this folder too.
+            if remove_data {
+                let size = size_of(&path);
+                std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
+                freed = freed.saturating_add(size);
+            }
+        } else if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking")) {
             let size = size_of(&path);
             std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
             freed = freed.saturating_add(size);
@@ -363,7 +387,7 @@ pub fn remove_engines(engine_dir: &Path) -> Result<u64> {
             freed = freed.saturating_add(size);
         }
     }
-    // The folder itself, when nothing else was in it.
+    // The folder itself, when nothing else was in it: it is not when the data folder stayed.
     let _ = std::fs::remove_dir(engine_dir);
     Ok(freed)
 }
@@ -630,12 +654,22 @@ mod tests {
         std::fs::write(theirs.join("keep.txt"), b"mine").unwrap();
         std::fs::write(engines.join("ComfyUI_windows_portable_nvidia.7z.part"), vec![0u8; 500]).unwrap();
         std::fs::write(engines.join("holiday.7z"), b"mine too").unwrap();
+        // The data folder of writable engine output, beside the versioned engines.
+        std::fs::create_dir_all(engines.join(DATA_FOLDER).join("user")).unwrap();
+        std::fs::write(engines.join(DATA_FOLDER).join("user").join("flow.json"), b"mine").unwrap();
         assert_eq!(installed_engines(&engines).iter().map(|(_, m)| m.version.as_str()).collect::<Vec<_>>(), ["0.39.0"]);
-        let freed = remove_engines(&engines).unwrap();
+        let freed = remove_engines(&engines, false).unwrap();
         assert!(freed >= 1500, "{freed}");
         assert!(!ours.exists() && !engines.join("0.40.0.unpacking").exists() && !engines.join("ComfyUI_windows_portable_nvidia.7z.part").exists());
         assert!(theirs.join("keep.txt").is_file() && engines.join("holiday.7z").is_file());
-        assert_eq!(remove_engines(&dir.path().join("missing")).unwrap(), 0);
+        // The user's workflows and output stay with the setup removed, like the models do.
+        assert!(engines.join(DATA_FOLDER).join("user").join("flow.json").is_file());
+        // Only `remove_data` takes the data folder; what never belonged to the app still stays.
+        let freed = remove_engines(&engines, true).unwrap();
+        assert!(freed >= 4, "{freed}");
+        assert!(!engines.join(DATA_FOLDER).exists());
+        assert!(theirs.join("keep.txt").is_file() && engines.join("holiday.7z").is_file());
+        assert_eq!(remove_engines(&dir.path().join("missing"), true).unwrap(), 0);
         // A marker that is not one (a huge file, junk) marks nothing.
         std::fs::write(theirs.join(MARKER), b"not json").unwrap();
         assert!(read_marker(&theirs).is_none());
@@ -675,15 +709,66 @@ mod tests {
         let script = m.comfy.script.replace('/', std::path::MAIN_SEPARATOR_STR);
         let model_paths = layout.model_paths.to_string_lossy().into_owned();
 
-        // Windows portable remains the public default and keeps its standalone-build flag.
-        let windows = split_args(&launch(m, &layout, false).args);
-        assert_eq!(windows, ["-s", script.as_str(), "--windows-standalone-build", "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
+        // Windows portable remains the public default and keeps its standalone-build flag,
+        // byte-for-byte: no new argument, and no environment of its own.
+        let windows = launch(m, &layout, false);
+        let windows_args = split_args(&windows.args);
+        assert_eq!(
+            windows_args,
+            ["-s", script.as_str(), "--windows-standalone-build", "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]
+        );
+        assert!(windows.env.is_empty());
 
-        // The future macOS runtime uses the same pinned script and quoted paths without the
-        // Windows-only flag. CPU mode adds exactly one explicit argument on either platform.
-        let macos = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, false).args);
-        assert_eq!(macos, ["-s", script.as_str(), "--disable-auto-launch", "--extra-model-paths-config", model_paths.as_str()]);
-        let macos_cpu = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &layout, true).args);
+        // A future macOS asset's own paths reach launch construction without the Windows-only
+        // flag. CPU mode adds exactly one explicit argument on either platform.
+        let mut mac_layout = layout.clone();
+        mac_layout.python = mac_layout.engine_root.join("python/bin/python3");
+        mac_layout.script = mac_layout.engine_root.join("ComfyUI-macos/main.py");
+        let launched = build_launch_command(RuntimePlatform::MacosArm64, m, &mac_layout, false);
+        assert!(launched.python.ends_with("python/bin/python3"));
+        // The writable folders, every flag once, each path outside the engine folder. The engine
+        // folder has a space in it, so this also proves the paths survive join_args/split_args.
+        let macos = split_args(&launched.args);
+        let data = mac_layout.data_dir.clone();
+        assert!(!data.starts_with(&mac_layout.engine_root));
+        let mut want = vec![
+            "-s".to_string(),
+            "ComfyUI-macos/main.py".to_string(),
+            "--disable-auto-launch".to_string(),
+            "--extra-model-paths-config".to_string(),
+            model_paths.clone(),
+        ];
+        for (flag, folder) in crate::runtime::MACOS_DATA_ARGS.iter().zip(crate::plan::DATA_FOLDERS) {
+            let path = data.join(folder);
+            assert!(!path.starts_with(&mac_layout.engine_root));
+            want.extend([(*flag).to_string(), path.to_string_lossy().into_owned()]);
+        }
+        want.extend(crate::runtime::MACOS_SERVER_ARGS.iter().map(|a| (*a).to_string()));
+        assert_eq!(macos, want, "{macos:?}");
+        for flag in crate::runtime::MACOS_DATA_ARGS.iter().chain(crate::runtime::MACOS_SERVER_ARGS.iter()) {
+            assert_eq!(macos.iter().filter(|a| a == flag).count(), 1, "{flag}");
+        }
+        assert!(!launched.args.contains("--windows-standalone-build") && !launched.args.contains("--port"));
+        // Offline and untelemetered, managed macOS only.
+        assert_eq!(launched.env, crate::runtime::MACOS_LAUNCH_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>());
+        let macos_cpu = split_args(&build_launch_command(RuntimePlatform::MacosArm64, m, &mac_layout, true).args);
         assert_eq!((macos_cpu.len(), macos_cpu.last().map(String::as_str)), (macos.len() + 1, Some("--cpu")));
+    }
+
+    #[test]
+    fn the_writable_folders_are_made_outside_the_engine_and_survive_re_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let lay = layout(dir.path());
+        create_data_dirs(&lay).unwrap();
+        create_data_dirs(&lay).unwrap(); // idempotent
+        for folder in crate::plan::DATA_FOLDERS {
+            let made = lay.data_dir.join(folder);
+            assert!(made.is_dir(), "{made:?}");
+            assert!(!made.starts_with(&lay.engine_root), "nothing inside the engine folder");
+        }
+        // What the user made in them is left alone.
+        std::fs::write(lay.data_dir.join("output").join("a.png"), b"x").unwrap();
+        create_data_dirs(&lay).unwrap();
+        assert!(lay.data_dir.join("output").join("a.png").is_file());
     }
 }

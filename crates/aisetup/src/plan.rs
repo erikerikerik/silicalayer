@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{LEGACY_FOLDERS, Manifest, ModelEntry, split_key};
+use crate::platform::RuntimePlatform;
 use crate::{Error, Result};
 
 /// Written into the engine folder when the runtime is unpacked whole: its presence is what
@@ -19,6 +20,13 @@ use crate::{Error, Result};
 pub const MARKER: &str = "layershop-engine.json";
 /// ComfyUI's list of extra model folders, pointing it at the models folder.
 pub const MODEL_PATHS: &str = "layershop-models.yaml";
+/// The folder of the managed engine's writable data (its `user`, `input`, `output` and `temp`
+/// folders), beside the versioned engine folder and not inside it, so an engine version can be
+/// replaced or removed without taking the user's workflows, uploaded files or generated output.
+pub const DATA_FOLDER: &str = "data";
+/// The writable ComfyUI folders [`DATA_FOLDER`] holds, in the order the launch arguments name
+/// them (see `runtime::MACOS_DATA_ARGS`).
+pub const DATA_FOLDERS: [&str; 4] = ["user", "input", "output", "temp"];
 /// The note of an Install screen row whose file is in one of the user's own models folders.
 pub const LINKED_NOTE: &str = "in your models folder";
 /// A download in progress, beside where the finished file goes.
@@ -44,6 +52,9 @@ pub enum Route {
 #[serde(default, rename_all = "camelCase")]
 pub struct Choices {
     pub route: Route,
+    /// The runtime family a managed choice installs. Absent in older records: the existing
+    /// Windows portable behavior.
+    pub platform: RuntimePlatform,
     /// Ids of the manifest's models.
     pub models: Vec<String>,
     /// Managed: where the engine goes (a folder per ComfyUI version inside it).
@@ -210,6 +221,9 @@ pub struct Layout {
     pub python: PathBuf,
     pub script: PathBuf,
     pub models_dir: PathBuf,
+    /// Managed: the writable ComfyUI folders live here ([`DATA_FOLDER`]), outside every versioned
+    /// engine folder. Empty for [`Route::Existing`], like the other managed paths.
+    pub data_dir: PathBuf,
     /// Managed: the user's own models folders the engine reads too ([`Choices::extra_models_dirs`]).
     pub extra_models: Vec<PathBuf>,
 }
@@ -219,6 +233,9 @@ pub const MAX_EXTRA_MODELS_DIRS: usize = 16;
 
 impl Layout {
     pub fn new(manifest: &Manifest, choices: &Choices) -> Result<Layout> {
+        if choices.route == Route::Managed && !choices.platform.accepts_variant(&choices.variant) {
+            return Err(Error::Config(format!("the `{}` runtime build does not belong to the {:?} platform", choices.variant, choices.platform)));
+        }
         let models_dir = folder(&choices.models_dir, "models")?;
         let engine_dir = match choices.route {
             Route::Managed => folder(&choices.engine_dir, "engine")?,
@@ -226,6 +243,13 @@ impl Layout {
             Route::Existing => PathBuf::new(),
         };
         let engine_root = engine_dir.join(&manifest.comfy.version);
+        let (python, script) = match choices.route {
+            Route::Managed => {
+                let paths = manifest.runtime_paths(&choices.variant)?;
+                (paths.python, paths.script)
+            }
+            Route::Existing => (manifest.comfy.python.as_str(), manifest.comfy.script.as_str()),
+        };
         let archive_name = match choices.route {
             Route::Managed => {
                 let url = &manifest.asset(&choices.variant)?.url;
@@ -238,6 +262,10 @@ impl Layout {
             Route::Existing => String::new(),
         };
         let inside = |rel: &str| rel.split('/').fold(engine_root.clone(), |p, part| p.join(part));
+        let data_dir = match choices.route {
+            Route::Managed => engine_dir.join(DATA_FOLDER),
+            Route::Existing => PathBuf::new(),
+        };
         let extra_models = match choices.route {
             Route::Managed => extra_folders(&choices.extra_models_dirs, &models_dir)?,
             Route::Existing => Vec::new(),
@@ -246,11 +274,12 @@ impl Layout {
             archive: engine_dir.join(archive_name),
             marker: engine_root.join(MARKER),
             model_paths: engine_root.join(MODEL_PATHS),
-            python: inside(&manifest.comfy.python),
-            script: inside(&manifest.comfy.script),
+            python: inside(python),
+            script: inside(script),
             engine_dir,
             engine_root,
             models_dir,
+            data_dir,
             extra_models,
         })
     }
@@ -259,6 +288,12 @@ impl Layout {
     pub fn model_file(&self, key: &str) -> Result<PathBuf> {
         let (folder, name) = split_key(key).ok_or_else(|| Error::Config(format!("`{key}` is not a model file")))?;
         Ok(self.models_dir.join(folder).join(name))
+    }
+
+    /// The writable ComfyUI folders inside [`Layout::data_dir`] (in [`DATA_FOLDERS`] order):
+    /// what the launch points ComfyUI at, and what creating and removing them covers.
+    pub fn data_dirs(&self) -> Vec<PathBuf> {
+        DATA_FOLDERS.iter().map(|f| self.data_dir.join(f)).collect()
     }
 
     /// Where the user's own models folders would have the file `name` of `folder`, each with the
@@ -329,10 +364,10 @@ fn folder(text: &str, what: &str) -> Result<PathBuf> {
 }
 
 /// Why the engine folder can't be used, when its paths would be too long for Windows.
-pub fn path_too_long(asset: &crate::manifest::Asset, layout: &Layout) -> Option<String> {
+pub fn path_too_long(platform: RuntimePlatform, asset: &crate::manifest::Asset, layout: &Layout) -> Option<String> {
     let longest = asset.longest_path as usize;
     let root = layout.engine_root.as_os_str().len();
-    (cfg!(windows) && longest > 0 && root.saturating_add(1).saturating_add(longest) > MAX_PATH).then(|| {
+    (platform.needs_windows_support() && longest > 0 && root.saturating_add(1).saturating_add(longest) > MAX_PATH).then(|| {
         format!(
             "The engine folder's path is too long: files inside it would be {} characters, and Windows stops at {MAX_PATH}. Choose a shorter folder, such as C:\\LayerShop\\engine.",
             root.saturating_add(1).saturating_add(longest)
@@ -480,6 +515,19 @@ mod tests {
 
     fn keys(plan: &Plan) -> Vec<String> {
         plan.steps.iter().map(|s| s.step.key()).collect()
+    }
+
+    #[test]
+    fn a_runtime_assets_own_layout_reaches_the_managed_paths() {
+        let mut json = serde_json::to_value(manifest()).unwrap();
+        let mut asset = json["comfy"]["assets"]["nvidia"].clone();
+        asset["python"] = serde_json::json!("python/bin/python3");
+        asset["script"] = serde_json::json!("ComfyUI-macos/main.py");
+        json["comfy"]["assets"]["macos_arm64"] = asset;
+        let m = Manifest::parse(&serde_json::to_string(&json).unwrap()).unwrap();
+        let layout = Layout::new(&m, &Choices { platform: RuntimePlatform::MacosArm64, variant: "macos_arm64".into(), ..choices(&[]) }).unwrap();
+        assert_eq!(layout.python.strip_prefix(&layout.engine_root).unwrap(), Path::new("python/bin/python3"));
+        assert_eq!(layout.script.strip_prefix(&layout.engine_root).unwrap(), Path::new("ComfyUI-macos/main.py"));
     }
 
     #[test]
@@ -687,6 +735,7 @@ mod tests {
         let fails = |c: Choices| plan(m, &c, &Fake::default()).unwrap_err().to_string();
         assert!(fails(choices(&["no-such-model"])).contains("no-such-model"));
         assert!(fails(Choices { variant: "voodoo".into(), ..choices(&[]) }).contains("voodoo"));
+        assert!(fails(Choices { platform: RuntimePlatform::MacosArm64, ..choices(&[]) }).contains("nvidia"));
         assert!(fails(Choices { models_dir: String::new(), ..choices(&[]) }).contains("models"));
         assert!(fails(Choices { engine_dir: "  ".into(), ..choices(&[]) }).contains("engine"));
         for odd in ["relative/models", "..", "models\0x", &"x".repeat(2000)] {
@@ -710,6 +759,13 @@ mod tests {
         assert!(layout.model_file("vae/../ae.safetensors").is_err());
         assert!(!layout.models_dir.starts_with(&layout.engine_dir));
         assert_eq!(part_of(Path::new("a/b.7z")), PathBuf::from("a/b.7z.part"));
+        // The writable folders live outside the versioned engine folder, so replacing or removing
+        // an engine version leaves the user's workflows and output alone.
+        assert_eq!(layout.data_dir, PathBuf::from(root("engine")).join("data"));
+        assert!(!layout.data_dir.starts_with(&layout.engine_root));
+        assert_eq!(layout.data_dirs(), ["user", "input", "output", "temp"].iter().map(|f| layout.data_dir.join(f)).collect::<Vec<_>>());
+        // The user's own ComfyUI installs nothing.
+        assert!(Layout::new(m, &Choices { route: Route::Existing, ..choices(&[]) }).unwrap().data_dir.as_os_str().is_empty());
     }
 
     #[test]
@@ -718,14 +774,15 @@ mod tests {
         let mut asset = m.asset("nvidia").unwrap().clone();
         let short = Layout::new(m, &choices(&[])).unwrap();
         let deep = Layout::new(m, &Choices { engine_dir: format!("{}{}", root("engine"), "\\deep".repeat(20)), ..choices(&[]) }).unwrap();
-        assert_eq!(path_too_long(&asset, &short), None);
-        assert_eq!(path_too_long(&asset, &deep).is_some(), cfg!(windows));
+        assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &short), None);
+        assert!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &deep).is_some());
+        assert_eq!(path_too_long(RuntimePlatform::MacosArm64, &asset, &deep), None);
         // The default folder leaves room for a long user name.
         if cfg!(windows) {
             let home = Choices { engine_dir: format!(r"C:\Users\{}\AppData\Local\LayerShop\engine", "n".repeat(40)), ..choices(&[]) };
-            assert_eq!(path_too_long(&asset, &Layout::new(m, &home).unwrap()), None);
+            assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &Layout::new(m, &home).unwrap()), None);
         }
         asset.longest_path = 0;
-        assert_eq!(path_too_long(&asset, &deep), None);
+        assert_eq!(path_too_long(RuntimePlatform::WindowsPortable, &asset, &deep), None);
     }
 }

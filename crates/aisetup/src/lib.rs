@@ -7,6 +7,8 @@
 //!   sha256, and the model files (each listed once, shared between models) with their size,
 //!   checksum and licence.
 //! - [`probe`]: what the machine has (system, graphics card, free space, an existing ComfyUI).
+//! - [`platform`]: the managed-runtime platform a host's facts select, shared by the probe and
+//!   the runtime.
 //! - [`plan`]: a pure function from the manifest, the user's choices and what is on disk to the
 //!   ordered list of steps. Every step can tell whether it is already done, so resuming, adding
 //!   a model later and repairing are all "plan again and run what is left".
@@ -18,6 +20,8 @@
 //!   that lets an interrupted setup be continued after a restart.
 //! - [`hf`]: Hugging Face, for the gated models: Sign in with Hugging Face (OAuth with PKCE), an
 //!   access token as the fallback, and whether the user may download each gated model yet.
+//! - [`diagnostics`]: the secret-free report about a setup — machine, folders, last log lines,
+//!   every token and password redacted — that a user can copy and send to support.
 //!
 //! Everything that touches the network, the file system or another process is native only. The
 //! web build keeps the manifest and the plan; its setup commands say they need the desktop app.
@@ -28,6 +32,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod configure;
+pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod download;
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,6 +42,7 @@ pub mod hf;
 pub mod install;
 pub mod manifest;
 pub mod plan;
+pub mod platform;
 pub mod probe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
@@ -48,6 +54,7 @@ pub mod vcrt;
 
 pub use manifest::Manifest;
 pub use plan::{Choices, Plan, Route, Step};
+pub use platform::{RuntimePlatform, RuntimeTarget};
 pub use probe::Probe;
 pub use state::SetupState;
 

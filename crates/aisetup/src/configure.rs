@@ -156,7 +156,7 @@ mod tests {
     }
 
     fn launch() -> Launch {
-        Launch { python: "D:/e/python_embeded/python.exe".into(), folder: "D:/e".into(), args: "-s ComfyUI/main.py".into() }
+        Launch { python: "D:/e/python_embeded/python.exe".into(), folder: "D:/e".into(), args: "-s ComfyUI/main.py".into(), ..Launch::default() }
     }
 
     fn local_enabled(s: &Settings) -> Vec<&str> {

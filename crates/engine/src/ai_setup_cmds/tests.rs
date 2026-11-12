@@ -14,11 +14,12 @@ mod native {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    const COMMANDS: [&str; 16] = [
+    const COMMANDS: [&str; 17] = [
         "ai.setup.probe",
         "ai.setup.manifest",
         "ai.setup.plan",
         "ai.setup.status",
+        "ai.setup.diagnostics",
         "ai.setup.start",
         "ai.setup.cancel",
         "ai.setup.repair",
@@ -178,6 +179,9 @@ mod native {
             assert!(!s.is_enabled(id), "{id}");
         }
         // What can be installed is no secret: the bundled manifest, with its totals.
+        // An Apple-silicon Mac suggests its own preset whatever the memory; the test runs on
+        // the machine it is checked out on, so that decides which rule the answers follow.
+        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         let m = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
         assert_eq!(m["comfy"]["version"], "0.43.0");
         assert_eq!(m["models"].as_array().unwrap().len(), 10);
@@ -185,7 +189,7 @@ mod native {
             (m["presets"]["starter"]["bytes"].as_u64(), m["presets"]["recommended"]["models"].as_array().map(Vec::len)),
             (Some(18_520_930_264), Some(3))
         );
-        let qwen = &m["models"][0];
+        let qwen = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "qwen-image-2-1").unwrap();
         assert_eq!(
             (qwen["id"].as_str(), qwen["installed"].as_bool(), qwen["fit"].as_str(), qwen["licence"]["commercial"].as_bool()),
             (Some("qwen-image-2-1"), Some(false), Some("tested"), Some(false))
@@ -198,20 +202,47 @@ mod native {
         for preset in ["light", "starter", "recommended"] {
             assert!(!m["presets"][preset]["models"].as_array().unwrap().iter().any(|id| id == "fibo-2-dev"), "{preset}");
         }
-        assert_eq!(m["suggested"], "recommended");
+        // The Apple-silicon preset holds the one model qualified on MPS, everywhere the
+        // manifest ships; only a Mac is suggested to start on it.
+        assert_eq!(m["presets"]["apple-silicon"]["models"], json!(["z-image-turbo"]));
+        assert_eq!(m["suggested"], if apple { "apple-silicon" } else { "recommended" });
         // A smaller card than any it has run on: not tested, and it says so instead of guessing.
-        // It starts on the light preset, its model listed first.
+        // It starts on the light preset, its model listed first — on an Apple-silicon Mac on
+        // its own preset instead, first too, whatever the memory.
         let small = s.execute("ai.setup.manifest", json!({"vramGb": 8})).unwrap();
-        assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some("light"), Some("moss-image")));
+        let want = if apple { ("apple-silicon", "z-image-turbo") } else { ("light", "moss-image") };
+        assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some(want.0), Some(want.1)));
         assert_eq!(small["presets"]["light"]["models"], json!(["moss-image"]));
-        assert_eq!(small["models"][0]["fit"], "untested");
+        let moss = small["models"].as_array().unwrap().iter().find(|x| x["id"] == "moss-image").unwrap();
+        assert_eq!(moss["fit"], "untested");
         assert_eq!(small["models"][1]["id"], "qwen-image-2-1");
         let unknown = s.execute("ai.setup.manifest", json!({})).unwrap();
-        assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some("recommended"), Some("untested")));
+        let want = if apple { "apple-silicon" } else { "recommended" };
+        assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some(want), Some("untested")));
         let status = s.execute("ai.setup.status", json!({})).unwrap();
         assert_eq!((status["available"].as_bool(), status["state"].as_str(), status["running"].as_bool()), (Some(false), Some("none"), Some(false)));
         assert_eq!(s.execute("ai.setup.cancel", json!({})).unwrap()["stopping"], false);
         assert!(!poll(&mut s) && s.ai_setup.seq() == 0 && s.ai_setup.last().is_none());
+    }
+
+    /// Task 017: the diagnostics report reads only: a session with no setup env, no record, no
+    /// engine and no log file still gets a full report rather than an error — that is exactly
+    /// when a user has nothing else to send. And it answers whatever the session holds, so an
+    /// agent can gather it too.
+    #[test]
+    fn the_ai_setup_diagnostics_report_answers_with_no_setup_at_all() {
+        let mut s = Session::new();
+        assert!(s.is_enabled("ai.setup.diagnostics"), "read-only, for agents included");
+        let r = s.execute("ai.setup.diagnostics", json!({})).unwrap();
+        // What this machine is, whether or not anything was ever set up.
+        assert!(r["app"].as_str().is_some_and(|v| !v.is_empty()), "{r}");
+        assert!(r["osArchitecture"].as_str().is_some_and(|a| !a.is_empty()), "{r}");
+        // What is not there reads as null — never as a failed command.
+        assert_eq!((r["record"].clone(), r["engine"].clone(), r["engineLog"].clone()), (Value::Null, Value::Null, Value::Null));
+        assert_eq!((r["tokenExists"].as_bool(), r["lastFinished"].is_null(), r["engineFolder"].is_null()), (Some(false), true, true));
+        // Odd parameters change nothing: the report ignores them, and stays a report.
+        let odd = s.execute("ai.setup.diagnostics", json!({"models": ["no-such-model"]})).unwrap();
+        assert_eq!(odd["tokenExists"], json!(false));
     }
 
     /// Rule 9: every command answers odd parameters with an error, never a panic, and none of
@@ -233,6 +264,7 @@ mod native {
             json!({"modelsDir": "relative/path", "models": []}),
             json!({"modelsDir": "x\u{0}y"}),
             json!({"variant": "voodoo"}),
+            json!({"platform": "linux"}),
             json!({"recheck": "yes"}),
             json!({"testImage": 1}),
             json!({"serverFiles": []}),
@@ -248,8 +280,9 @@ mod native {
             json!({"cancel": "yes"}),
             json!({"product": 7}),
         ];
-        // The probe takes no parameters and really looks at this machine: once is enough.
-        for id in COMMANDS.into_iter().filter(|id| *id != "ai.setup.probe") {
+        // The probe and the diagnostics report take no parameters and really look at this
+        // machine: once each is enough.
+        for id in COMMANDS.into_iter().filter(|id| !["ai.setup.probe", "ai.setup.diagnostics"].contains(id)) {
             for params in &odd {
                 // Each either refuses or does something harmless; it never panics.
                 let _ = rig.run(id, params.clone());
@@ -262,6 +295,7 @@ mod native {
         assert_eq!(rows, ["os", "gpu", "disk", "comfy", "net"]);
         assert_eq!(seen["defaults"]["modelsDir"], rig.models_dir().to_string_lossy().as_ref());
         assert!(seen["variant"].is_string() && seen["canInstall"].is_boolean() && seen["gpuUsable"].is_boolean());
+        assert!(seen["runtimeTarget"].is_null() || seen["runtimeTarget"]["platform"].is_string());
         assert!(!rig.s.ai_setup.running(), "nothing was started by odd parameters");
         assert_eq!(rig.net.served.load(Ordering::SeqCst), 0);
         assert!(!rig.dir.path().join("engine").exists());
@@ -270,6 +304,8 @@ mod native {
             ("ai.setup.plan", json!({"models": ["no-such-model"]})),
             ("ai.setup.plan", json!({"route": "sideways"})),
             ("ai.setup.plan", json!({"variant": "voodoo"})),
+            ("ai.setup.plan", json!({"platform": "linux"})),
+            ("ai.setup.plan", json!({"platform": "macosArm64", "variant": "nvidia"})),
             ("ai.setup.plan", json!({"modelsDir": "relative/path", "models": []})),
             ("ai.setup.start", json!({"models": [1]})),
             ("ai.setup.start", json!({"url": "ftp://x", "route": "existing", "models": []})),
@@ -293,24 +329,89 @@ mod native {
     fn a_plan_says_what_would_be_downloaded_and_what_stands_in_the_way() {
         let mut rig = Rig::new();
         let plan = rig.run("ai.setup.plan", json!({"models": ["qwen-image-2-1"]})).unwrap();
-        // The app's default folders, the build for NVIDIA, the real runtime's size.
+        // The app's default folders, the build for this computer, the real runtime's size.
+        let (want_platform, want_variant) = match runtime::RuntimePlatform::host() {
+            Some(runtime::RuntimePlatform::MacosArm64) => ("macosArm64", "macos_arm64"),
+            _ => ("windowsPortable", "nvidia"),
+        };
         assert_eq!(plan["engineDir"], rig.dir.path().join("engine").to_string_lossy().as_ref());
-        assert_eq!((plan["variant"].as_str(), plan["route"].as_str()), (Some("nvidia"), Some("managed")));
+        assert_eq!((plan["platform"].as_str(), plan["variant"].as_str(), plan["route"].as_str()), (Some(want_platform), Some(want_variant), Some("managed")));
         let steps: Vec<&str> = plan["steps"].as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
         assert_eq!(steps.len(), 8, "{steps:?}");
         assert_eq!(plan["modelsBytes"], 60_000);
-        assert_eq!(plan["downloadBytes"].as_u64().unwrap(), 60_000 + rig.manifest.comfy.assets["nvidia"].size);
+        assert_eq!(plan["downloadBytes"].as_u64().unwrap(), 60_000 + rig.manifest.comfy.assets[want_variant].size);
         assert!(plan["modelsFree"].as_u64().unwrap() > 0 && plan["sameDrive"] == true);
         assert!(plan["problems"].as_array().unwrap().is_empty(), "{}", plan["problems"]);
         assert!(plan["folderProblems"].as_array().unwrap().is_empty() && plan["modelProblems"].as_array().unwrap().is_empty());
         // Nothing was written by asking.
         assert!(!rig.dir.path().join("engine").exists() && !rig.models_dir().exists());
         assert_eq!(rig.net.served.load(Ordering::SeqCst), 0);
-        // A folder too deep for Windows is a problem named before Install is pressed.
+        // A folder too deep for Windows is a problem named before Install is pressed — but only
+        // for a build that would run on Windows; the same folder is simply fine for the others.
         let deep = format!("{}{}", rig.dir.path().join("engine").to_string_lossy(), "\\deeper".repeat(30));
         let plan = rig.run("ai.setup.plan", json!({"models": [], "engineDir": deep})).unwrap();
-        assert_eq!(plan["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")), cfg!(windows));
-        assert_eq!(plan["folderProblems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")), cfg!(windows));
+        if want_platform == "windowsPortable" {
+            assert!(plan["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")));
+            assert!(plan["folderProblems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("too long")));
+        } else {
+            assert!(plan["problems"].as_array().unwrap().is_empty(), "{}", plan["problems"]);
+            assert!(plan["folderProblems"].as_array().unwrap().is_empty(), "{}", plan["folderProblems"]);
+        }
+    }
+
+    /// A managed build must run where it is planned: naming another computer's platform, or a
+    /// variant this platform does not own, is an error that says so — the pure rules live in
+    /// `photocraft_aisetup::platform`; these check the command wiring.
+    #[test]
+    fn a_plan_refuses_another_computers_runtime() {
+        let Some(host) = runtime::RuntimePlatform::host() else { return };
+        let mut rig = Rig::new();
+        let (foreign_platform, foreign_variant, own_platform, own_variant) = match host {
+            runtime::RuntimePlatform::WindowsPortable => ("macosArm64", "macos_arm64", "windowsPortable", "nvidia"),
+            runtime::RuntimePlatform::MacosArm64 => ("windowsPortable", "nvidia", "macosArm64", "macos_arm64"),
+        };
+        let e = rig.run("ai.setup.plan", json!({"models": [], "platform": foreign_platform})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }), "{e}");
+        assert!(e.to_string().contains("can't run on this computer"), "{e}");
+        let e = rig.run("ai.setup.plan", json!({"models": [], "variant": foreign_variant})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }), "{e}");
+        // Nothing of the foreign build was planned: no download of its asset is on offer.
+        assert!(!rig.s.ai_setup.running());
+        // The host's own build, named or not, still plans.
+        let plan = rig.run("ai.setup.plan", json!({"models": [], "platform": own_platform, "variant": own_variant})).unwrap();
+        assert_eq!((plan["platform"].as_str(), plan["variant"].as_str()), (Some(own_platform), Some(own_variant)));
+    }
+
+    /// A record left by a setup on a different computer (settings moved to a Mac): the plan
+    /// follows this computer and says its build is the one to download; repair of that record is
+    /// refused instead of unpacking a build that can never run here.
+    #[test]
+    fn a_record_from_another_platform_is_not_reused_by_ai_setup() {
+        let Some(runtime::RuntimePlatform::MacosArm64) = runtime::RuntimePlatform::host() else { return };
+        let mut rig = Rig::new();
+        state::save(
+            &rig.s.ai_setup.env.as_ref().unwrap().state_file,
+            &SetupState {
+                phase: Phase::Done,
+                choices: Choices {
+                    route: Route::Managed,
+                    models: vec![],
+                    engine_dir: rig.dir.path().join("engine").to_string_lossy().into_owned(),
+                    models_dir: rig.models_dir().to_string_lossy().into_owned(),
+                    platform: runtime::RuntimePlatform::WindowsPortable,
+                    variant: "nvidia".into(),
+                    ..Choices::default()
+                },
+                ..SetupState::default()
+            },
+        )
+        .unwrap();
+        let plan = rig.run("ai.setup.plan", json!({})).unwrap();
+        assert_eq!((plan["platform"].as_str(), plan["variant"].as_str()), (Some("macosArm64"), Some("macos_arm64")));
+        assert_eq!(plan["downloadBytes"].as_u64().unwrap(), rig.manifest.comfy.assets["macos_arm64"].size);
+        let e = rig.run("ai.setup.repair", json!({})).unwrap_err();
+        assert!(e.to_string().contains("can't run on this computer"), "{e}");
+        assert!(!rig.s.ai_setup.running());
     }
 
     #[test]
@@ -581,7 +682,15 @@ mod native {
             ai.comfy_launch.python = root.join("python_embeded").join("python.exe").to_string_lossy().into_owned();
         });
         let status = rig.run("ai.setup.status", json!({})).unwrap();
-        assert_eq!((status["engines"][0]["version"].as_str(), status["installedNow"].as_array().map(Vec::len)), (Some("0.39.0"), Some(2)));
+        assert_eq!(
+            (
+                status["record"]["platform"].as_str(),
+                status["engines"][0]["platform"].as_str(),
+                status["engines"][0]["version"].as_str(),
+                status["installedNow"].as_array().map(Vec::len),
+            ),
+            (Some("windowsPortable"), Some("windowsPortable"), Some("0.39.0"), Some(2))
+        );
         // What its models folder has, for telling what is installed while the engine is off.
         assert!(status["modelFiles"]["vae"].as_array().unwrap().iter().any(|f| f == "my_own.safetensors"), "{}", status["modelFiles"]);
         // One model: its own files go, the engine and the other model stay.
@@ -605,6 +714,82 @@ mod native {
             (Some("none"), Some(0), Some(0))
         );
         assert_eq!(rig.s.ai_setup.seq(), 2, "the shell is told to save the settings");
+    }
+
+    /// The engine's data folder (task 013), as a finished setup leaves one: ComfyUI's own
+    /// workflows and output, beside the versioned engines, inside the setup's engines folder.
+    fn fake_data(rig: &Rig) -> PathBuf {
+        let data = rig.dir.path().join("engine").join(photocraft_aisetup::plan::DATA_FOLDER);
+        write(&data.join("user").join("workflows").join("my.json"), b"a workflow worth keeping");
+        write(&data.join("output").join("first.png"), b"a picture worth keeping");
+        data
+    }
+
+    /// Total bytes of every file under `path`, counted as the removal counts them.
+    fn bytes_of(path: &Path) -> u64 {
+        let mut stack = vec![path.to_path_buf()];
+        let mut total = 0u64;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(entry.path()),
+                    Ok(t) if t.is_file() => total = total.saturating_add(entry.metadata().map_or(0, |m| m.len())),
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+
+    /// Task 014: removing the engine and every model keeps ComfyUI's data folder — its workflows
+    /// and output are the user's — and the reported total leaves its bytes out.
+    #[test]
+    fn removing_the_engine_keeps_comfyui_data_until_data_is_asked() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let (engine, models, keep) = (bytes_of(&root), bytes_of(&rig.models_dir()), bytes_of(&data));
+        assert!(keep > 0, "{keep}");
+        let removed = rig.run("ai.setup.remove", json!({"engine": true, "models": true})).unwrap();
+        assert_eq!(removed["freed"].as_u64(), Some(engine + models), "the freed total counts no data file");
+        assert!(!root.exists(), "the engine went");
+        assert!(
+            data.join("user").join("workflows").join("my.json").is_file() && data.join("output").join("first.png").is_file(),
+            "the workflows and output stayed"
+        );
+    }
+
+    /// Task 014: `data: true` is the explicit choice that takes the data folder with the engine,
+    /// and its bytes then count as freed.
+    #[test]
+    fn removing_the_engine_with_data_takes_comfyui_data_too() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let all = bytes_of(&root) + bytes_of(&rig.models_dir()) + bytes_of(&data);
+        let removed = rig.run("ai.setup.remove", json!({"engine": true, "models": true, "data": true})).unwrap();
+        assert_eq!(removed["freed"].as_u64(), Some(all), "asked for, the data folder counts as freed");
+        assert!(!root.exists() && !data.exists(), "the workflows and output went with the engine");
+        assert!(!rig.dir.path().join("engine").exists(), "nothing of the setup was left in its engines folder");
+    }
+
+    /// Task 014: `data` belongs to a removal of the engine; on its own it is an error, and
+    /// nothing is deleted — the workflows are not something to lose to a mistyped parameter.
+    #[test]
+    fn removing_data_without_the_engine_is_an_error_and_removes_nothing() {
+        let mut rig = Rig::new();
+        let root = fake_engine(&rig);
+        let data = fake_data(&rig);
+        let models = bytes_of(&rig.models_dir());
+        for params in [json!({"data": true}), json!({"models": true, "data": true})] {
+            let e = rig.run("ai.setup.remove", params.clone()).unwrap_err().to_string();
+            assert!(e.contains("`data`") && e.contains("engine"), "{params}: {e}");
+        }
+        assert!(
+            root.exists() && data.join("user").join("workflows").join("my.json").is_file() && bytes_of(&rig.models_dir()) == models,
+            "the refused removal deleted nothing"
+        );
     }
 
     #[test]
@@ -848,6 +1033,7 @@ fn every_setup_command_is_registered_with_its_parameters_documented() {
             "ai.setup.manifest",
             "ai.setup.plan",
             "ai.setup.status",
+            "ai.setup.diagnostics",
             "ai.setup.start",
             "ai.setup.cancel",
             "ai.setup.repair",

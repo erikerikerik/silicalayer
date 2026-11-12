@@ -21,7 +21,7 @@ use crate::download::{self, Spec};
 use crate::fetch::Fetch;
 use crate::manifest::Manifest;
 use crate::plan::{self, Choices, Layout, Plan, Planned, PlannedModel, RealDisk, Route, Step};
-use crate::runtime::{self, Marker};
+use crate::runtime::{self, Marker, RuntimePlatform};
 use crate::state::{self, Phase};
 use crate::unpack::{self, Limits};
 use crate::vcrt;
@@ -362,7 +362,7 @@ fn writable(dir: &Path, what: &str) -> Result<()> {
 pub fn preflight(job: &Job, plan: &Plan, layout: &Layout, free_space: fn(&Path) -> Option<u64>) -> Result<()> {
     let managed = job.choices.route == Route::Managed;
     if managed {
-        if let Some(why) = plan::path_too_long(job.manifest.asset(&job.choices.variant)?, layout) {
+        if let Some(why) = plan::path_too_long(job.choices.platform, job.manifest.asset(&job.choices.variant)?, layout) {
             return Err(Error::Config(why));
         }
         writable(&layout.engine_dir, "engine")?;
@@ -434,19 +434,43 @@ fn fetch_step(env: &Env, job: &Job, layout: &Layout, shared: &Shared, index: usi
 }
 
 /// Unpack the runtime archive into the engine folder, then delete the archive.
+fn apply_executable_permissions(staging: &Path, executables: &[String]) -> Result<()> {
+    for relative in executables {
+        if !crate::manifest::is_plain_rel(relative) {
+            return Err(Error::Archive(format!("The engine manifest names `{relative}` as an executable, but it is not a safe path inside the build.")));
+        }
+        let path = staging.join(relative);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| Error::Archive(format!("The engine archive has no executable `{relative}`: it is not the build this version of the app installs.")))?;
+        if !metadata.is_file() {
+            return Err(Error::Archive(format!(
+                "The engine archive's declared executable `{relative}` is not a regular file: it is not the build this version of the app installs."
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| Error::Disk(format!("Could not make `{}` executable: {e}.", path.display())))?;
+        }
+    }
+    Ok(())
+}
+
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
-    let marker = Marker::managed(runtime::RuntimePlatform::WindowsPortable, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
-    let python = job.manifest.comfy.python.split('/').fold(PathBuf::new(), |p, part| p.join(part));
+    let marker = Marker::managed(job.choices.platform, &job.manifest.comfy.version, &job.choices.variant, &asset.sha256);
+    // The Python this asset's own manifest entry names, not the catalogue's default:
+    // an asset may ship its runtime somewhere else.
+    let paths = job.manifest.runtime_paths(&job.choices.variant)?;
+    let python = paths.python.split('/').fold(PathBuf::new(), |p, part| p.join(part));
     let finish = |staging: &Path| {
         // An archive that unpacks without the Python it is started with is not an engine.
         if !staging.join(&python).is_file() {
-            return Err(Error::Archive(format!(
-                "The engine archive has no `{}`: it is not the build this version of the app installs.",
-                job.manifest.comfy.python
-            )));
+            return Err(Error::Archive(format!("The engine archive has no `{}`: it is not the build this version of the app installs.", paths.python)));
         }
+        apply_executable_permissions(staging, &asset.executables)?;
         runtime::write_marker(staging, &marker)
     };
     let done =
@@ -565,7 +589,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
         // The C++ runtime PyTorch needs, beside the engine's Python: a PC without the Visual C++
         // Redistributable (a new one, Windows Sandbox) runs the engine too. Every run looks, so
         // Continue or Repair mends an engine unpacked before this, with nothing downloaded again.
-        if let (Some(sources), Some(python_dir)) = (&env.vc_runtime, layout.python.parent()) {
+        if let (true, Some(sources), Some(python_dir)) = (job.choices.platform.needs_windows_support(), &env.vc_runtime, layout.python.parent()) {
             shared.message("Checking the engine's runtime");
             if let Err(e) = vcrt::ensure(python_dir, sources) {
                 if let Some(row) = index_of(&plan, &Step::Verify).or_else(|| index_of(&plan, &Step::WriteModelPaths)) {
@@ -580,7 +604,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
             runtime::free_port(runtime::FIRST_PORT)
                 .ok_or_else(|| Error::Engine("No free port was found for the engine (8190 to 8389 are all taken).".into()))?
         };
-        (runtime::url(port), Some(runtime::launch(&job.manifest, &layout, job.choices.cpu)), port)
+        (runtime::url(port), Some(runtime::launch_for(job.choices.platform, &job.manifest, &layout, job.choices.cpu)), port)
     } else {
         (job.url.clone(), job.launch.clone(), 0)
     };
@@ -589,6 +613,13 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
     let configure_index = index_of(&plan, &Step::Configure);
     if let Some(i) = configure_index {
         shared.set(i, StepState::Active, "");
+    }
+    // The managed macOS engine writes its `user`, `input`, `output` and `temp` folders into the
+    // data folder beside the engine folder (runtime::MACOS_DATA_ARGS): make them before it can be
+    // started. Idempotent, so Repair and Continue re-run it. Nothing is made on Windows, whose
+    // launch does not mention those folders.
+    if managed && job.choices.platform == RuntimePlatform::MacosArm64 {
+        runtime::create_data_dirs(&layout)?;
     }
     shared.message("Setting up the models");
     let mut folders =

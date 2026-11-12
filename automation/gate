@@ -5,17 +5,27 @@ PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local
 export PATH
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/silica-agent}"
 cd "$ROOT"
-changed_rust=$(git diff --name-only --diff-filter=ACM HEAD -- '*.rs')
+changed_rust=$(
+  git diff --name-only --diff-filter=ACM HEAD -- '*.rs'
+  git ls-files --others --exclude-standard -- '*.rs'
+)
 if [ -n "$changed_rust" ]; then
   # The upstream baseline predates this rustfmt release and is not globally clean under it.
   # Keep the autonomous change narrow: only files it touched must satisfy pinned rustfmt.
+  # Do not let a changed module root make rustfmt recurse into untouched baseline modules.
   # shellcheck disable=SC2086
-  rustfmt --edition 2024 --check $changed_rust
+  rustfmt --edition 2024 --check --config skip_children=true $changed_rust
 fi
 cargo test -p photocraft-aisetup --lib --tests
 cargo test -p photocraft-aigen --lib --tests
+# Setup tasks change the engine command boundary and the setup UI; test those too.
+cargo test -p photocraft-engine --lib --tests ai_setup
+cargo test -p photocraft-ui-egui --lib --tests ai_setup
 # Rust 1.95 introduced two lints that the recorded upstream baseline does not pass.
 # Keep them visible as explicit debt while denying every other warning.
 cargo clippy -p photocraft-aisetup -p photocraft-aigen --all-targets -- \
   -D warnings -A clippy::collapsible_match -A clippy::nonminimal_bool
 cargo xtask layers
+# The narrow crate checks have missed integration breakage in the native app before.
+# Build the actual product before the supervisor accepts or commits a task.
+cargo build -p photocraft

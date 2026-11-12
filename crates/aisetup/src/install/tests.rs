@@ -245,8 +245,15 @@ impl Rig {
 
     /// Run a setup to its end.
     fn run_job(&self, job: Job, free_space: fn(&Path) -> Option<u64>) -> (Result<Outcome>, Progress) {
+        let net = self.net.clone();
+        self.run_job_with(job, &net, free_space)
+    }
+
+    /// Run a setup whose manifest points at a different fake network: what a test does to
+    /// try an asset or an archive the rig's own manifest does not describe.
+    fn run_job_with(&self, job: Job, net: &Arc<FakeNet>, free_space: fn(&Path) -> Option<u64>) -> (Result<Outcome>, Progress) {
         let env = Env {
-            fetch: self.net.clone(),
+            fetch: net.clone(),
             transport: self.comfy.clone(),
             server: Some(self.server.clone()),
             state_file: Some(self.state_file()),
@@ -594,6 +601,228 @@ fn without_a_graphics_card_the_engine_runs_on_the_processor_and_renders_no_test_
 }
 
 #[test]
+fn a_macos_managed_job_writes_its_platform_launches_without_windows_flags_and_skips_vcrt() {
+    let rig = Rig::new();
+    let mut manifest = rig.manifest.clone();
+    let asset = manifest.comfy.assets["nvidia"].clone();
+    manifest.comfy.assets.insert("macos_arm64".into(), asset);
+    let choices = Choices { platform: runtime::RuntimePlatform::MacosArm64, variant: "macos_arm64".into(), test_image: false, ..rig.choices(&[]) };
+    let layout = Layout::new(&manifest, &choices).unwrap();
+    let mut job = rig.job(choices);
+    job.manifest = manifest;
+    // A Windows setup would fail to repair from these empty sources. macOS must never try.
+    *rig.vc_runtime.borrow_mut() = Some(crate::vcrt::Sources { bundled: None, system: None });
+
+    let done = rig.run_job(job, plenty).0.unwrap();
+    let marker = runtime::read_marker(&layout.engine_root).unwrap();
+    assert_eq!((marker.platform, marker.variant.as_str()), (RuntimePlatform::MacosArm64, "macos_arm64"));
+    let launch = done.launch.unwrap();
+    assert!(!launch.args.contains("--windows-standalone-build"));
+    assert!(launch.args.contains("--disable-auto-launch"));
+    // The Configure step made the writable folders, outside the engine folder, and the launch
+    // points at them: an engine swap cannot take the user's workflows, uploads or output.
+    let args = photocraft_aigen::launch::split_args(&launch.args);
+    let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| i + 1).and_then(|i| args.get(i).cloned());
+    for folder in crate::plan::DATA_FOLDERS {
+        assert!(layout.data_dir.join(folder).is_dir(), "{folder}");
+        assert!(!layout.engine_root.join(folder).exists(), "{folder} inside the engine");
+        assert_eq!(after(flag_for(folder)).as_deref(), Some(layout.data_dir.join(folder).to_string_lossy().as_ref()), "{folder}");
+    }
+    assert_eq!(after("--listen").as_deref(), Some("127.0.0.1"));
+    assert!(args.iter().filter(|a| a.as_str() == "--disable-api-nodes").count() == 1);
+    assert_eq!(launch.env.get("HF_HUB_OFFLINE").map(String::as_str), Some("1"));
+}
+
+/// The launch flag that points ComfyUI at one writable folder (see runtime::MACOS_DATA_ARGS).
+fn flag_for(folder: &str) -> &'static str {
+    crate::plan::DATA_FOLDERS.iter().copied().zip(runtime::MACOS_DATA_ARGS).find(|(f, _)| *f == folder).map(|(_, arg)| arg).unwrap()
+}
+
+/// A macOS managed setup with no models chosen: the rig's own offline archive serves as the
+/// `macos_arm64` build (the same URL and checksum as `nvidia`), so a test can cancel, damage and
+/// resume the engine install without touching anything but this folder. The fake network answers
+/// as a cancel would (StopAfter) or as a restart in a new process does (bytes already on disk).
+struct MacOs {
+    rig: Rig,
+    manifest: Manifest,
+    layout: Layout,
+}
+
+impl MacOs {
+    fn new() -> Self {
+        let rig = Rig::new();
+        let mut manifest = rig.manifest.clone();
+        let asset = manifest.comfy.assets["nvidia"].clone();
+        manifest.comfy.assets.insert("macos_arm64".into(), asset);
+        let layout = Layout::new(&manifest, &self_choices(&rig)).unwrap();
+        Self { rig, manifest, layout }
+    }
+
+    fn job(&self) -> Job {
+        let mut job = self.rig.job(self_choices(&self.rig));
+        job.manifest = self.manifest.clone();
+        job
+    }
+
+    /// What the macOS launch of task 013 and the clean test check, on any job that completes:
+    /// its marker, its Python, no Windows flag, the writable folders beside the engine, and
+    /// nothing of the download left behind.
+    fn assert_finished(&self, launch: &Launch, served: u64) {
+        let (layout, manifest) = (&self.layout, &self.manifest);
+        assert_eq!(
+            runtime::read_marker(&layout.engine_root),
+            Some(Marker::managed(RuntimePlatform::MacosArm64, &manifest.comfy.version, "macos_arm64", &manifest.comfy.assets["macos_arm64"].sha256))
+        );
+        assert_eq!(std::fs::read(&layout.python).unwrap(), b"MZ python");
+        assert!(!launch.args.contains("--windows-standalone-build") && launch.args.contains("--disable-auto-launch"));
+        assert!(!layout.archive.exists() && !part_of(&layout.archive).exists() && !part_of(&layout.archive).with_extension("part.etag").exists());
+        for folder in crate::plan::DATA_FOLDERS {
+            assert!(layout.data_dir.join(folder).is_dir(), "{folder}");
+            assert!(!layout.engine_root.join(folder).exists(), "{folder} inside the engine");
+        }
+        assert!(layout.data_dir.starts_with(&layout.engine_dir) && !layout.data_dir.starts_with(&layout.engine_root));
+        // The engine folder holds the engine, its model-paths file and nothing else: no half an
+        // unpack, no archive.
+        let mut names: Vec<String> = std::fs::read_dir(&layout.engine_dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["0.43.0".to_string(), "data".to_string()]);
+        assert_eq!(self.rig.net.served(&self.rig.manifest, "runtime"), served);
+    }
+}
+
+fn self_choices(rig: &Rig) -> Choices {
+    Choices { platform: runtime::RuntimePlatform::MacosArm64, variant: "macos_arm64".into(), test_image: false, ..rig.choices(&[]) }
+}
+
+/// Cancelling, a corrupt part, and a `.unpacking` folder left by a crash are shown on the paths
+/// that can reach them: `Handle::cancel` while the archive downloads (the fetch itself answers
+/// as a stop does, which is what `Net::StopAfter` stands for), a part written by an earlier
+/// process, and unpack run with a stop that trips once bytes start landing on disk.
+#[test]
+fn a_macos_setup_cancelled_while_the_engine_downloads_pauses_and_continues_from_its_part() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+    rig.net.rule(&rig.manifest, "runtime", Net::StopAfter(10));
+    let (result, progress) = rig.run_job(rig_mac.job(), plenty);
+    assert_eq!(result.unwrap_err(), Error::Cancelled);
+    // Paused, not failed: what arrived is kept, and nothing is started or marked.
+    assert_eq!(rig.phase(), Phase::Paused);
+    assert!(progress.steps.iter().all(|s| s.state != StepState::Failed), "{:?}", progress.steps);
+    assert!(rig.server.asked.lock().unwrap().is_empty(), "nothing is started on half an engine");
+    let part = part_of(&layout.archive);
+    assert_eq!(std::fs::metadata(&part).unwrap().len(), 10, "the part of the archive that arrived is kept");
+    assert!(!layout.archive.exists());
+    assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists());
+    assert!(runtime::read_marker(&layout.engine_root).is_none() && runtime::installed_engines(&layout.engine_dir).is_empty());
+    assert_eq!(rig.net.served(&rig.manifest, "runtime"), 10);
+
+    // Started again: the part is checked and only what is missing comes down, the checksum is
+    // verified, and the setup finishes as the clean macOS test says it should.
+    rig.net.rule(&rig.manifest, "runtime", Net::Serve);
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    assert!(done.installed.is_empty() && done.test.is_none());
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), size);
+    // It came back to the network a second time, for the rest only: the two requests together
+    // served the file once, not a file and a half (the served bytes in assert_finished).
+    assert!(rig.net.tokens.lock().unwrap().len() >= 2);
+    assert!(done.port >= runtime::FIRST_PORT);
+}
+
+#[test]
+fn a_macos_setup_interrupted_while_unpacking_leaves_no_engine_and_restarts_cleanly() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let size = rig_mac.manifest.comfy.assets["macos_arm64"].size;
+    let job = rig_mac.job();
+    let env = Arc::new(Env {
+        fetch: rig.net.clone(),
+        transport: rig.comfy.clone(),
+        server: Some(rig.server.clone()),
+        state_file: None,
+        sleep: |_| {},
+        free_space: plenty,
+        vc_runtime: rig.vc_runtime.borrow().clone(),
+    });
+    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk).unwrap();
+    let shared = Shared::default();
+    shared.set_steps(&plan);
+    let fetch = plan.steps.iter().position(|s| s.step == Step::FetchRuntime).unwrap_or_else(|| panic!("the plan has no runtime row"));
+    fetch_step(&env, &job, &layout, &shared, fetch, &plan.steps[fetch], &|| false).unwrap();
+    assert!(layout.archive.is_file());
+
+    // Cancelled once the first bytes land in the staging folder: unpacking is Pending again,
+    // and no half an engine is anywhere the app calls an engine.
+    let unpack_row = plan.steps.iter().position(|s| s.step == Step::UnpackRuntime).unwrap_or_else(|| panic!("the plan has no unpack row"));
+    // The stop a user's Cancel makes, asked at the same moments `unpack` asks it - before every
+    // entry and after every chunk. It answers yes from the first bytes that land in the staging
+    // folder on, so a real file is written to before the stop takes it away again.
+    let stop = || shared.progress().steps.get(unpack_row).is_some_and(|s| s.done > 0);
+    let e = unpack_step(&job, &layout, &shared, unpack_row, &stop).unwrap_err();
+    assert_eq!(e, Error::Cancelled);
+    // `unpack_step` leaves its row Active: it is the run above it that puts a cancelled row
+    // back to Pending (install.rs), and nothing here ever marks the engine Failed.
+    assert_eq!(shared.state_of(unpack_row), Some(StepState::Active));
+    assert!(!layout.engine_root.exists() && runtime::read_marker(&layout.engine_root).is_none());
+    assert!(!unpack::staging_of(&layout.engine_root).exists(), "the staging folder goes with the interrupt");
+    assert!(layout.archive.is_file(), "the verified archive waits to be unpacked again");
+    assert_eq!(rig.net.served(&rig.manifest, "runtime"), size);
+
+    // A crash that takes the process takes the staging folder's cleanup with it: the folder it
+    // leaves is no engine, whatever it holds.
+    let staging = unpack::staging_of(&layout.engine_root);
+    std::fs::create_dir_all(staging.join("python_embeded")).unwrap();
+    std::fs::write(staging.join("python_embeded").join("python.exe"), b"MZ python").unwrap();
+    assert!(runtime::read_marker(&staging).is_none());
+    assert!(runtime::installed_engines(&layout.engine_dir).is_empty(), "the half unpack is not taken for an engine");
+
+    // A restart clears it and finishes: unpacked from the archive that is there, nothing fetched.
+    let mut again = rig_mac.job();
+    again.port = 8_190;
+    let (result, progress) = rig.run_job(again, plenty);
+    let done = result.unwrap();
+    assert_eq!(progress.steps.get(unpack_row).map(|s| s.state), Some(StepState::Done), "{:?}", progress.steps);
+    assert!(!staging.exists(), "the stale staging folder is cleared");
+    assert!(!layout.engine_root.join(crate::vcrt::DLLS[0]).exists(), "macOS never reaches for the Windows C++ runtime");
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), size);
+    assert_eq!(done.port, 8_190, "the setup's own port, not one searched for on a test machine");
+}
+
+#[test]
+fn a_macos_part_of_the_wrong_bytes_is_refused_by_the_checksum_and_fetched_whole() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    let asset = rig_mac.manifest.comfy.assets["macos_arm64"].clone();
+    // What an earlier process left: the right length, other bytes, as a truncated mirror or a
+    // damaged drive leaves. Its checksum is the only thing that can tell, and it tells.
+    std::fs::create_dir_all(&layout.engine_dir).unwrap();
+    std::fs::write(part_of(&layout.archive), vec![0x5Au8; asset.size as usize]).unwrap();
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    // Never unpacked - a correct engine stands there, from a whole fetch: the part alone
+    // downloaded zero bytes and still the archive came down its full size.
+    rig_mac.assert_finished(done.launch.as_ref().unwrap(), asset.size);
+    assert_eq!(rig.phase(), Phase::Done);
+}
+
+#[test]
+fn a_part_of_the_wrong_bytes_never_reaches_its_final_name_on_any_platform() {
+    // The download core refuses a damaged part on its own: the same guarantee the macOS
+    // checksum test rides on, shown where no restart is involved at all.
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let url = "https://example.invalid/engine.7z";
+    let net = FakeNet { files: HashMap::from([(url.to_string(), data.clone())]), ..FakeNet::default() };
+    let dest = dir.path().join("engine.7z");
+    std::fs::write(part_of(&dest), vec![0x5Au8; data.len()]).unwrap();
+    let ctx = download::Ctx { fetch: &net, cancelled: &|| false, sleep: &|_| {}, free_space: &plenty };
+    download::download(&ctx, &download::Spec { url, size: data.len() as u64, sha256: &sha(&data), token: None }, &dest, &|_| {}).unwrap();
+    // Rejected by the checksum, deleted, and fetched again whole: never renamed as it was.
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+    assert!(!part_of(&dest).exists() && !part_of(&dest).with_extension("part.etag").exists());
+    assert_eq!(net.served.lock().unwrap().get(url).copied(), Some(data.len() as u64));
+}
+
+#[test]
 fn a_test_image_that_does_not_render_is_not_a_failed_install() {
     let rig = Rig::with(true, FakeComfy { running: true, fails: Some(CARD_OUT_OF_MEMORY), prompts: AtomicU64::new(0) }, FakeServer::default());
     let (result, progress) = rig.run(&["qwen-image-2-1"]);
@@ -603,6 +832,9 @@ fn a_test_image_that_does_not_render_is_not_a_failed_install() {
     assert!(done.test.is_none() && done.installed == ["qwen-image-2-1"]);
     assert_eq!(progress.steps.last().map(|s| s.state), Some(StepState::Done));
     assert_eq!(rig.phase(), Phase::Done);
+    // Windows is untouched: no data folder to make, and its launch carries no environment.
+    assert!(!rig.layout().data_dir.exists());
+    assert!(done.launch.as_ref().is_some_and(|l| l.env.is_empty() && !l.args.contains("--user-directory") && !l.args.contains("--listen")));
     // Windows' paging file ran out (error 1455): that is system memory, not the card's, and the
     // message says what to do about it.
     let paging = "The paging file is too small for this operation to complete. (os error 1455)";
@@ -630,6 +862,51 @@ fn an_archive_that_is_not_the_build_leaves_no_engine_and_is_fetched_again() {
 }
 
 #[test]
+fn an_archive_built_for_another_asset_is_refused_by_that_assets_python() {
+    // The catalogue's default Python is present, so a check on it alone would pass. The asset
+    // names its own, deeper path: an archive without it is not the build that asset installs.
+    let rig = Rig::with(true, FakeComfy { running: true, fails: None, prompts: AtomicU64::new(0) }, FakeServer::default());
+    let mut manifest = rig.manifest.clone();
+    let asset = manifest.comfy.assets.get_mut("nvidia").unwrap();
+    (asset.python, asset.script) = (Some("runtime/python/python.exe".into()), Some("ComfyUI/main.py".into()));
+    let archive = rig.net.files.get(&manifest.comfy.assets["nvidia"].url.clone()).unwrap().clone();
+    let net = Arc::new(FakeNet::new(&manifest, &archive));
+    let mut job = rig.job(rig.choices(&[]));
+    job.manifest = manifest;
+    let (result, _) = rig.run_job_with(job, &net, plenty);
+    let e = result.unwrap_err();
+    assert!(matches!(&e, Error::Archive(m) if m.contains("runtime/python/python.exe") && !m.contains("python_embeded/python.exe")), "{e:?}");
+    let layout = rig.layout();
+    assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && !layout.archive.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_runtime_executables_get_only_the_declared_unix_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = Rig::new();
+    let mut job = rig.job(rig.choices(&[]));
+    job.manifest.comfy.assets.get_mut("nvidia").unwrap().executables = vec!["ComfyUI/main.py".into()];
+    rig.run_job(job, plenty).0.unwrap();
+    let mode = std::fs::metadata(rig.layout().engine_root.join("ComfyUI/main.py")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[test]
+fn missing_or_non_file_declared_executables_refuse_the_archive_atomically() {
+    for relative in ["missing-tool", "ComfyUI"] {
+        let rig = Rig::new();
+        let mut job = rig.job(rig.choices(&[]));
+        job.manifest.comfy.assets.get_mut("nvidia").unwrap().executables = vec![relative.into()];
+        let error = rig.run_job(job, plenty).0.unwrap_err();
+        assert!(matches!(&error, Error::Archive(message) if message.contains(relative)), "{error:?}");
+        let layout = rig.layout();
+        assert!(!layout.engine_root.exists() && !unpack::staging_of(&layout.engine_root).exists() && !layout.archive.exists());
+    }
+}
+
+#[test]
 fn the_users_own_comfyui_gets_the_missing_files_and_nothing_else() {
     let rig = Rig::new();
     let server_files = BTreeMap::from([("diffusion_models".to_string(), vec!["qwen_image_2.1_int8_convrot.safetensors".to_string()])]);
@@ -642,7 +919,7 @@ fn the_users_own_comfyui_gets_the_missing_files_and_nothing_else() {
     };
     let mut job = rig.job(choices);
     job.url = "http://127.0.0.1:8000".into();
-    job.launch = Some(Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into() });
+    job.launch = Some(Launch { python: "C:/comfy/python.exe".into(), folder: "C:/comfy".into(), args: "main.py".into(), ..Launch::default() });
     let (result, progress) = rig.run_job(job, plenty);
     let done = result.unwrap();
     // No engine was installed, and the file their server has was not downloaded again.

@@ -69,12 +69,18 @@ fn opening_fills_in_the_folders_and_the_recommended_models() {
     assert!(s.open && s.page == Page::Pc && !s.existing);
     assert_eq!(s.engine_dir, dir.path().join("engine").to_string_lossy());
     assert_eq!(s.models_dir, dir.path().join("models").to_string_lossy());
-    assert_eq!(
-        (s.preset.as_str(), s.models.clone()),
-        ("recommended", vec!["qwen-image-2-1".to_string(), "z-image-turbo".to_string(), "flux-3-klein".to_string()])
-    );
+    // An Apple-silicon Mac opens on its own preset (task 015); everywhere else Recommended does.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let want = ("apple-silicon", vec!["z-image-turbo".to_string()]);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let want = ("recommended", vec!["qwen-image-2-1".to_string(), "z-image-turbo".to_string(), "flux-3-klein".to_string()]);
+    assert_eq!((s.preset.as_str(), s.models.clone()), want);
     assert!(s.probe_job.is_none(), "an answer that is there is not asked for again");
-    // The presets: ticking by hand names the preset that results, or none.
+    // The presets: ticking by hand names the preset that results, or none. From the recommended
+    // trio, whatever this host opened on.
+    app.ui.ai_setup.models = preset_models(&app, "recommended");
+    name_preset(&mut app);
+    assert_eq!(app.ui.ai_setup.preset, "recommended");
     toggle_model(&mut app, "flux-3-klein", false);
     toggle_model(&mut app, "z-image-turbo", false);
     assert_eq!(app.ui.ai_setup.preset, "starter");
@@ -102,31 +108,44 @@ fn opening_fills_in_the_folders_and_the_recommended_models() {
     assert!(!dir.path().join("engine").exists(), "looking changes nothing");
 }
 
-/// A card with little memory starts on Light (MOSS Image), whether the probe has answered when
-/// the wizard opens or answers after; a selection the user made stays theirs.
+/// A machine with little memory starts on the preset suggested for it: Light on a small card,
+/// the Apple-silicon set on an Apple-silicon Mac, whatever that reports. Whether the probe has
+/// answered when the wizard opens or answers after; a selection the user made stays theirs.
 #[test]
-fn a_small_card_starts_on_the_light_preset() {
+fn a_small_card_starts_on_the_suggested_preset() {
     let small = |dir: &std::path::Path| {
         let mut found = demo::probe(dir);
         found["vramGb"] = json!(8);
         found
     };
+    // What an 8 GB machine opens on: Light below the card rule, the Apple-silicon set on a Mac.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (want, want_first) = ("apple-silicon", "z-image-turbo");
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let (want, want_first) = ("light", "moss-image");
+    let want_models = vec![want_first.to_string()];
     let (mut app, dir) = app(demo::Scale::Real);
     app.ui.ai_setup.probe = Some(small(dir.path()));
     open(&mut app);
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), ("light", vec!["moss-image".to_string()]));
-    assert_eq!(list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models")[0]["id"], "moss-image");
+    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models.clone()));
+    assert_eq!(list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models")[0]["id"], want_first);
     let c = ctx();
     app.ui.ai_setup.page = Page::Models;
     draw(&mut app, &c);
-    assert_eq!(app.ui.ai_setup.plan.as_ref().unwrap()["models"][0]["id"], "moss-image");
+    assert_eq!(app.ui.ai_setup.plan.as_ref().unwrap()["models"][0]["id"], want_first);
 
-    // Opened before the probe answered: Recommended, until the answer says the card is small.
+    // Opened before the probe answered: Recommended on a card that is not known to be small,
+    // until the answer comes — on a Mac the answer was never the question, and its own preset
+    // stands either way.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let before = "apple-silicon";
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let before = "recommended";
     let (mut app, dir) = app_without_probe();
     open(&mut app);
-    assert_eq!(app.ui.ai_setup.preset, "recommended");
+    assert_eq!(app.ui.ai_setup.preset, before);
     probed(&mut app, small(dir.path()));
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), ("light", vec!["moss-image".to_string()]));
+    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models));
 
     // Ticked by hand first: the answer changes nothing.
     let (mut app, dir) = app_without_probe();
@@ -361,6 +380,10 @@ fn a_comfyui_that_does_not_answer_is_said_on_the_screen() {
 fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_new_one() {
     let (mut app, dir) = app(demo::Scale::Small);
     let root = demo::pretend_installed(&app, dir.path()).unwrap();
+    // The engine's data folder (task 013): workflows and output the user made with ComfyUI.
+    let data = dir.path().join("engine").join(photocraft_aisetup::plan::DATA_FOLDER);
+    std::fs::create_dir_all(data.join("user")).unwrap();
+    std::fs::write(data.join("user").join("my workflow.json"), br#"{"nodes":[]}"#).unwrap();
     let c = ctx();
     open(&mut app);
     assert!(set_up(&app), "the record says it is installed");
@@ -373,14 +396,18 @@ fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_n
         app.ui.ai_setup.page = page;
         draw(&mut app, &c);
     }
-    let installed =
-        |app: &PhotocraftApp| list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models").iter().map(|m| m["installed"].as_bool().unwrap()).collect::<Vec<_>>();
-    assert_eq!(installed(&app), [true, true]);
+    let installed = |app: &PhotocraftApp| {
+        list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models")
+            .iter()
+            .map(|m| (text(m, "/id").to_string(), m["installed"].as_bool().unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!((installed(&app)["z-image-turbo"], installed(&app)["qwen-image-2-1"]), (true, true));
     // One model's files go. It is not a setup that finished: the screen stays where it is.
     remove_model(&mut app, "z-image-turbo");
     draw(&mut app, &c);
     assert!(app.ui.ai_setup.note.contains("Space freed: 24.0 KB"), "{}", app.ui.ai_setup.note);
-    assert_eq!((app.ui.ai_setup.page, installed(&app)), (Page::Models, vec![true, false]));
+    assert_eq!((app.ui.ai_setup.page, installed(&app)["z-image-turbo"], installed(&app)["qwen-image-2-1"]), (Page::Models, false, true));
     assert!(app.ui.ai_setup.remove_model.is_none() && !app.ui.ai_setup.models.contains(&"z-image-turbo".to_string()));
     assert!(root.join("python_embeded").join("python.exe").is_file());
     // Everything goes: back on the first screen, which says how much room that made.
@@ -390,7 +417,15 @@ fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_n
     assert!(!root.exists() && app.ui.ai_setup.page == Page::Pc && !app.ui.ai_setup.confirm_remove);
     assert!(app.ui.ai_setup.note.starts_with("Local AI was removed. Space freed:"), "{}", app.ui.ai_setup.note);
     assert!(!set_up(&app));
-    assert_eq!(installed(&app), [false, false]);
+    assert_eq!((installed(&app)["z-image-turbo"], installed(&app)["qwen-image-2-1"]), (false, false));
+    // The confirmation is unticked by default (task 014): ComfyUI's workflows and output stayed
+    // with the engine folder gone. Ticked, a second removal takes them and the empty folder.
+    assert!(data.join("user").join("my workflow.json").is_file(), "the checkbox was not ticked");
+    app.ui.ai_setup.confirm_remove = true;
+    assert!(!app.ui.ai_setup.remove_data, "the checkbox starts unticked");
+    app.ui.ai_setup.remove_data = true;
+    remove(&mut app, true);
+    assert!(!data.exists() && !dir.path().join("engine").exists(), "asked for, they went with the engine");
 }
 
 #[test]
@@ -424,6 +459,81 @@ fn without_a_graphics_card_a_new_comfyui_installs_only_on_the_processor_when_ask
     assert_eq!(resume_params(&card), json!({"cpu": false}));
     card.ui.ai_setup.probe = None;
     assert_eq!(resume_params(&card), json!({}));
+}
+
+#[test]
+fn apple_silicon_uses_the_managed_macos_runtime_without_cpu_fallback() {
+    let (mut app, dir) = app(demo::Scale::Small);
+    app.ui.ai_setup.probe = Some(json!({
+        "canInstall": true,
+        "gpuUsable": true,
+        "variant": "macos_arm64",
+        "runtimeTarget": {"platform": "macosArm64", "variant": "macos_arm64", "qualified": true},
+        "defaults": {"engineDir": dir.path().join("engine"), "modelsDir": dir.path().join("models")},
+        "checks": []
+    }));
+    let choices = params(&app);
+    assert_eq!(choices["platform"], "macosArm64");
+    assert_eq!(choices["variant"], "macos_arm64");
+    assert_eq!(choices["cpu"], false);
+    assert!(gpu_usable(&app) && can_install_new(&app));
+}
+
+/// Everything the wizard painted as text in one more frame, one galley per line.
+fn drawn_words(app: &mut PhotocraftApp, c: &egui::Context) -> String {
+    fn galleys<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a str>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.job.text.as_str()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| galleys(s, out)),
+            _ => {}
+        }
+    }
+    let out = c.run_ui(Default::default(), |ui| window(app, ui.ctx()));
+    let mut texts = Vec::new();
+    for shape in &out.shapes {
+        galleys(&shape.shape, &mut texts);
+    }
+    texts.join("\n")
+}
+
+/// A Mac below the unified-memory floor is recommended cloud models on the first screen: the
+/// one-line note above the local buttons, and Cloud Models Only marked as recommended. That is
+/// all it is — a recommendation: no API-key window opens and nothing is changed by itself. A
+/// qualified Mac and a Windows PC see the plain screen.
+#[test]
+fn a_mac_below_the_memory_floor_is_recommended_the_cloud_without_anything_opening() {
+    let mac = |qualified: bool, dir: &std::path::Path| {
+        json!({
+            "canInstall": true,
+            "gpuUsable": true,
+            "variant": "macos_arm64",
+            "vramGb": if qualified { 32 } else { 8 },
+            "runtimeTarget": {"platform": "macosArm64", "variant": "macos_arm64", "qualified": qualified},
+            "defaults": {"engineDir": dir.join("engine"), "modelsDir": dir.join("models")},
+            "checks": []
+        })
+    };
+    let (mut app, dir) = app(demo::Scale::Small);
+    app.ui.ai_setup.probe = Some(mac(false, dir.path()));
+    open(&mut app);
+    let c = ctx();
+    draw(&mut app, &c);
+    let words = drawn_words(&mut app, &c);
+    assert!(words.contains("cloud models are faster here"), "the note above the local buttons is missing:\n{words}");
+    assert!(words.contains("Cloud Models Only · Recommended for this Mac"), "the footer does not mark the cloud path:\n{words}");
+    assert!(app.ui.dialogs.is_empty() && app.ui.ai_setup.open, "a recommendation opens nothing by itself");
+    // A qualified Mac: the plain screen, and still nothing opened.
+    app.ui.ai_setup.probe = Some(mac(true, dir.path()));
+    draw(&mut app, &c);
+    let words = drawn_words(&mut app, &c);
+    assert!(!words.contains("Recommended for this Mac") && !words.contains("faster here"), "a qualified Mac must not be steered:\n{words}");
+    assert!(words.contains("Cloud Models Only"), "the way to the cloud is still offered:\n{words}");
+    // The walkthrough's Windows machine: unchanged too.
+    app.ui.ai_setup.probe = Some(demo::probe(dir.path()));
+    draw(&mut app, &c);
+    let words = drawn_words(&mut app, &c);
+    assert!(!words.contains("Recommended for this Mac") && !words.contains("faster here"), "Windows must not be steered:\n{words}");
+    assert!(app.ui.dialogs.is_empty() && app.ui.ai_setup.open, "nothing was opened on its own");
 }
 
 #[test]
@@ -990,7 +1100,12 @@ fn the_model_folders_page_says_whose_each_folder_is_and_lists_what_it_has() {
     let z_file = std::fs::read_dir(std::path::Path::new(&mine).join("unet")).unwrap().next().unwrap().unwrap().file_name().into_string().unwrap();
     let lora = |file: &str| photocraft_aigen::Lora { file: file.into(), ..Default::default() };
     let draft = [
-        photocraft_aigen::Model { id: "found".into(), name: "my finetune".into(), unet: "z_image_bf16.safetensors".into(), ..photocraft_aigen::Family::ZImage.preset() },
+        photocraft_aigen::Model {
+            id: "found".into(),
+            name: "my finetune".into(),
+            unet: "z_image_bf16.safetensors".into(),
+            ..photocraft_aigen::Family::ZImage.preset()
+        },
         photocraft_aigen::Model { id: "z-image-turbo".into(), unet: z_file.clone(), enabled: true, ..photocraft_aigen::Family::ZImage.preset() },
         // Scan Server's own entry for the same file: another build of the recommended model, not it.
         photocraft_aigen::Model { id: "z-image-turbo-found".into(), name: "z image turbo".into(), unet: z_file, ..photocraft_aigen::Family::ZImage.preset() },

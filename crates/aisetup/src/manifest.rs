@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use photocraft_aigen::Family;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, platform::RuntimePlatform};
 
 /// The manifest format this build reads.
 pub const VERSION: u32 = 1;
@@ -29,6 +29,8 @@ const ASSET_HOST: &str = "github.com";
 const MAX_FILE_BYTES: u64 = 96 << 30;
 const MAX_FILES: usize = 2000;
 const MAX_MODELS: usize = 500;
+/// How many files one build may name as executables (see [`Asset::executables`]).
+pub const MAX_EXECUTABLES: usize = 128;
 /// A card with less video memory than this is offered the `light` preset first.
 pub const LIGHT_BELOW_VRAM_GB: u64 = 16;
 
@@ -105,6 +107,20 @@ pub struct Asset {
     /// check before anything is downloaded. 0: not measured.
     #[serde(default)]
     pub longest_path: u32,
+    /// Inside this build: its Python, when it is not where [`Comfy::python`] says. Absent: the
+    /// manifest's global path. A build that says one of these two says both: a half override is
+    /// refused at parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    /// Inside this build: the script it runs, when it is not where [`Comfy::script`] says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// Inside this build: the files the setup may make executable, as plain relative paths. The
+    /// archive's own mode bits are not trusted, so a build says what it needs here and unpack
+    /// applies the permissions after extracting. Absent: nothing: the archive's modes stand, and
+    /// a build that needs none, and every Windows build, say nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executables: Vec<String>,
 }
 
 /// The pinned ComfyUI: a release works with exactly the version its workflows were tested on.
@@ -115,8 +131,16 @@ pub struct Comfy {
     /// Inside the unpacked build: its Python, and the script it runs.
     pub python: String,
     pub script: String,
-    /// By graphics card: `nvidia`, `nvidia_cu126`, `amd`, `intel`.
+    /// By runtime target: Windows GPU builds (`nvidia`, `nvidia_cu126`, `amd`, `intel`) and
+    /// the qualified Apple Silicon build (`macos_arm64`).
     pub assets: BTreeMap<String, Asset>,
+}
+
+/// Paths inside one runtime archive after variant-specific overrides are resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimePaths<'a> {
+    pub python: &'a str,
+    pub script: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -141,6 +165,11 @@ fn bad(msg: impl Into<String>) -> Error {
 
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Is `rel` a plain path inside the unpacked build?
+pub(crate) fn is_plain_rel(rel: &str) -> bool {
+    !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']))
 }
 
 /// `url` is `https://<host>/…` with nothing that could change where it goes.
@@ -182,8 +211,7 @@ impl Manifest {
             return Err(bad("the ComfyUI version is not a version number"));
         }
         for rel in [&m.comfy.python, &m.comfy.script] {
-            let plain = !rel.is_empty() && rel.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']));
-            if !plain {
+            if !is_plain_rel(rel) {
                 return Err(bad(format!("`{rel}` is not a path inside the ComfyUI build")));
             }
         }
@@ -196,6 +224,29 @@ impl Manifest {
             }
             if asset.size == 0 || asset.size > MAX_FILE_BYTES || !is_sha256(&asset.sha256) {
                 return Err(bad(format!("the `{name}` build has no usable size or sha256")));
+            }
+            // A build may name its own Python and script: both or neither, each a plain path.
+            if asset.python.is_some() != asset.script.is_some() {
+                return Err(bad(format!("the `{name}` build names only one of its Python and script, and must name both or neither")));
+            }
+            for rel in [asset.python.as_deref(), asset.script.as_deref()].into_iter().flatten() {
+                if !is_plain_rel(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}`, which is not a path inside the ComfyUI build")));
+                }
+            }
+            // The files unpack may make executable: each a plain path inside the build, no
+            // repeats, few enough that a hostile manifest cannot make unpack walk forever.
+            if asset.executables.len() > MAX_EXECUTABLES {
+                return Err(bad(format!("the `{name}` build names more than {MAX_EXECUTABLES} executables")));
+            }
+            let mut seen_executables = BTreeSet::new();
+            for rel in &asset.executables {
+                if !is_plain_rel(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}` as an executable, which is not a path inside the ComfyUI build")));
+                }
+                if !seen_executables.insert(rel) {
+                    return Err(bad(format!("the `{name}` build names `{rel}` as an executable twice")));
+                }
             }
         }
         for (key, file) in &m.files {
@@ -227,7 +278,8 @@ impl Manifest {
                 }
             }
             let min = model.min_comfy.as_str();
-            let min_ok = min.is_empty() || (min.len() <= 32 && min.starts_with(|c: char| c.is_ascii_digit()) && min.chars().all(|c| c.is_ascii_digit() || c == '.'));
+            let min_ok =
+                min.is_empty() || (min.len() <= 32 && min.starts_with(|c: char| c.is_ascii_digit()) && min.chars().all(|c| c.is_ascii_digit() || c == '.'));
             if !min_ok {
                 return Err(bad(format!("`{}` names `{min}` as its ComfyUI version, which is not a version number", model.id)));
             }
@@ -259,20 +311,41 @@ impl Manifest {
         self.presets.get(name).map_or(&[], Vec::as_slice)
     }
 
-    /// The preset the wizard starts on for a card with `vram_gb` of memory: `light` on a card
-    /// with less than [`LIGHT_BELOW_VRAM_GB`], `recommended` otherwise and when it is not known.
-    pub fn suggested_preset(&self, vram_gb: Option<u64>) -> &'static str {
+    /// The preset the wizard starts on for `platform` with `vram_gb` of memory: the
+    /// Apple-silicon set on an Apple-silicon Mac whenever the manifest names one — unified
+    /// memory is shared with the system, so the card rule below says nothing useful there, and
+    /// only the models in that preset are qualified on MPS (task 015) — whatever the memory.
+    /// Otherwise `light` on a card with less than [`LIGHT_BELOW_VRAM_GB`], `recommended`
+    /// otherwise and when the memory is not known. `platform` is `None` when the caller has
+    /// not looked the host up, or on a host with no managed build.
+    pub fn suggested_preset_for(&self, platform: Option<RuntimePlatform>, vram_gb: Option<u64>) -> &'static str {
+        if platform == Some(RuntimePlatform::MacosArm64) && !self.preset("apple-silicon").is_empty() {
+            return "apple-silicon";
+        }
         let small = vram_gb.is_some_and(|gb| gb < LIGHT_BELOW_VRAM_GB);
         if small && !self.preset("light").is_empty() { "light" } else { "recommended" }
     }
 
-    /// The models in the order the wizard lists them for a card with `vram_gb` of memory: the
-    /// suggested preset's first, the rest in the manifest's order.
-    pub fn offered(&self, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
-        let first = self.preset(self.suggested_preset(vram_gb));
+    /// The preset the wizard starts on for a card with `vram_gb` of memory: a thin wrapper over
+    /// [`Self::suggested_preset_for`] without a platform, the rule from before Apple-silicon
+    /// hosts were told apart.
+    pub fn suggested_preset(&self, vram_gb: Option<u64>) -> &'static str {
+        self.suggested_preset_for(None, vram_gb)
+    }
+
+    /// The models in the order the wizard lists them for `platform` with `vram_gb` of memory:
+    /// the suggested preset's first, the rest in the manifest's order.
+    pub fn offered_for(&self, platform: Option<RuntimePlatform>, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
+        let first = self.preset(self.suggested_preset_for(platform, vram_gb));
         let (mut out, rest): (Vec<&ModelEntry>, Vec<&ModelEntry>) = self.models.iter().partition(|m| first.contains(&m.id));
         out.extend(rest);
         out
+    }
+
+    /// The models in the order the wizard lists them for a card with `vram_gb` of memory: a thin
+    /// wrapper over [`Self::offered_for`] without a platform.
+    pub fn offered(&self, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
+        self.offered_for(None, vram_gb)
     }
 
     /// The models named by `ids`, in the manifest's order; an unknown id is an error.
@@ -334,6 +407,25 @@ impl Manifest {
     pub fn asset(&self, variant: &str) -> Result<&Asset> {
         self.comfy.assets.get(variant).ok_or_else(|| Error::Config(format!("there is no ComfyUI build for `{variant}`")))
     }
+
+    /// The builds that run on `platform`, by variant key: every setup listing,
+    /// default or validation of managed builds must go through this so a host
+    /// never sees, chooses or downloads a build made for another platform.
+    pub fn assets_for(&self, platform: RuntimePlatform) -> BTreeMap<&str, &Asset> {
+        self.comfy.assets.iter().filter(|(variant, _)| platform.accepts_variant(variant)).map(|(variant, asset)| (variant.as_str(), asset)).collect()
+    }
+
+    /// The Python executable and ComfyUI script inside one runtime archive. Older manifests use
+    /// the global paths; an asset may override both together for a different platform layout.
+    pub fn runtime_paths(&self, variant: &str) -> Result<RuntimePaths<'_>> {
+        let asset = self.asset(variant)?;
+        Ok(match (&asset.python, &asset.script) {
+            (Some(python), Some(script)) => RuntimePaths { python, script },
+            (None, None) => RuntimePaths { python: &self.comfy.python, script: &self.comfy.script },
+            // Parsed manifests cannot reach this, but callers may construct one in memory.
+            _ => return Err(Error::Config(format!("the ComfyUI build for `{variant}` must name both its Python and script or neither"))),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -353,8 +445,21 @@ mod tests {
     fn the_bundled_manifest_is_valid_and_pins_one_comfyui() {
         let m = bundled();
         assert_eq!(m.comfy.version, "0.43.0");
-        assert_eq!(m.comfy.assets.keys().map(String::as_str).collect::<Vec<_>>(), ["amd", "intel", "nvidia", "nvidia_cu126"]);
-        assert!(m.comfy.assets.values().all(|a| a.url.contains("/v0.43.0/")));
+        assert_eq!(m.comfy.assets.keys().map(String::as_str).collect::<Vec<_>>(), ["amd", "intel", "macos_arm64", "nvidia", "nvidia_cu126"]);
+        assert!(m.comfy.assets.iter().filter(|(name, _)| name.as_str() != "macos_arm64").all(|(_, a)| a.url.contains("/v0.43.0/")));
+        let mac = &m.comfy.assets["macos_arm64"];
+        assert_eq!(
+            (mac.url.as_str(), mac.size, mac.sha256.as_str(), mac.unpacked_bytes, mac.longest_path),
+            (
+                "https://github.com/erikerikerik/silicalayer-runtime/releases/download/comfyui-0.43.0-macos-arm64-r1/SilicaLayer-ComfyUI-0.43.0-macos-arm64.7z",
+                760_253_266,
+                "891e8e2af644353deeba13ff122b3b4c23589f7b6611c334334f75c2f0b0a32f",
+                1_887_798_757,
+                173,
+            )
+        );
+        assert_eq!(m.runtime_paths("macos_arm64").unwrap(), RuntimePaths { python: "python/bin/python3", script: "ComfyUI/main.py" });
+        assert_eq!(mac.executables, ["python/bin/python3"]);
         assert!(m.asset("nvidia").is_ok() && m.asset("voodoo").is_err());
         // Measured from each archive's header (`--example archive_contents`).
         assert!(m.comfy.assets.values().all(|a| a.unpacked_bytes > a.size && (100..=200).contains(&a.longest_path)));
@@ -366,6 +471,51 @@ mod tests {
         // Each local enhancer is pinned at the size the app knows it by.
         for x in photocraft_aigen::enhance::local::MODELS {
             assert_eq!(m.files.get(&x.manifest_key()).map(|f| f.size), Some(x.size), "{}", x.id);
+        }
+    }
+
+    #[test]
+    fn assets_for_hands_each_platform_only_its_own_builds() {
+        let m = bundled();
+        let mac: Vec<&str> = m.assets_for(RuntimePlatform::MacosArm64).keys().copied().collect();
+        assert_eq!(mac, ["macos_arm64"]);
+        let windows: Vec<&str> = m.assets_for(RuntimePlatform::WindowsPortable).keys().copied().collect();
+        assert_eq!(windows, ["amd", "intel", "nvidia", "nvidia_cu126"]);
+        assert!(!windows.contains(&"macos_arm64"));
+        // Every build a platform lists can be fetched and run on that platform, and no others leak.
+        for platform in [RuntimePlatform::MacosArm64, RuntimePlatform::WindowsPortable] {
+            for (variant, asset) in m.assets_for(platform) {
+                assert!(platform.accepts_variant(variant), "{variant} listed for {platform:?}");
+                assert_eq!(m.asset(variant).unwrap(), asset);
+                assert!(m.runtime_paths(variant).is_ok(), "{variant}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_paths_fall_back_override_together_and_refuse_hostile_values() {
+        let bundled = bundled();
+        assert_eq!(bundled.runtime_paths("nvidia").unwrap(), RuntimePaths { python: bundled.comfy.python.as_str(), script: bundled.comfy.script.as_str() });
+        assert!(bundled.runtime_paths("missing").is_err());
+
+        let with_paths = |python: Option<&str>, script: Option<&str>| {
+            let mut json = serde_json::to_value(bundled).unwrap();
+            if let Some(python) = python {
+                json["comfy"]["assets"]["nvidia"]["python"] = serde_json::json!(python);
+            }
+            if let Some(script) = script {
+                json["comfy"]["assets"]["nvidia"]["script"] = serde_json::json!(script);
+            }
+            Manifest::parse(&serde_json::to_string(&json).unwrap())
+        };
+        let overridden = with_paths(Some("python/bin/python3"), Some("ComfyUI/main.py")).unwrap();
+        assert_eq!(overridden.runtime_paths("nvidia").unwrap(), RuntimePaths { python: "python/bin/python3", script: "ComfyUI/main.py" });
+
+        assert!(with_paths(Some("python/bin/python3"), None).is_err());
+        assert!(with_paths(None, Some("ComfyUI/main.py")).is_err());
+        for hostile in ["/bin/python3", "../python3", "bin/../python3", "C:/python.exe", r"bin\python3", "bin//python3"] {
+            assert!(with_paths(Some(hostile), Some("ComfyUI/main.py")).is_err(), "accepted {hostile:?}");
+            assert!(with_paths(Some("python/bin/python3"), Some(hostile)).is_err(), "accepted {hostile:?}");
         }
     }
 
@@ -565,6 +715,59 @@ mod tests {
         assert_eq!(without.offered(Some(8)).first().map(|x| x.id.as_str()), Some("qwen-image-2-1"));
     }
 
+    /// An Apple-silicon Mac is offered the Apple-silicon preset (only models qualified on MPS)
+    /// whatever its unified memory reports: the card rule reads shared memory as if it were a
+    /// card's VRAM and would suggest models that do not qualify there (task 015).
+    #[test]
+    fn an_apple_silicon_mac_is_offered_the_apple_silicon_preset_at_any_memory() {
+        let m = bundled();
+        assert_eq!(m.preset("apple-silicon"), ["z-image-turbo"]);
+        for vram in [Some(8), Some(16), Some(24), Some(64), None] {
+            assert_eq!(m.suggested_preset_for(Some(RuntimePlatform::MacosArm64), vram), "apple-silicon", "{vram:?}");
+        }
+        let order = |vram| m.offered_for(Some(RuntimePlatform::MacosArm64), vram).iter().map(|x| x.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(order(Some(8))[0], "z-image-turbo");
+        assert_eq!(order(Some(8)).len(), m.models.len());
+        assert_eq!(order(Some(8)), order(Some(64)));
+    }
+
+    /// Without an Apple-silicon host in front — unknown platform or Windows — the suggestion is
+    /// exactly the memory rule it was before, and the old entry points say the same.
+    #[test]
+    fn only_apple_silicon_macs_leave_the_memory_rule() {
+        let m = bundled();
+        for (platform, vram, preset) in [
+            (None, Some(8), "light"),
+            (None, Some(24), "recommended"),
+            (None, None, "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), Some(8), "light"),
+            (Some(RuntimePlatform::WindowsPortable), Some(16), "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), Some(24), "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), None, "recommended"),
+        ] {
+            assert_eq!(m.suggested_preset_for(platform, vram), preset, "{platform:?} {vram:?}");
+        }
+        assert_eq!(m.offered_for(Some(RuntimePlatform::WindowsPortable), Some(8)).first().map(|x| x.id.as_str()), Some("moss-image"));
+        assert_eq!(m.offered_for(Some(RuntimePlatform::WindowsPortable), Some(8)), m.offered(Some(8)));
+        assert_eq!(m.suggested_preset_for(None, Some(8)), m.suggested_preset(Some(8)));
+    }
+
+    /// A manifest that does not name an Apple-silicon preset (an older one on the wire) leaves
+    /// the Mac on the memory rule, as before; an empty one suggests nothing either.
+    #[test]
+    fn a_manifest_without_the_apple_silicon_preset_falls_back_on_mac() {
+        let mut without = bundled().clone();
+        without.presets.remove("apple-silicon");
+        assert_eq!(without.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(8)), "light");
+        assert_eq!(without.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(24)), "recommended");
+        assert_eq!(without.offered_for(Some(RuntimePlatform::MacosArm64), Some(8)).first().map(|x| x.id.as_str()), Some("moss-image"));
+        let mut empty = bundled().clone();
+        if let Some(ids) = empty.presets.get_mut("apple-silicon") {
+            ids.clear();
+        }
+        assert_eq!(empty.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(8)), "light");
+    }
+
     #[test]
     fn selections_keep_the_manifests_order_and_refuse_unknown_models() {
         let m = bundled();
@@ -575,5 +778,32 @@ mod tests {
         let folders = m.folders(chosen);
         assert_eq!(folders["vae"], ["qwen_image_2.1_vae_bf16.safetensors", "ae.safetensors"]);
         assert_eq!(folders["diffusion_models"].len(), 2);
+    }
+
+    /// `executables` defaults to empty (a manifest that says nothing stays valid, as every
+    /// manifest does until a build needs it), round-trips, and refuses hostile or repeated paths.
+    #[test]
+    fn executable_paths_default_empty_and_hostile_values_are_refused() {
+        let bundled = bundled();
+        // Windows builds need no Unix executable allowlist; the macOS build names only Python.
+        assert!(bundled.comfy.assets.iter().filter(|(name, _)| name.as_str() != "macos_arm64").all(|(_, a)| a.executables.is_empty()));
+        assert_eq!(bundled.comfy.assets["macos_arm64"].executables, ["python/bin/python3"]);
+        assert_eq!(Manifest::parse(&serde_json::to_string(&bundled).unwrap()).unwrap(), bundled.clone());
+
+        let with_executables = |executables: serde_json::Value| {
+            let mut json = serde_json::to_value(bundled).unwrap();
+            json["comfy"]["assets"]["nvidia"]["executables"] = executables;
+            Manifest::parse(&serde_json::to_string(&json).unwrap())
+        };
+        let declared = with_executables(serde_json::json!(["python/bin/python3", "ComfyUI/run.sh"])).unwrap();
+        assert_eq!(declared.comfy.assets["nvidia"].executables, ["python/bin/python3", "ComfyUI/run.sh"]);
+        assert!(with_executables(serde_json::json!([])).unwrap().comfy.assets["nvidia"].executables.is_empty());
+
+        for hostile in ["/bin/sh", "../escape", "bin/../python3", "C:/windows/system32/cmd.exe", r"bin\python3", "bin//python3", "", ".", "bin/."] {
+            assert!(with_executables(serde_json::json!([hostile])).is_err(), "accepted {hostile:?}");
+        }
+        assert!(with_executables(serde_json::json!(["a.sh", "a.sh"])).is_err(), "accepted a duplicate");
+        let many: Vec<String> = (0..=MAX_EXECUTABLES).map(|i| format!("bin/tool{i}")).collect();
+        assert!(with_executables(serde_json::json!(many)).is_err(), "accepted a build naming {MAX_EXECUTABLES}");
     }
 }

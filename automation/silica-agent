@@ -8,19 +8,61 @@ COMPLETED="$STATE/completed"
 QUARANTINED="$STATE/quarantined"
 FAILURES="$STATE/failures"
 LOCK="$STATE/lock"
-MODEL=${SILICA_MODEL:-qwen3.5:9b}
+BACKEND_CONFIG="$STATE/backend.conf"
 MAX_REPAIRS=${SILICA_MAX_REPAIRS:-3}
 MAX_FAILED_RUNS=${SILICA_MAX_FAILED_RUNS:-1}
-AGENT_TIMEOUT=${SILICA_AGENT_TIMEOUT:-3600}
+AGENT_TIMEOUT=${SILICA_AGENT_TIMEOUT:-5400}
 GATE_TIMEOUT=${SILICA_GATE_TIMEOUT:-3600}
 PUSH=${SILICA_PUSH:-0}
 GATE=${SILICA_GATE:-automation/gate}
-MIN_FREE_GB=${SILICA_MIN_FREE_GB:-80}
+MIN_FREE_GB=${SILICA_MIN_FREE_GB:-20}
 PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
+local_setting() {
+  key=$1
+  [ -f "$BACKEND_CONFIG" ] || return 0
+  awk -F= -v wanted="$key" '$1 == wanted { print substr($0, index($0, "=") + 1) }' "$BACKEND_CONFIG"
+}
+
+PROVIDER=${SILICA_PROVIDER:-$(local_setting SILICA_PROVIDER)}
+PROVIDER=${PROVIDER:-ollama}
+case "$PROVIDER" in
+  strata)
+    MODEL=${SILICA_MODEL:-$(local_setting SILICA_MODEL)}
+    MODEL=${MODEL:-qwen3.8-flash-next-unsloth-ud-iq4_xs}
+    SILICA_STRATA_BASE_URL=${SILICA_STRATA_BASE_URL:-$(local_setting SILICA_STRATA_BASE_URL)}
+    export SILICA_STRATA_BASE_URL
+    ;;
+  ollama)
+    MODEL=${SILICA_MODEL:-$(local_setting SILICA_MODEL)}
+    MODEL=${MODEL:-qwen3.5:9b}
+    ;;
+  *)
+    printf 'Unsupported SILICA_PROVIDER: %s\n' "$PROVIDER" >&2
+    exit 1
+    ;;
+esac
+
 say() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
+valid_strata_url() {
+  case "$1" in
+    http://*:8080) :;;
+    *) return 1;;
+  esac
+  host=${1#http://}
+  host=${host%:8080}
+  printf '%s\n' "$host" | awk -F. '
+    NF == 4 && $1 == 100 && $2 >= 64 && $2 <= 127 {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+      }
+      exit 0
+    }
+    { exit 1 }
+  '
+}
 checkpoint() {
   tmp="$STATE/checkpoint.tmp.$$"
   printf 'task=%s\nphase=%s\nattempt=%s\nhead=%s\nupdated=%s\n' "$TASK_NAME" "$1" "${2:-0}" "$(git -C "$ROOT" rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
@@ -61,6 +103,7 @@ acquire_lock() {
   printf '%s\n' "$$" > "$LOCK/pid"
 }
 unload_model() {
+  [ "$PROVIDER" = ollama ] || return 0
   ollama stop "$MODEL" >/dev/null 2>&1 || true
   i=0
   while ollama ps 2>/dev/null | grep -F "$MODEL" >/dev/null; do
@@ -69,13 +112,52 @@ unload_model() {
     sleep 1
   done
 }
+json_value() {
+  # The scalar value of a top-level field in a one-line JSON object: a string's contents, or a
+  # bare number/true/false/null. Whitespace around ":" does not matter.
+  value=$(printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$value" ] || value=$(printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([A-Za-z0-9.]*\).*/\1/p')
+  printf '%s' "$value"
+}
+STRATA_KEYCHAIN_SERVICE=${SILICA_STRATA_KEYCHAIN_SERVICE:-silicalayer-strata}
 preflight() {
   command -v git >/dev/null || die "git is missing"
   command -v opencode >/dev/null || die "OpenCode is missing"
-  command -v ollama >/dev/null || die "Ollama is missing"
   command -v cargo >/dev/null || die "Rust/Cargo is missing"
-  curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || die "Ollama is not listening on loopback"
-  ollama show "$MODEL" >/dev/null 2>&1 || die "Ollama model $MODEL is not installed"
+  command -v curl >/dev/null || die "curl is missing"
+  case "$PROVIDER" in
+    ollama)
+      command -v ollama >/dev/null || die "Ollama is missing"
+      curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || die "Ollama is not listening on loopback"
+      ollama show "$MODEL" >/dev/null 2>&1 || die "Ollama model $MODEL is not installed"
+      ;;
+    strata)
+      valid_strata_url "$SILICA_STRATA_BASE_URL" || die "Strata URL must be an explicit Tailscale IPv4 address on port 8080"
+      health=$(curl --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/health") || die "Strata health check failed"
+      [ "$(json_value "$health" status)" = ok ] || die "Strata is not healthy"
+      case "$(json_value "$health" api_key)" in
+        false)
+          SILICA_STRATA_API_KEY=strata-local
+          ;;
+        true)
+          SILICA_STRATA_API_KEY=$(security find-generic-password -s "$STRATA_KEYCHAIN_SERVICE" -w 2>/dev/null) || \
+            die "Strata requires an API key: store it with security add-generic-password -s $STRATA_KEYCHAIN_SERVICE -a strata -w"
+          [ -n "$SILICA_STRATA_API_KEY" ] || die "Strata API key in Keychain item $STRATA_KEYCHAIN_SERVICE is empty"
+          ;;
+        *)
+          die "Strata did not report its authentication mode"
+          ;;
+      esac
+      export SILICA_STRATA_API_KEY
+      ctx=$(json_value "$health" max_context)
+      case "$ctx" in ''|*[!0-9]*) die "Strata did not report max_context";; esac
+      [ "$ctx" -ge "${SILICA_MIN_CONTEXT:-131072}" ] || die "Strata context $ctx is below ${SILICA_MIN_CONTEXT:-131072}"
+      models=$(printf 'header = "Authorization: Bearer %s"\n' "$SILICA_STRATA_API_KEY" | \
+        curl -K - --connect-timeout 5 --max-time 15 -fsS "$SILICA_STRATA_BASE_URL/v1/models") || die "Strata model query failed"
+      printf '%s\n' "$models" | tr ',{}[]' '\n\n\n\n\n' | grep -E '^[[:space:]]*"id"[[:space:]]*:' | \
+        sed 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | grep -Fx "$MODEL" >/dev/null || die "Strata model $MODEL is not served"
+      ;;
+  esac
   [ "$(uname -m)" = arm64 ] || die "this worker is qualified only on Apple Silicon"
   free_kb=$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')
   [ "$free_kb" -ge $((MIN_FREE_GB * 1024 * 1024)) ] || die "less than ${MIN_FREE_GB} GiB is free"
@@ -96,7 +178,7 @@ preflight() {
     *) die "origin is not the expected private SilicaLayer repository";;
   esac
   [ -f "$ROOT/$GATE" ] || die "$GATE is missing"
-  say "preflight passed: model=$MODEL branch=$branch free=$((free_kb / 1024 / 1024))GiB"
+  say "preflight passed: provider=$PROVIDER model=$MODEL branch=$branch free=$((free_kb / 1024 / 1024))GiB"
 }
 next_task() {
   for file in "$ROOT"/automation/tasks/*.md; do
@@ -116,7 +198,7 @@ run_agent() {
   out=$3
   checkpoint "$phase" "${4:-0}"
   /usr/bin/perl -e '$t = shift @ARGV; alarm $t; exec @ARGV' "$AGENT_TIMEOUT" \
-    opencode run --standalone --archived --auto --model "ollama/$MODEL" --format json "$prompt" > "$out" 2>&1
+    opencode run --standalone --archived --auto --model "$PROVIDER/$MODEL" --format json "$prompt" < /dev/null > "$out" 2>&1
 }
 run_gate() {
   out=$1
@@ -191,6 +273,7 @@ one_run() {
 
 status() {
   printf '%s\n' 'SilicaLayer local supervisor'
+  printf 'provider=%s\nmodel=%s\n' "$PROVIDER" "$MODEL"
   if [ -f "$STATE/checkpoint" ]; then
     cat "$STATE/checkpoint"
   else

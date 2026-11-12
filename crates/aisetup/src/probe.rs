@@ -9,6 +9,7 @@ use photocraft_aigen::Launch;
 use serde::{Deserialize, Serialize};
 
 use crate::human_bytes;
+use crate::platform::{RuntimePlatform, RuntimeTarget};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,6 +166,11 @@ const WORTH_LISTING: u64 = 10_000_000_000;
 const LITTLE_MEMORY_MB: u64 = 15_000;
 /// A paging file set by hand to leave less than this (memory included) is called small.
 const SMALL_VIRTUAL_MB: u64 = 32_000;
+/// The least unified memory that qualifies an Apple Silicon host for local models: 24 GiB. The
+/// only qualified configuration is Z-Image Turbo INT8 on 24 GB (`docs/MPS_MODEL_SPIKE.md`), and
+/// that run already reached 21% free memory; below this the models may not fit. Unknown memory
+/// does not qualify either: it must not be assumed enough.
+pub const MIN_QUALIFIED_UNIFIED_MEMORY_MB: u64 = 24 * 1_024;
 
 /// `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits`
 pub fn parse_nvidia_smi(text: &str) -> Vec<Gpu> {
@@ -277,6 +283,16 @@ pub fn merge_gpus(system: Vec<Gpu>, smi: Vec<Gpu>) -> Vec<Gpu> {
     out
 }
 
+impl Os {
+    /// Whether the OS reports an Apple Silicon Mac: the architecture is
+    /// exactly `arm64`, as the macOS collector reports it. The comparison is
+    /// exact and case-sensitive — a malformed or foreign value that merely
+    /// resembles `arm64` does not count.
+    pub fn is_apple_silicon(&self) -> bool {
+        self.architecture == "arm64"
+    }
+}
+
 impl Probe {
     /// The card the engine would use: the one with the most memory among the best-supported
     /// vendor present (NVIDIA, then AMD, then Intel).
@@ -294,6 +310,29 @@ impl Probe {
     /// display adapter, or Windows' basic one, is not: the engine's PyTorch can't run on it.
     pub fn usable_gpu(&self) -> Option<&Gpu> {
         self.gpu().filter(|g| g.vendor != Vendor::Other)
+    }
+
+    /// Whether this host has hardware acceleration the managed runtime can use. Windows reports
+    /// discrete/display adapters above; Apple Silicon exposes its GPU through Metal/MPS instead.
+    pub fn has_usable_acceleration(&self) -> bool {
+        self.usable_gpu().is_some() || (self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon())
+    }
+
+    /// Whether the acceleration of this Apple Silicon host is qualified for local models: its
+    /// unified memory must be known and at least [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`].
+    pub fn unified_memory_qualified(&self) -> bool {
+        self.os.unified_memory_mb.is_some_and(|mb| mb >= MIN_QUALIFIED_UNIFIED_MEMORY_MB)
+    }
+
+    /// The memory, in megabytes, models are sized by: the best card's when the host reports
+    /// cards, and an Apple Silicon host's unified memory where it reports none. A host that
+    /// reports neither gives no figure.
+    pub fn model_memory_mb(&self) -> Option<u64> {
+        match self.gpu().and_then(|g| g.vram_mb) {
+            Some(mb) => Some(mb),
+            None if self.os.is_apple_silicon() => self.os.unified_memory_mb,
+            None => None,
+        }
     }
 
     /// The build of ComfyUI for this machine's card (a key of the manifest's assets), and
@@ -315,14 +354,34 @@ impl Probe {
         }
     }
 
+    /// The runtime target this machine's facts select, if any: the Windows
+    /// portable GPU runtime when this is a 64-bit Windows host (same variant
+    /// and qualification as [`Probe::variant`] reports), or the Apple Silicon
+    /// macOS runtime on a 64-bit `arm64` host, qualified only when its unified
+    /// memory is known and at least [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`]. Older
+    /// Intel Macs, 32-bit hosts and malformed facts select nothing.
+    pub fn runtime_target(&self) -> Option<RuntimeTarget> {
+        if self.os.windows && self.os.sixty_four_bit {
+            let (variant, qualified) = self.variant();
+            return Some(RuntimeTarget::new(RuntimePlatform::WindowsPortable, variant, qualified));
+        }
+        if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
+            return Some(RuntimeTarget::new(RuntimePlatform::MacosArm64, RuntimeTarget::MACOS_ARM64_VARIANT, self.unified_memory_qualified()));
+        }
+        None
+    }
+
     /// The drive with the most room.
     pub fn roomiest(&self) -> Option<&Drive> {
         self.drives.iter().max_by_key(|d| d.free)
     }
 
-    /// Can the app install the engine itself here?
+    /// Can the app install the engine itself here? Windows as ever; an Apple Silicon Mac whose
+    /// memory falls short of [`MIN_QUALIFIED_UNIFIED_MEMORY_MB`] like Windows' unqualified card
+    /// variants: install stays open, and the shortfall is said by the `gpu` check row and the
+    /// target's qualified flag rather than silently blocking or silently allowing.
     pub fn can_install(&self) -> bool {
-        self.os.windows && self.os.sixty_four_bit
+        (self.os.windows && self.os.sixty_four_bit) || self.runtime_target().is_some_and(|target| target.is_macos_arm64())
     }
 
     /// The rows of the first screen.
@@ -333,36 +392,60 @@ impl Probe {
         out.push(if self.can_install() {
             row("os", Level::Ok, format!("{}, 64-bit", self.os.name), "", "supported".into())
         } else if self.os.windows {
-            row("os", Level::Stop, self.os.name.clone(), "The engine needs 64-bit Windows.", "not supported".into())
+            row("os", Level::Stop, self.os.name.clone(), "The engine needs a 64-bit system.", "not supported".into())
         } else {
             let name = if self.os.name.is_empty() { "This system".to_string() } else { self.os.name.clone() };
-            row("os", Level::Stop, name, "Installing the engine for you is Windows only for now. Use my ComfyUI works here.", "use your own".into())
+            row(
+                "os",
+                Level::Stop,
+                name,
+                "Managed installation supports 64-bit Windows and Apple Silicon macOS. Use my ComfyUI works here.",
+                "use your own".into(),
+            )
         });
         // The graphics card.
-        out.push(match self.gpu() {
-            Some(gpu) => {
-                let (variant, tried) = self.variant();
-                let memory = gpu.vram_mb.map_or_else(String::new, |mb| format!("{} GB", (mb as f64 / 1024.0).round() as u64));
-                match (gpu.vendor, variant, tried) {
-                    (Vendor::Nvidia, "nvidia", _) => row("gpu", Level::Ok, gpu.name.clone(), "Graphics driver is recent enough", memory),
-                    (Vendor::Nvidia, _, _) => row(
-                        "gpu",
-                        Level::Info,
-                        gpu.name.clone(),
-                        "An older card or driver: the engine build for CUDA 12.6 will be installed. Updating the graphics driver is still a good idea.",
-                        memory,
+        out.push(if self.os.name == "macOS" && self.os.sixty_four_bit && self.os.is_apple_silicon() {
+            let memory = self.os.unified_memory_mb.map_or_else(String::new, |mb| format!("{} GB unified", (mb as f64 / 1024.0).round() as u64));
+            if self.unified_memory_qualified() {
+                row("gpu", Level::Ok, "Apple Silicon GPU".into(), "Metal Performance Shaders acceleration is available", memory)
+            } else {
+                row(
+                    "gpu",
+                    Level::Warn,
+                    "Apple Silicon GPU".into(),
+                    &format!(
+                        "Local models may not fit in this Mac's unified memory and would generate slowly: {} GB or more is qualified. Cloud models are recommended for speed; installing locally is still possible.",
+                        MIN_QUALIFIED_UNIFIED_MEMORY_MB / 1024
                     ),
-                    (Vendor::Amd | Vendor::Intel, _, _) => row(
-                        "gpu",
-                        Level::Warn,
-                        gpu.name.clone(),
-                        "Not tested: ComfyUI has a build for this card, but these models have only been run on NVIDIA cards. Cloud models work on any PC.",
-                        memory,
-                    ),
-                    _ => row("gpu", Level::Stop, gpu.name.clone(), NO_CARD, "can't run local models".into()),
-                }
+                    memory,
+                )
             }
-            None => row("gpu", Level::Stop, "No graphics card found".into(), NO_CARD, "can't run local models".into()),
+        } else {
+            match self.gpu() {
+                Some(gpu) => {
+                    let (variant, tried) = self.variant();
+                    let memory = gpu.vram_mb.map_or_else(String::new, |mb| format!("{} GB", (mb as f64 / 1024.0).round() as u64));
+                    match (gpu.vendor, variant, tried) {
+                        (Vendor::Nvidia, "nvidia", _) => row("gpu", Level::Ok, gpu.name.clone(), "Graphics driver is recent enough", memory),
+                        (Vendor::Nvidia, _, _) => row(
+                            "gpu",
+                            Level::Info,
+                            gpu.name.clone(),
+                            "An older card or driver: the engine build for CUDA 12.6 will be installed. Updating the graphics driver is still a good idea.",
+                            memory,
+                        ),
+                        (Vendor::Amd | Vendor::Intel, _, _) => row(
+                            "gpu",
+                            Level::Warn,
+                            gpu.name.clone(),
+                            "Not tested: ComfyUI has a build for this card, but these models have only been run on NVIDIA cards. Cloud models work on any PC.",
+                            memory,
+                        ),
+                        _ => row("gpu", Level::Stop, gpu.name.clone(), NO_CARD, "can't run local models".into()),
+                    }
+                }
+                None => row("gpu", Level::Stop, "No graphics card found".into(), NO_CARD, "can't run local models".into()),
+            }
         });
         // Memory: models load through it on their way to the card, and Windows' paging file makes
         // up what it lacks only while the paging file may grow.
@@ -417,7 +500,7 @@ impl Probe {
             }
         });
         // The Microsoft C++ runtime PyTorch needs: said only when the engine would go without it.
-        if self.vc_runtime == VcRuntime::Missing && self.can_install() {
+        if self.os.windows && self.vc_runtime == VcRuntime::Missing && self.can_install() {
             out.push(row(
                 "vcRuntime",
                 Level::Warn,
@@ -759,6 +842,126 @@ mod tests {
         assert!(with("AMD Radeon RX 7900 XTX", "31.0").usable_gpu().is_some() && with("NVIDIA GeForce RTX 3060", "591.59").usable_gpu().is_some());
         // Installing stays possible (on the processor): the system is fine, only the card is missing.
         assert!(vm.can_install());
+    }
+
+    #[test]
+    fn the_runtime_target_follows_the_host_and_the_card() {
+        let mut p = probe();
+        let target = p.runtime_target().expect("a 64-bit Windows host selects a target");
+        assert!(matches!(target.platform(), RuntimePlatform::WindowsPortable) && target.is_windows() && !target.is_macos_arm64());
+        assert_eq!((target.variant(), target.is_qualified()), ("nvidia", true));
+        // An older NVIDIA driver still selects Windows, with the CUDA 12.6 variant.
+        p.gpus[0].driver = "552.22".into();
+        let target = p.runtime_target().expect("older drivers still select a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("nvidia_cu126", true));
+        // AMD and Intel select the same platform with their own variants, unqualified.
+        p.gpus[0] = Gpu { vendor: Vendor::Amd, vram_mb: Some(12288), driver: "31.0".into(), name: "AMD Radeon RX 7900 XT".into() };
+        let target = p.runtime_target().expect("AMD still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("amd", false));
+        p.gpus[0] = Gpu { vendor: Vendor::Intel, vram_mb: Some(2048), driver: "31.0".into(), name: "Intel(R) Arc(TM) A770".into() };
+        let target = p.runtime_target().expect("Intel still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), ("intel", false));
+        // The variant and qualification are exactly what `variant()` reports: one source of truth.
+        let (variant, qualified) = p.variant();
+        let target = p.runtime_target().expect("Windows still selects a target");
+        assert_eq!((target.variant(), target.is_qualified()), (variant, qualified));
+    }
+
+    #[test]
+    fn the_runtime_target_selects_qualified_apple_silicon() {
+        let p = Probe {
+            os: Os {
+                name: "macOS".into(),
+                version: "26.1".into(),
+                architecture: "arm64".into(),
+                sixty_four_bit: true,
+                unified_memory_mb: Some(24_576),
+                ..Os::default()
+            },
+            ..Probe::default()
+        };
+        let target = p.runtime_target().expect("Apple Silicon selects a target");
+        assert!(matches!(target.platform(), RuntimePlatform::MacosArm64) && target.is_macos_arm64() && !target.is_windows());
+        assert_eq!(target.variant(), "macos_arm64");
+        assert!(target.is_qualified());
+        assert!(p.can_install());
+        assert!(p.has_usable_acceleration());
+        assert_eq!(p.model_memory_mb(), Some(24_576));
+        let gpu = p.checks().into_iter().find(|check| check.id == "gpu").expect("the acceleration check is present");
+        assert_eq!((gpu.level, gpu.title.as_str(), gpu.value.as_str()), (Level::Ok, "Apple Silicon GPU", "24 GB unified"));
+    }
+
+    /// Only 24 GiB of unified memory and above qualifies (Z-Image Turbo INT8 on 24 GB is the one
+    /// qualified configuration); below it, or with the memory unknown, the target is unqualified
+    /// and the card row warns. Install stays open either way, and a figure comes back for Macs so
+    /// preset selection and the light-preset suggestion work there.
+    #[test]
+    fn apple_silicon_qualifies_only_at_the_unified_memory_floor() {
+        let mac = |mb: Option<u64>| Probe {
+            os: Os { name: "macOS".into(), architecture: "arm64".into(), sixty_four_bit: true, unified_memory_mb: mb, ..Os::default() },
+            ..Probe::default()
+        };
+        let read = |mb: Option<u64>| {
+            let p = mac(mb);
+            let target = p.runtime_target().expect("Apple Silicon selects a target");
+            let gpu = p.checks().into_iter().find(|c| c.id == "gpu").expect("the acceleration check is present");
+            (target.is_qualified(), gpu.level, gpu.value, p.model_memory_mb(), p.can_install())
+        };
+        // Below the floor: unqualified, a warning and not a stop, and a memory figure all the same.
+        assert_eq!(read(Some(8_192)), (false, Level::Warn, "8 GB unified".to_string(), Some(8_192), true));
+        assert_eq!(read(Some(16_384)), (false, Level::Warn, "16 GB unified".to_string(), Some(16_384), true));
+        // 23.9 GiB rounds to 24 GB on the row and still is under the 24 GiB floor.
+        assert_eq!(read(Some(24_473)), (false, Level::Warn, "24 GB unified".to_string(), Some(24_473), true));
+        // Unknown memory is not qualified either: it must not be assumed enough.
+        assert_eq!(read(None), (false, Level::Warn, String::new(), None, true));
+        // At and above the floor: qualified, and the row reads as before.
+        assert_eq!(read(Some(24_576)), (true, Level::Ok, "24 GB unified".to_string(), Some(24_576), true));
+        assert_eq!(read(Some(65_536)), (true, Level::Ok, "64 GB unified".to_string(), Some(65_536), true));
+        // The warning says what it means, at the floor and with the memory unknown: local models
+        // may not fit here and would run slowly, cloud models are the fast way, and installing
+        // locally stays open.
+        for mb in [Some(8_192), None] {
+            let warn = mac(mb).checks().into_iter().find(|c| c.id == "gpu").expect("the card row");
+            assert_eq!((warn.level, warn.detail.contains("24 GB")), (Level::Warn, true), "{mb:?}");
+            assert!(warn.detail.contains("may not fit"), "{mb:?}: {}", warn.detail);
+            assert!(warn.detail.contains("Cloud models are recommended"), "{mb:?}: {}", warn.detail);
+            assert!(warn.detail.contains("installing locally is still possible"), "{mb:?}: {}", warn.detail);
+            assert!(mac(mb).can_install(), "{mb:?}");
+        }
+        // Windows is unchanged: the card's memory is the figure, and the card still qualifies.
+        let win = probe();
+        assert_eq!(win.model_memory_mb(), Some(24_564));
+        assert!(win.can_install() && win.runtime_target().is_some_and(|t| t.is_qualified()));
+    }
+
+    #[test]
+    fn the_runtime_target_never_selects_an_unsupported_mac_or_host() {
+        let mut p = Probe {
+            os: Os { name: "macOS".into(), version: "12.7".into(), architecture: "x86_64".into(), sixty_four_bit: true, ..Os::default() },
+            ..Probe::default()
+        };
+        assert!(p.runtime_target().is_none(), "an Intel Mac must not select a target");
+        p.os = Os { name: "macOS".into(), architecture: "arm64".into(), sixty_four_bit: false, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "arm64 without a 64-bit OS is an incomplete fact and must not select");
+        p.os = Os { name: "macOS".into(), architecture: "ARM64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "the architecture comparison is exact");
+        p.os = Os { name: "macOS".into(), architecture: " x86-64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "a malformed architecture must not select");
+        p.os = Os { name: "macOS".into(), architecture: "arm".into(), ..Os::default() };
+        assert!(p.runtime_target().is_none(), "a 32-bit architecture must not select");
+        p.os = Os { name: "Linux".into(), architecture: "arm64".into(), sixty_four_bit: true, ..Os::default() };
+        assert!(p.runtime_target().is_none(), "other operating systems select nothing");
+        // A default, unrun probe answers nothing.
+        assert!(Probe::default().runtime_target().is_none());
+    }
+
+    #[test]
+    fn apple_silicon_recognition_is_exact() {
+        assert!(Os { architecture: "arm64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "ARM64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "arm".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: "x86_64".into(), ..Os::default() }.is_apple_silicon());
+        assert!(!Os { architecture: String::new(), ..Os::default() }.is_apple_silicon());
     }
 
     #[test]

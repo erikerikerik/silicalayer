@@ -1,11 +1,32 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "ollama/qwen3.5:9b",
-  "providers": {
-    "ollama": {
-      "settings": {
-        "headerTimeout": 900000,
-        "chunkTimeout": 900000
+  "model": "strata/qwen3.8-flash-next-unsloth-ud-q5_k_xl",
+  "small_model": "strata/qwen3.8-flash-next-unsloth-ud-q5_k_xl",
+  "autoupdate": false,
+  "share": "disabled",
+  "compaction": {
+    "auto": true,
+    "buffer": 29298
+  },
+  "provider": {
+    "strata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Strata (private Tailscale host)",
+      "options": {
+        "baseURL": "{env:SILICA_STRATA_BASE_URL}/v1",
+        "apiKey": "{env:SILICA_STRATA_API_KEY}"
+      },
+      "models": {
+        "qwen3.8-flash-next-unsloth-ud-q5_k_xl": {
+          "name": "Qwen3.8-Flash-Next UD-Q5_K_XL (Strata)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "input": 122880,
+            "output": 8192
+          }
+        }
       }
     }
   },
@@ -14,23 +35,15 @@
     { "action": "read", "resource": "*.env", "effect": "deny" },
     { "action": "read", "resource": "*.env.*", "effect": "deny" },
     { "action": "read", "resource": "secrets/**", "effect": "deny" },
+    { "action": "read", "resource": ".silica-agent/**", "effect": "deny" },
     { "action": "edit", "resource": "*", "effect": "allow" },
     { "action": "edit", "resource": "opencode.json", "effect": "deny" },
     { "action": "edit", "resource": "automation/**", "effect": "deny" },
     { "action": "edit", "resource": ".github/**", "effect": "deny" },
+    { "action": "edit", "resource": ".silica-agent/**", "effect": "deny" },
     { "action": "glob", "resource": "*", "effect": "allow" },
     { "action": "grep", "resource": "*", "effect": "allow" },
     { "action": "shell", "resource": "*", "effect": "deny" },
-    { "action": "shell", "resource": "git status*", "effect": "allow" },
-    { "action": "shell", "resource": "git diff*", "effect": "allow" },
-    { "action": "shell", "resource": "git log*", "effect": "allow" },
-    { "action": "shell", "resource": "git show*", "effect": "allow" },
-    { "action": "shell", "resource": "git grep*", "effect": "allow" },
-    { "action": "shell", "resource": "rg *", "effect": "allow" },
-    { "action": "shell", "resource": "sed *", "effect": "allow" },
-    { "action": "shell", "resource": "find *", "effect": "allow" },
-    { "action": "shell", "resource": "ls *", "effect": "allow" },
-    { "action": "shell", "resource": "pwd", "effect": "allow" },
     { "action": "subagent", "resource": "*", "effect": "deny" },
     { "action": "question", "resource": "*", "effect": "deny" },
     { "action": "webfetch", "resource": "*", "effect": "deny" },
@@ -39,6 +52,7 @@
   ],
   "policies": [
     { "action": "provider.use", "resource": "*", "effect": "deny" },
-    { "action": "provider.use", "resource": "ollama", "effect": "allow" }
+    { "action": "provider.use", "resource": "ollama", "effect": "allow" },
+    { "action": "provider.use", "resource": "strata", "effect": "allow" }
   ]
 }

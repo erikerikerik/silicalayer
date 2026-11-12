@@ -437,6 +437,7 @@ pub fn probe_with_comfy_at(dir: &Path, version: &str) -> Value {
         python: dir.join("Documents").join("ComfyUI").join(".venv").join("Scripts").join("python.exe").to_string_lossy().into_owned(),
         folder: dir.join("ComfyUI-Installs").join("ComfyUI").to_string_lossy().into_owned(),
         args: "ComfyUI\\main.py --enable-manager".into(),
+        ..Default::default()
     };
     probe_with(dir, Existing { running: Vec::new(), installed: Some(launch), models: comfy_folders(dir), version: version.into() })
 }
@@ -453,6 +454,8 @@ fn probe_with(dir: &Path, comfy: Existing) -> Value {
             memory_mb: Some(65_536),
             virtual_mb: Some(75_000),
             paging_managed: Some(true),
+            architecture: String::new(),
+            unified_memory_mb: None,
         },
         gpus: vec![Gpu { name: "NVIDIA GeForce RTX 4090".into(), vendor: Vendor::Nvidia, vram_mb: Some(24564), driver: "591.59".into() }],
         drives: vec![Drive { name: "D:".into(), free: 412_000_000_000, total: 2_000_000_000_000 }],
@@ -465,11 +468,12 @@ fn probe_with(dir: &Path, comfy: Existing) -> Value {
 
 /// `ai.setup.probe`'s answer for `p`.
 fn describe(dir: &Path, p: &photocraft_aisetup::probe::Probe) -> Value {
-    let (variant, tested) = p.variant();
+    let target = p.runtime_target();
+    let (variant, tested) = target.as_ref().map_or_else(|| p.variant(), |target| (target.variant(), target.is_qualified()));
     let vram = p.usable_gpu().and_then(|g| g.vram_mb).map(|mb| (mb as f64 / 1024.0).round() as u64);
     json!({
-        "probe": p, "checks": p.checks(), "variant": variant, "variantTested": tested, "canInstall": p.can_install(),
-        "gpuUsable": p.usable_gpu().is_some(), "vramGb": vram,
+        "probe": p, "checks": p.checks(), "runtimeTarget": target, "variant": variant, "variantTested": tested, "canInstall": p.can_install(),
+        "gpuUsable": p.has_usable_acceleration(), "vramGb": vram,
         "defaults": {"engineDir": dir.join("engine").to_string_lossy(), "modelsDir": dir.join("models").to_string_lossy()},
     })
 }
