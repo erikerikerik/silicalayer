@@ -414,7 +414,7 @@ impl Probe {
                     Level::Warn,
                     "Apple Silicon GPU".into(),
                     &format!(
-                        "Local models may not fit in this Mac's unified memory: {} GB or more is qualified. Cloud models work on any Mac.",
+                        "Local models may not fit in this Mac's unified memory and would generate slowly: {} GB or more is qualified. Cloud models are recommended for speed; installing locally is still possible.",
                         MIN_QUALIFIED_UNIFIED_MEMORY_MB / 1024
                     ),
                     memory,
@@ -917,9 +917,17 @@ mod tests {
         // At and above the floor: qualified, and the row reads as before.
         assert_eq!(read(Some(24_576)), (true, Level::Ok, "24 GB unified".to_string(), Some(24_576), true));
         assert_eq!(read(Some(65_536)), (true, Level::Ok, "64 GB unified".to_string(), Some(65_536), true));
-        // The warning says what it means: the models may not fit here, and cloud models still work.
-        let warn = mac(Some(8_192)).checks().into_iter().find(|c| c.id == "gpu").expect("the card row");
-        assert!(warn.detail.contains("may not fit") && warn.detail.contains("24 GB") && warn.detail.contains("Cloud models"), "{}", warn.detail);
+        // The warning says what it means, at the floor and with the memory unknown: local models
+        // may not fit here and would run slowly, cloud models are the fast way, and installing
+        // locally stays open.
+        for mb in [Some(8_192), None] {
+            let warn = mac(mb).checks().into_iter().find(|c| c.id == "gpu").expect("the card row");
+            assert_eq!((warn.level, warn.detail.contains("24 GB")), (Level::Warn, true), "{mb:?}");
+            assert!(warn.detail.contains("may not fit"), "{mb:?}: {}", warn.detail);
+            assert!(warn.detail.contains("Cloud models are recommended"), "{mb:?}: {}", warn.detail);
+            assert!(warn.detail.contains("installing locally is still possible"), "{mb:?}: {}", warn.detail);
+            assert!(mac(mb).can_install(), "{mb:?}");
+        }
         // Windows is unchanged: the card's memory is the figure, and the card still qualifies.
         let win = probe();
         assert_eq!(win.model_memory_mb(), Some(24_564));

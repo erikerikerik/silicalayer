@@ -383,6 +383,7 @@
     }
   ],
   "presets": {
+    "apple-silicon": ["z-image-turbo"],
     "light": ["moss-image"],
     "starter": ["qwen-image-2-1"],
     "recommended": ["qwen-image-2-1", "z-image-turbo", "flux-3-klein"],

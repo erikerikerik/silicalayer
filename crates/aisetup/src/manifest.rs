@@ -311,20 +311,41 @@ impl Manifest {
         self.presets.get(name).map_or(&[], Vec::as_slice)
     }
 
-    /// The preset the wizard starts on for a card with `vram_gb` of memory: `light` on a card
-    /// with less than [`LIGHT_BELOW_VRAM_GB`], `recommended` otherwise and when it is not known.
-    pub fn suggested_preset(&self, vram_gb: Option<u64>) -> &'static str {
+    /// The preset the wizard starts on for `platform` with `vram_gb` of memory: the
+    /// Apple-silicon set on an Apple-silicon Mac whenever the manifest names one — unified
+    /// memory is shared with the system, so the card rule below says nothing useful there, and
+    /// only the models in that preset are qualified on MPS (task 015) — whatever the memory.
+    /// Otherwise `light` on a card with less than [`LIGHT_BELOW_VRAM_GB`], `recommended`
+    /// otherwise and when the memory is not known. `platform` is `None` when the caller has
+    /// not looked the host up, or on a host with no managed build.
+    pub fn suggested_preset_for(&self, platform: Option<RuntimePlatform>, vram_gb: Option<u64>) -> &'static str {
+        if platform == Some(RuntimePlatform::MacosArm64) && !self.preset("apple-silicon").is_empty() {
+            return "apple-silicon";
+        }
         let small = vram_gb.is_some_and(|gb| gb < LIGHT_BELOW_VRAM_GB);
         if small && !self.preset("light").is_empty() { "light" } else { "recommended" }
     }
 
-    /// The models in the order the wizard lists them for a card with `vram_gb` of memory: the
-    /// suggested preset's first, the rest in the manifest's order.
-    pub fn offered(&self, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
-        let first = self.preset(self.suggested_preset(vram_gb));
+    /// The preset the wizard starts on for a card with `vram_gb` of memory: a thin wrapper over
+    /// [`Self::suggested_preset_for`] without a platform, the rule from before Apple-silicon
+    /// hosts were told apart.
+    pub fn suggested_preset(&self, vram_gb: Option<u64>) -> &'static str {
+        self.suggested_preset_for(None, vram_gb)
+    }
+
+    /// The models in the order the wizard lists them for `platform` with `vram_gb` of memory:
+    /// the suggested preset's first, the rest in the manifest's order.
+    pub fn offered_for(&self, platform: Option<RuntimePlatform>, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
+        let first = self.preset(self.suggested_preset_for(platform, vram_gb));
         let (mut out, rest): (Vec<&ModelEntry>, Vec<&ModelEntry>) = self.models.iter().partition(|m| first.contains(&m.id));
         out.extend(rest);
         out
+    }
+
+    /// The models in the order the wizard lists them for a card with `vram_gb` of memory: a thin
+    /// wrapper over [`Self::offered_for`] without a platform.
+    pub fn offered(&self, vram_gb: Option<u64>) -> Vec<&ModelEntry> {
+        self.offered_for(None, vram_gb)
     }
 
     /// The models named by `ids`, in the manifest's order; an unknown id is an error.
@@ -692,6 +713,59 @@ mod tests {
         without.presets.remove("light");
         assert_eq!(without.suggested_preset(Some(8)), "recommended");
         assert_eq!(without.offered(Some(8)).first().map(|x| x.id.as_str()), Some("qwen-image-2-1"));
+    }
+
+    /// An Apple-silicon Mac is offered the Apple-silicon preset (only models qualified on MPS)
+    /// whatever its unified memory reports: the card rule reads shared memory as if it were a
+    /// card's VRAM and would suggest models that do not qualify there (task 015).
+    #[test]
+    fn an_apple_silicon_mac_is_offered_the_apple_silicon_preset_at_any_memory() {
+        let m = bundled();
+        assert_eq!(m.preset("apple-silicon"), ["z-image-turbo"]);
+        for vram in [Some(8), Some(16), Some(24), Some(64), None] {
+            assert_eq!(m.suggested_preset_for(Some(RuntimePlatform::MacosArm64), vram), "apple-silicon", "{vram:?}");
+        }
+        let order = |vram| m.offered_for(Some(RuntimePlatform::MacosArm64), vram).iter().map(|x| x.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(order(Some(8))[0], "z-image-turbo");
+        assert_eq!(order(Some(8)).len(), m.models.len());
+        assert_eq!(order(Some(8)), order(Some(64)));
+    }
+
+    /// Without an Apple-silicon host in front — unknown platform or Windows — the suggestion is
+    /// exactly the memory rule it was before, and the old entry points say the same.
+    #[test]
+    fn only_apple_silicon_macs_leave_the_memory_rule() {
+        let m = bundled();
+        for (platform, vram, preset) in [
+            (None, Some(8), "light"),
+            (None, Some(24), "recommended"),
+            (None, None, "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), Some(8), "light"),
+            (Some(RuntimePlatform::WindowsPortable), Some(16), "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), Some(24), "recommended"),
+            (Some(RuntimePlatform::WindowsPortable), None, "recommended"),
+        ] {
+            assert_eq!(m.suggested_preset_for(platform, vram), preset, "{platform:?} {vram:?}");
+        }
+        assert_eq!(m.offered_for(Some(RuntimePlatform::WindowsPortable), Some(8)).first().map(|x| x.id.as_str()), Some("moss-image"));
+        assert_eq!(m.offered_for(Some(RuntimePlatform::WindowsPortable), Some(8)), m.offered(Some(8)));
+        assert_eq!(m.suggested_preset_for(None, Some(8)), m.suggested_preset(Some(8)));
+    }
+
+    /// A manifest that does not name an Apple-silicon preset (an older one on the wire) leaves
+    /// the Mac on the memory rule, as before; an empty one suggests nothing either.
+    #[test]
+    fn a_manifest_without_the_apple_silicon_preset_falls_back_on_mac() {
+        let mut without = bundled().clone();
+        without.presets.remove("apple-silicon");
+        assert_eq!(without.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(8)), "light");
+        assert_eq!(without.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(24)), "recommended");
+        assert_eq!(without.offered_for(Some(RuntimePlatform::MacosArm64), Some(8)).first().map(|x| x.id.as_str()), Some("moss-image"));
+        let mut empty = bundled().clone();
+        if let Some(ids) = empty.presets.get_mut("apple-silicon") {
+            ids.clear();
+        }
+        assert_eq!(empty.suggested_preset_for(Some(RuntimePlatform::MacosArm64), Some(8)), "light");
     }
 
     #[test]

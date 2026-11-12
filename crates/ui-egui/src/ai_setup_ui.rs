@@ -1130,6 +1130,15 @@ fn offer_choice(app: &PhotocraftApp) -> bool {
     app.ui.ai_setup.probe.is_some() && list(&status, "/engines").is_empty() && !matches!(text(&status, "/state"), "done" | "running")
 }
 
+/// Does the look at this PC say cloud models are the way to go: an Apple-silicon Mac whose
+/// unified memory sits below the local floor? Its models would load, but run slowly and may not
+/// fit, so the cloud path is recommended for speed. A recommendation only: installing locally
+/// stays possible, and nothing here is clicked or opened by itself.
+fn cloud_recommended(app: &PhotocraftApp) -> bool {
+    let Some(probe) = app.ui.ai_setup.probe.as_ref() else { return false };
+    text(probe, "/runtimeTarget/platform") == "macosArm64" && probe.pointer("/runtimeTarget/qualified").and_then(Value::as_bool) == Some(false)
+}
+
 /// Is this PC being looked at for the first time: nothing set up, nothing begun, and no answer
 /// yet? The first screen is then only its steps, in the middle.
 fn first_look(app: &PhotocraftApp) -> bool {
@@ -1293,7 +1302,7 @@ fn name_preset(app: &mut PhotocraftApp) {
         b.sort();
         a == b
     };
-    app.ui.ai_setup.preset = PRESETS.into_iter().map(|(key, _)| key).find(|p| same(p)).unwrap_or("custom").to_string();
+    app.ui.ai_setup.preset = presets(app).into_iter().map(|(key, _)| key).find(|p| same(p)).unwrap_or("custom").to_string();
 }
 
 // ---------- the test image ----------
@@ -1692,9 +1701,27 @@ fn choice(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let area = ui.available_rect_before_wrap();
     let gap = 12.0;
     let width = ((area.width() - gap) / 2.0).max(0.0);
-    let height = area.height().clamp(0.0, 80.0);
-    let mine = Rect::from_min_size(area.min, vec2(width, height));
-    let new = Rect::from_min_size(pos2(area.left() + width + gap, area.top()), vec2(width, height));
+    let mut height = area.height().clamp(0.0, 80.0);
+    let mut top = area.min.y;
+    // The one-line reason the footer recommends the cloud, right above the local paths it is
+    // weighing against. An Apple-silicon Mac under the floor can still install here: both
+    // buttons stay as they are, only the note says which way is faster. The screen's height
+    // allows this line under the same condition (see where `note` is asked in `window`).
+    if cloud_recommended(app) {
+        let t = Tokens::get(ui.ctx());
+        let painter = ui.painter();
+        painter.text(
+            pos2(area.left(), top + 11.0),
+            egui::Align2::LEFT_CENTER,
+            tr("This Mac's unified memory is below what local models want: cloud models are faster here. Local ones can still be installed below."),
+            crate::theme::medium(11.5),
+            t.text_dim,
+        );
+        top += 22.0;
+        height = (height - 22.0).max(0.0);
+    }
+    let mine = Rect::from_min_size(pos2(area.left(), top), vec2(width, height));
+    let new = Rect::from_min_size(pos2(area.left() + width + gap, top), vec2(width, height));
     // Each in a Ui of its own: side by side, and the second greyed where it can't install.
     let mut left = ui.new_child(UiBuilder::new().max_rect(mine));
     let r = choice_button(&mut left, mine, mine_title, mine_sub, "", false);
@@ -2017,6 +2044,17 @@ fn licence_note(model: &Value) -> String {
 /// The presets of the Models step, smallest first: `light` is the one for a small card.
 const PRESETS: [(&str, &str); 4] = [("light", "Light"), ("starter", "Starter"), ("recommended", "Recommended"), ("everything", "Everything")];
 
+/// The presets in use: the four above, and on an Apple-silicon Mac the manifest's qualified set
+/// first (task 015) when it has models. Elsewhere, and without that preset, exactly the four.
+fn presets(app: &PhotocraftApp) -> Vec<(&'static str, &'static str)> {
+    let mut presets = PRESETS.to_vec();
+    let qualified = app.ui.ai_setup.manifest.as_ref().is_some_and(|m| !list(m, "/presets/apple-silicon/models").is_empty());
+    if qualified && RuntimePlatform::host() == Some(RuntimePlatform::MacosArm64) {
+        presets.insert(0, ("apple-silicon", "Apple Silicon"));
+    }
+    presets
+}
+
 fn page_models(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     heading(ui, "Choose your models", "Each model is a few large files. Files that models share are downloaded once. You can add more later.");
@@ -2026,7 +2064,7 @@ fn page_models(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let mut chosen_preset = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        for (key, label) in PRESETS {
+        for (key, label) in presets(app) {
             let bytes = number(&manifest, &format!("/presets/{key}/bytes"));
             if widgets::pill_tab(ui, &format!("{} · {}", tr(label), download_size(bytes)), app.ui.ai_setup.preset == key).clicked() {
                 chosen_preset = Some(key);
@@ -2599,7 +2637,11 @@ fn footer(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         use_existing(app);
                     }
                 }
-                let r = widgets::secondary_button(ui, tr("Cloud Models Only"), 0.0);
+                // Under the memory floor the cloud path is the fast one: mark it, don't open it.
+                let recommend = cloud_recommended(app);
+                let cloud_label =
+                    if recommend { format!("{} · {}", tr("Cloud Models Only"), tr("Recommended for this Mac")) } else { tr("Cloud Models Only").to_string() };
+                let r = if recommend { widgets::primary_button(ui, &cloud_label, 0.0) } else { widgets::secondary_button(ui, &cloud_label, 0.0) };
                 if r.on_hover_text(tr("Skip local models: add an API key for OpenAI, Google, xAI, Meta or Black Forest Labs instead")).clicked() {
                     app.ui.ai_setup.open = false;
                     crate::ai_gen_ui::open_api_keys(app);
@@ -2805,7 +2847,11 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
             let content = Rect::from_min_max(pos2(side.right(), title.bottom()), rect.max).shrink2(vec2(28.0, 18.0));
             let foot = Rect::from_min_max(pos2(content.left(), content.bottom() - 46.0), content.max);
             // Which ComfyUI to use is asked above the footer, where it is seen.
-            let choice_height = if app.ui.ai_setup.page == Page::Pc && offer_choice(app) { CHOICE } else { 0.0 };
+            let choosing = app.ui.ai_setup.page == Page::Pc && offer_choice(app);
+            // The note above the big buttons needs its own line: only where it is drawn, on the
+            // screens that show the cards (a setup in progress leaves them behind).
+            let note = choosing && cloud_recommended(app);
+            let choice_height = if choosing { CHOICE + if note { 22.0 } else { 0.0 } } else { 0.0 };
             let body = Rect::from_min_max(content.min, pos2(content.right(), foot.top() - 8.0 - choice_height));
             if choice_height > 0.0 {
                 let strip = Rect::from_min_max(pos2(content.left(), body.bottom() + 12.0), pos2(content.right(), foot.top() - 4.0));

@@ -178,6 +178,9 @@ mod native {
             assert!(!s.is_enabled(id), "{id}");
         }
         // What can be installed is no secret: the bundled manifest, with its totals.
+        // An Apple-silicon Mac suggests its own preset whatever the memory; the test runs on
+        // the machine it is checked out on, so that decides which rule the answers follow.
+        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         let m = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
         assert_eq!(m["comfy"]["version"], "0.43.0");
         assert_eq!(m["models"].as_array().unwrap().len(), 10);
@@ -185,7 +188,7 @@ mod native {
             (m["presets"]["starter"]["bytes"].as_u64(), m["presets"]["recommended"]["models"].as_array().map(Vec::len)),
             (Some(18_520_930_264), Some(3))
         );
-        let qwen = &m["models"][0];
+        let qwen = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "qwen-image-2-1").unwrap();
         assert_eq!(
             (qwen["id"].as_str(), qwen["installed"].as_bool(), qwen["fit"].as_str(), qwen["licence"]["commercial"].as_bool()),
             (Some("qwen-image-2-1"), Some(false), Some("tested"), Some(false))
@@ -198,16 +201,23 @@ mod native {
         for preset in ["light", "starter", "recommended"] {
             assert!(!m["presets"][preset]["models"].as_array().unwrap().iter().any(|id| id == "fibo-2-dev"), "{preset}");
         }
-        assert_eq!(m["suggested"], "recommended");
+        // The Apple-silicon preset holds the one model qualified on MPS, everywhere the
+        // manifest ships; only a Mac is suggested to start on it.
+        assert_eq!(m["presets"]["apple-silicon"]["models"], json!(["z-image-turbo"]));
+        assert_eq!(m["suggested"], if apple { "apple-silicon" } else { "recommended" });
         // A smaller card than any it has run on: not tested, and it says so instead of guessing.
-        // It starts on the light preset, its model listed first.
+        // It starts on the light preset, its model listed first — on an Apple-silicon Mac on
+        // its own preset instead, first too, whatever the memory.
         let small = s.execute("ai.setup.manifest", json!({"vramGb": 8})).unwrap();
-        assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some("light"), Some("moss-image")));
+        let want = if apple { ("apple-silicon", "z-image-turbo") } else { ("light", "moss-image") };
+        assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some(want.0), Some(want.1)));
         assert_eq!(small["presets"]["light"]["models"], json!(["moss-image"]));
-        assert_eq!(small["models"][0]["fit"], "untested");
+        let moss = small["models"].as_array().unwrap().iter().find(|x| x["id"] == "moss-image").unwrap();
+        assert_eq!(moss["fit"], "untested");
         assert_eq!(small["models"][1]["id"], "qwen-image-2-1");
         let unknown = s.execute("ai.setup.manifest", json!({})).unwrap();
-        assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some("recommended"), Some("untested")));
+        let want = if apple { "apple-silicon" } else { "recommended" };
+        assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some(want), Some("untested")));
         let status = s.execute("ai.setup.status", json!({})).unwrap();
         assert_eq!((status["available"].as_bool(), status["state"].as_str(), status["running"].as_bool()), (Some(false), Some("none"), Some(false)));
         assert_eq!(s.execute("ai.setup.cancel", json!({})).unwrap()["stopping"], false);

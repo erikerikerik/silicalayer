@@ -63,10 +63,12 @@ fn fit(model: &photocraft_aisetup::manifest::ModelEntry, vram_gb: Option<u64>) -
 /// What the wizard offers, with sizes: `{comfy, models, presets, suggested}`. `installed`
 /// (manifest ids) marks the models that are there already, and `linked` those of them that are
 /// there only because the user's own models folders have their files (they are not the setup's
-/// to delete). A small card is offered the light preset, its models listed first.
+/// to delete). The suggested preset follows this host: the Apple-silicon set on an
+/// Apple-silicon Mac, else the light preset on a small card; its models are listed first.
 fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb: Option<u64>) -> Value {
+    let host = photocraft_aisetup::RuntimePlatform::host();
     let models: Vec<Value> = m
-        .offered(vram_gb)
+        .offered_for(host, vram_gb)
         .into_iter()
         .map(|model| {
             let files: Vec<Value> =
@@ -85,13 +87,13 @@ fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb
     // Only the builds this computer could actually run are worth offering; a host with no
     // managed build (Linux, an Intel Mac, the browser) still sees every build.
     let build = |a: &photocraft_aisetup::manifest::Asset| json!({"bytes": a.size, "unpackedBytes": a.unpacked_bytes});
-    let assets: serde_json::Map<String, Value> = match photocraft_aisetup::RuntimePlatform::host() {
-        Some(host) => m.assets_for(host).into_iter().map(|(name, a)| (name.to_string(), build(a))).collect(),
+    let assets: serde_json::Map<String, Value> = match host {
+        Some(platform) => m.assets_for(platform).into_iter().map(|(name, a)| (name.to_string(), build(a))).collect(),
         None => m.comfy.assets.iter().map(|(name, a)| (name.clone(), build(a))).collect(),
     };
     json!({
         "version": m.version, "checked": m.checked, "comfy": {"version": m.comfy.version, "builds": assets}, "models": models, "presets": presets,
-        "suggested": m.suggested_preset(vram_gb),
+        "suggested": m.suggested_preset_for(host, vram_gb),
     })
 }
 
@@ -1270,7 +1272,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Local AI Models to Install",
             menu: &[],
             shortcut: None,
-            params: r##"{"vramGb":int?,"extraModelsDirs":[path,…]? (count these as the engine's, instead of the last setup's)} → {comfy:{version,builds},models:[{id,name,about,family,does:[create|edit|fill],licence:{name,url,commercial (true|false|null: read the licence)},page,gated (needs a Hugging Face sign-in),minVramGb,testedVramGb,bytes (downloaded alone),files:[{key,bytes,gated}],installed,linked (installed only because the user's own models folders have its files: not the setup's to delete),fit:tested|untested|tooLarge,minComfy (the first ComfyUI version that runs it)}],presets:{light|starter|recommended|everything:{models,bytes (shared files counted once)}},suggested:light|recommended (the preset to start on: light on a card under 16 GB, its models then listed first)}: what the setup can install"##,
+            params: r##"{"vramGb":int?,"extraModelsDirs":[path,…]? (count these as the engine's, instead of the last setup's)} → {comfy:{version,builds},models:[{id,name,about,family,does:[create|edit|fill],licence:{name,url,commercial (true|false|null: read the licence)},page,gated (needs a Hugging Face sign-in),minVramGb,testedVramGb,bytes (downloaded alone),files:[{key,bytes,gated}],installed,linked (installed only because the user's own models folders have its files: not the setup's to delete),fit:tested|untested|tooLarge,minComfy (the first ComfyUI version that runs it)}],presets:{apple-silicon|light|starter|recommended|everything:{models,bytes (shared files counted once)}},suggested:apple-silicon|light|recommended (the preset to start on: the Apple-silicon set on an Apple-silicon Mac, else light on a card under 16 GB, its models then listed first)}: what the setup can install"##,
             enabled: always,
             run: imp::manifest_cmd,
             journal: false,
