@@ -491,6 +491,70 @@ fn recover_replaced(layout: &Layout) {
     }
 }
 
+/// The empty file that tells Spotlight to leave a folder alone.
+const NEVER_INDEX: &str = ".metadata_never_index";
+
+/// Tell macOS to leave a folder this app can rebuild by itself alone: `tmutil addexclusion`
+/// takes it out of Time Machine's way, and an empty `.metadata_never_index` out of Spotlight's.
+/// The engine is reproducible from its pinned, checksummed archive, so both are pure cost on
+/// the ~2 GB of Python and ComfyUI it unpacks. Neither is owed the install: on a machine that
+/// has no `tmutil`, on which it refuses, or on which the marker file cannot be written, the
+/// engine works just the same - so `run`'s answer, and any write error, stop here.
+fn exclude_from_backup_and_index(dir: &Path, run: &dyn Fn(&str, &[&str]) -> bool) {
+    let path = dir.to_string_lossy();
+    run("tmutil", &["addexclusion", path.as_ref()]);
+    let _ = std::fs::write(dir.join(NEVER_INDEX), b"");
+}
+
+/// Runs a system tool with its stdin, stdout and stderr all sent away, and answers only
+/// whether it exited zero: a tool that is missing or refuses is a plain `false`, never an error.
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn run_quietly(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// In the browser there are no system tools to run, so nothing to exclude a folder with: the
+/// answer no managed install could ever need there.
+#[cfg(all(not(test), target_arch = "wasm32"))]
+fn run_quietly(_: &str, _: &[&str]) -> bool {
+    false
+}
+
+/// In tests nothing is run at all: every call is recorded for [`process_calls`] to read back
+/// and answered as [`set_process_reply`] last said. The log is process-wide because a setup
+/// runs on its worker thread and the tests run in parallel - a rig's folders live in its own
+/// tempdir, so a test only ever counts the calls that name its own.
+#[cfg(test)]
+fn run_quietly(program: &str, args: &[&str]) -> bool {
+    PROCESS_CALLS.lock().unwrap_or_else(PoisonError::into_inner).push((program.to_string(), args.iter().map(|a| a.to_string()).collect()));
+    PROCESS_REPLY.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static PROCESS_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+static PROCESS_REPLY: AtomicBool = AtomicBool::new(true);
+
+/// What a system tool answers for the rest of the test run: a fake that refuses lets a test
+/// show the install carries on without it.
+#[cfg(test)]
+fn set_process_reply(ok: bool) {
+    PROCESS_REPLY.store(ok, Ordering::SeqCst);
+}
+
+/// Every system tool call made so far, in order: the program, then its arguments.
+#[cfg(test)]
+fn process_calls() -> Vec<(String, Vec<String>)> {
+    PROCESS_CALLS.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 /// Unpack the runtime archive into the engine folder, then delete the archive. A marked engine
 /// already standing there is moved aside rather than deleted, so a repair that fails or is
 /// cancelled puts it back (see the body).
@@ -532,6 +596,12 @@ fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: 
             let _ = clear_replaced(&replaced);
             // 2 GB the engine no longer needs.
             let _ = std::fs::remove_file(&layout.archive);
+            // And the ~2 GB it is: Python and ComfyUI the machine can lay down again from the
+            // pinned, checksummed archive, so neither Time Machine nor Spotlight is to spend
+            // itself on them. The macOS managed engine only, and a polite ask: see the helper.
+            if job.choices.platform == RuntimePlatform::MacosArm64 {
+                exclude_from_backup_and_index(&layout.engine_root, &run_quietly);
+            }
             Ok(())
         }
         Err(e) => {

@@ -1109,6 +1109,70 @@ fn an_engine_set_aside_by_an_interrupted_repair_is_restored_or_cleared_at_the_ne
     assert_eq!(std::fs::read(layout.engine_root.join("my-file.txt")).unwrap(), b"mine", "the engine in place is the one that stays");
 }
 
+/// Calls to a system tool naming a path under `dir`. The log is process-wide (a setup runs on
+/// its worker thread beside the other tests), but a rig's folders live in its own tempdir, so
+/// counting the calls that name this rig's paths is exact whatever else runs at the same time.
+fn process_calls_under(dir: &Path) -> Vec<(String, Vec<String>)> {
+    let dir = dir.to_string_lossy().into_owned();
+    process_calls().into_iter().filter(|(_, args)| args.iter().any(|arg| arg.starts_with(&dir))).collect()
+}
+
+/// The managed engine unpacks ~2 GB of Python and ComfyUI that come back on their own from the
+/// pinned, checksummed archive: a finished macOS install tells Time Machine and Spotlight to
+/// leave it alone, and only it - what the user put beside it stays backed up and indexed.
+#[test]
+fn a_completed_macos_managed_install_excludes_its_engine_from_time_machine_and_spotlight() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    let root = layout.engine_root.to_string_lossy().into_owned();
+    let tmutil: Vec<Vec<String>> =
+        process_calls_under(&layout.engine_root).into_iter().filter(|(program, _)| program == "tmutil").map(|(_, args)| args).collect();
+    assert_eq!(tmutil, vec![vec!["addexclusion".to_string(), root]], "one `tmutil addexclusion` of the engine, and nothing else");
+    assert!(layout.engine_root.join(".metadata_never_index").is_file(), "Spotlight's marker stands in the engine folder");
+}
+
+#[test]
+fn an_engine_whose_tmutil_fails_still_finishes_the_install() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    set_process_reply(false);
+    let done = rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    assert!(done.launch.is_some(), "an exclusion that was refused is not a failed install");
+    assert_eq!(process_calls_under(&layout.engine_root).len(), 1, "the call was still made");
+    assert!(layout.engine_root.join(".metadata_never_index").is_file(), "a refused tool does not hold back the marker file");
+}
+
+#[test]
+fn a_macos_install_leaves_its_models_and_data_folder_in_the_backup_and_the_index() {
+    let rig_mac = MacOs::new();
+    let (rig, layout) = (&rig_mac.rig, rig_mac.layout.clone());
+    rig.run_job(rig_mac.job(), plenty).0.unwrap();
+    // This very install did exclude the engine: without this the guards below would pass
+    // just as well when no exclusion happens at all.
+    let excluded = process_calls_under(&layout.engine_root).into_iter().filter(|(program, _)| program == "tmutil").count();
+    assert_eq!(excluded, 1, "the engine itself was not excluded, so the absence below would prove nothing");
+    assert!(layout.engine_root.join(".metadata_never_index").is_file(), "Spotlight's marker stands in the engine folder");
+    // Both folders stand after a finished setup, so what is shown is the absence of a mark,
+    // not of a folder.
+    assert!(layout.models_dir.is_dir() && layout.data_dir.is_dir());
+    for dir in [&layout.models_dir, &layout.data_dir] {
+        let name = dir.display().to_string();
+        assert!(process_calls_under(dir).is_empty(), "something beside the engine was excluded: {name}");
+        assert!(!dir.join(".metadata_never_index").exists(), "a Spotlight marker stands in {name}");
+    }
+}
+
+#[test]
+fn a_windows_managed_install_excludes_nothing() {
+    let rig = Rig::new();
+    rig.run(&[]).0.unwrap();
+    let layout = rig.layout();
+    assert!(layout.engine_root.is_dir(), "the rig's engine did install");
+    assert!(process_calls_under(&layout.engine_dir).is_empty(), "no system tool ran for a Windows engine");
+    assert!(!layout.engine_root.join(".metadata_never_index").exists() && !layout.models_dir.join(".metadata_never_index").exists());
+}
+
 #[test]
 fn a_macos_repair_never_touches_a_model_file_it_already_verified() {
     let rig_mac = MacOs::new();
