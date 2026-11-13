@@ -2145,6 +2145,135 @@ fn models_that_cant_run_say_why_and_lead_to_what_makes_them_run() {
     assert!(app.ui.ai_setup.models.iter().any(|m| m == "z-image-turbo"), "{:?}", app.ui.ai_setup.models);
 }
 
+/// A finished setup at `route`, whose engine has Z-Image Turbo's file and reads a manifest with
+/// the two families the tests name: what Manage Models uses to tell an installable model from
+/// one only the user's own ComfyUI can be given.
+fn setup_record(f: &mut Map<String, Value>, route: &str) {
+    f.insert(
+        SETUP.into(),
+        json!({
+            "available": true, "installed": true, "managed": route == "managed", "route": route,
+            "modelFiles": {"diffusion_models": ["z_image_turbo_bf16.safetensors"]},
+            "catalog": [
+                {"id": "z-image-turbo", "name": "Z-Image Turbo", "main": "z_image_turbo_bf16.safetensors", "size": "8.4 GB", "family": "zImageTurbo"},
+                {"id": "qwen-image-2-1", "name": "Qwen Image 2.1", "main": "qwen_image_21.safetensors", "size": "53.9 GB", "family": "qwenImage21"},
+            ],
+        }),
+    );
+}
+
+/// The family matching runs on: a Qwen of the wizard's family under another name and file.
+fn my_qwen() -> Model {
+    Model { id: "my-qwen".into(), name: "My Qwen".into(), unet: "my_qwen.safetensors".into(), ..Family::QwenImage21.preset() }
+}
+
+/// A local model no manifest family covers: only a ComfyUI the user manages can be given its
+/// files.
+fn flux_fill() -> Model {
+    Model { id: "fill".into(), name: "FLUX.1 Fill".into(), unet: "flux1-fill-dev.safetensors".into(), ..Family::Flux1Fill.preset() }
+}
+
+/// Draw Manage Models over a draft of these models and this setup, as the preferences page does.
+fn models_page(models: Vec<Model>, route: &str) -> egui_kittest::Harness<'static, Map<String, Value>> {
+    let mut f = Map::new();
+    setup_record(&mut f, route);
+    f.insert(PAGE.into(), json!("models"));
+    let base = json!({ "integrations": { "ai": { "models": models } } });
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1100.0, 700.0))
+        .with_context_setup(|ctx| PhotocraftApp::setup_context(ctx, Default::default()))
+        .build_ui_state(
+            move |ui, f: &mut Map<String, Value>| {
+                let mut values = f.get("values").cloned().unwrap_or_else(|| base.clone());
+                let obj = values.get_mut("integrations").and_then(Value::as_object_mut).unwrap();
+                prefs_section(ui, obj, f, 600.0);
+                f.insert("values".into(), values);
+            },
+            f,
+        );
+    h.run();
+    h
+}
+
+/// Press what the pointer is over, as the folder-row tests do: what lies over a button is what
+/// the pointer hits.
+fn click_at(h: &mut egui_kittest::Harness<'_, Map<String, Value>>, at: egui::Pos2) {
+    h.hover_at(at);
+    h.run();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        h.run();
+    }
+}
+
+#[test]
+fn a_managed_setup_offers_install_for_a_missing_model_it_can_download() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    // Z-Image Turbo is installed; a Qwen of the wizard's family is not, under the user's own
+    // name and file: the setup can still fetch its files, so its row says Install.
+    let mut h: Harness<'static, Map<String, Value>> = models_page(vec![my_qwen()], "managed");
+    assert!(h.query_by_label("For your own ComfyUI").is_none(), "there is nothing only the user can fetch");
+    // The row's button is the word Install (the small icon is the same action, not this test's).
+    let at = h.get_by_label("Install").rect().center();
+    click_at(&mut h, at);
+    assert_eq!(h.state()[ACTION], json!("install:qwen-image-2-1"), "the row hands the model to the wizard");
+
+    // And the hand-over holds: the wizard opens on its Models screen with that model ticked.
+    let mut app = app();
+    crate::ai_setup_ui::install_from_prefs(&mut app, "qwen-image-2-1");
+    crate::ai_setup_ui::tick(&mut app, &egui::Context::default());
+    assert!(app.ui.ai_setup.open, "the wizard opened");
+    assert_eq!(app.ui.ai_setup.page, crate::ai_setup_ui::Page::Models);
+    assert!(app.ui.ai_setup.models.iter().any(|m| m == "qwen-image-2-1"), "{:?}", app.ui.ai_setup.models);
+}
+
+#[test]
+fn models_the_setup_cant_download_wait_in_their_own_folded_group() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    // A managed setup, a model its manifest has no family for, and one it can fetch.
+    let mut h: Harness<'static, Map<String, Value>> = models_page(vec![my_qwen(), flux_fill()], "managed");
+    // The installable one is listed where it was; the other is folded away at the bottom, and
+    // while folded nothing of its manual download shows anywhere on the page.
+    assert!(h.query_by_label("Offer in the AI Gen panel: My Qwen").is_some());
+    assert!(h.query_by_label("For your own ComfyUI").is_some(), "its group is there");
+    assert!(h.query_by_label("Offer in the AI Gen panel: FLUX.1 Fill").is_none(), "its row waits inside the group");
+    assert!(h.query_by_label_contains("into ComfyUI's models folder").is_none(), "the download words belong inside the group");
+    // Opening it brings the row and its one line of what to do, and the row says where its
+    // files go once it is the one in front.
+    let at = h.get_by_label("For your own ComfyUI").rect().center();
+    click_at(&mut h, at);
+    assert!(h.query_by_label("Offer in the AI Gen panel: FLUX.1 Fill").is_some(), "the row is back");
+    assert_eq!(h.state()["values"]["integrations"]["ai"]["listCollapsed"], json!(["ownComfy"]), "opened, and remembered that way");
+    assert!(h.query_by_label_contains("put their files into its models folder").is_some(), "one line says what to do inside the group");
+    // The row itself: its name is painted, not a widget, so the click goes in beside its box.
+    let row = h.get_by_label("Offer in the AI Gen panel: FLUX.1 Fill").rect();
+    click_at(&mut h, egui::pos2(row.right() + 40.0, row.center().y));
+    assert!(h.query_by_label_contains("into ComfyUI's models folder").is_some(), "the manual-download box shows inside the group");
+    // It is the user's to fetch: the page offers it nothing else, Install or otherwise.
+    assert!(h.query_by_label("Install…").is_none(), "its panel keeps the manual words, not a button");
+    // And closing it folds it away again: no row, and its box goes out of sight with it.
+    let at = h.get_by_label("For your own ComfyUI").rect().center();
+    click_at(&mut h, at);
+    assert!(h.query_by_label("Offer in the AI Gen panel: FLUX.1 Fill").is_none());
+    assert!(h.query_by_label_contains("into ComfyUI's models folder").is_none(), "the box is not left on the page");
+    assert_eq!(h.state()["values"]["integrations"]["ai"]["listCollapsed"], json!([]));
+}
+
+#[test]
+fn ones_own_comfyui_lists_missing_models_as_before_and_offers_the_download() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    // The same two models, but the ComfyUI is the user's own: the setup downloads nothing, so
+    // nothing moves, nothing is called Install, and the selected model still says where to put
+    // the file.
+    let h: Harness<'static, Map<String, Value>> = models_page(vec![my_qwen(), flux_fill()], "existing");
+    assert!(h.query_by_label("For your own ComfyUI").is_none(), "no group the setup would be a lie about");
+    assert!(h.query_by_label("Not Installed").is_some(), "both are listed where they always were");
+    // The boxes name their models even if the page can't offer them.
+    assert!(h.query_by_label("Offer in the AI Gen panel: My Qwen").is_some() && h.query_by_label("Offer in the AI Gen panel: FLUX.1 Fill").is_some());
+    assert!(h.query_by_label("Install").is_none() && h.query_by_label("Install…").is_none(), "nothing here is the setup's to install");
+    assert!(h.query_by_label_contains("into ComfyUI's models folder").is_some(), "the selected row says where to get its file");
+}
+
 #[test]
 fn local_models_before_local_ai_is_set_up_offer_the_setup() {
     let mut app = app();

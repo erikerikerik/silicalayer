@@ -576,15 +576,16 @@ pub fn installed_files(app: &PhotocraftApp) -> Option<std::collections::BTreeMap
     serde_json::from_value(files.clone()).ok()
 }
 
-/// The wizard's models, each with its main file (the first it lists) and its download size:
-/// `[{id, name, main, size}]`, for Manage Models to offer to install a model it lists.
+/// The wizard's models, each with its main file (the first it lists), its download size and its
+/// family: `[{id, name, main, size, family}]`, for Manage Models to offer to install a model it
+/// lists, and to tell which family a managed install can fetch.
 fn catalog(app: &PhotocraftApp) -> Vec<Value> {
     let Some(manifest) = &app.ui.ai_setup.manifest else { return Vec::new() };
     list(manifest, "/models")
         .iter()
         .map(|m| {
             let main = list(m, "/files").first().map_or("", |f| text(f, "/key").rsplit('/').next().unwrap_or(""));
-            json!({"id": text(m, "/id"), "name": text(m, "/name"), "main": main, "size": download_size(number(m, "/bytes"))})
+            json!({"id": text(m, "/id"), "name": text(m, "/name"), "main": main, "size": download_size(number(m, "/bytes")), "family": text(m, "/family")})
         })
         .collect()
 }

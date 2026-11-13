@@ -1106,7 +1106,11 @@ fn load_button(ui: &mut egui::Ui, label: &str, words: bool) -> egui::Response {
     ui.painter().rect_filled(rect, t.radius_sm, fill);
     ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
     let color = if on { t.text } else { t.text_faint };
-    let icon = if shown.is_some() { egui::Rect::from_min_size(rect.left_center() + vec2(8.0, -8.0), vec2(16.0, 16.0)) } else { egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0)) };
+    let icon = if shown.is_some() {
+        egui::Rect::from_min_size(rect.left_center() + vec2(8.0, -8.0), vec2(16.0, 16.0))
+    } else {
+        egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0))
+    };
     crate::icons::paint(ui, icon, "import", 14.0, color);
     if let Some(label) = shown {
         ui.painter().text(icon.right_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.0), color);
@@ -1801,9 +1805,10 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>) {
         again: mismatch.is_some() && job.is_none() && why.is_none() && enhance::blocked(app).is_none(),
     };
     let line_gap = ui.spacing().item_spacing.y;
-    let notes_height: f32 = setup.iter().map(|text| ui.painter().layout(text.clone(), egui::FontId::proportional(NOTE_SIZE), t.text_faint, width).size().y + line_gap).sum::<f32>()
-        + status.height(ui, width)
-        + line_gap;
+    let notes_height: f32 =
+        setup.iter().map(|text| ui.painter().layout(text.clone(), egui::FontId::proportional(NOTE_SIZE), t.text_faint, width).size().y + line_gap).sum::<f32>()
+            + status.height(ui, width)
+            + line_gap;
 
     // Prompt. ⌘/Ctrl+Return generates. Laying out regions, it is the scene, a box of a few lines
     // with the regions under it.
@@ -2378,8 +2383,11 @@ struct Standing {
     /// Something will run local models: a server answered, the setup has run, or ComfyUI is set
     /// up to be started.
     local: bool,
-    /// The wizard's models (`[{id, name, main, size}]`).
+    /// The wizard's models (`[{id, name, main, size, family}]`).
     catalog: Vec<Value>,
+    /// This app installed the ComfyUI: its setup can download a model of a listed family, and a
+    /// missing model of no listed family is the user's to fetch for their own ComfyUI.
+    managed: bool,
 }
 
 impl Standing {
@@ -2405,11 +2413,13 @@ impl Standing {
             local: answered.is_some() || installed || launch || autostart,
             files: answered.or_else(|| parse(setup.and_then(|s| s.get("modelFiles")))),
             catalog: setup.and_then(|s| s.get("catalog")).and_then(Value::as_array).cloned().unwrap_or_default(),
+            managed: setup.and_then(|s| s.get("route")).and_then(Value::as_str) == Some("managed"),
         }
     }
 
     /// The wizard's model `model` is: the one of its id (the recommended models keep the
-    /// wizard's), else the one whose main file is `model`'s.
+    /// wizard's), else the one whose main file is `model`'s, else, while this app's ComfyUI can
+    /// still download models, the one of the same family as `model`.
     fn wizard_model(&self, model: &Model) -> Option<Value> {
         let id = |m: &&Value| m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
         let file = model.main_file();
@@ -2417,6 +2427,7 @@ impl Standing {
             .iter()
             .find(|m| !model.id.is_empty() && id(m) == model.id)
             .or_else(|| self.catalog.iter().find(|m| !file.is_empty() && m.get("main").and_then(Value::as_str) == Some(file)))
+            .or_else(|| self.managed.then(|| self.catalog.iter().find(|m| m.get("family").and_then(Value::as_str) == Some(model.family.key()))).flatten())
             .cloned()
     }
 
@@ -2728,10 +2739,13 @@ enum Group {
     Internal,
     External,
     Missing,
+    /// Missing local models this app's Local AI setup can't download: the user's own ComfyUI's,
+    /// kept out of the way at the bottom, folded until opened.
+    OwnComfy,
 }
 
 impl Group {
-    const ALL: [Group; 4] = [Group::Cloud, Group::Internal, Group::External, Group::Missing];
+    const ALL: [Group; 5] = [Group::Cloud, Group::Internal, Group::External, Group::Missing, Group::OwnComfy];
 
     fn key(self) -> &'static str {
         match self {
@@ -2739,6 +2753,7 @@ impl Group {
             Group::Internal => "internal",
             Group::External => "external",
             Group::Missing => "missing",
+            Group::OwnComfy => "ownComfy",
         }
     }
 
@@ -2748,6 +2763,7 @@ impl Group {
             Group::Internal => "Internal",
             Group::External => "External",
             Group::Missing => "Not Installed",
+            Group::OwnComfy => "For your own ComfyUI",
         }
     }
 
@@ -2757,6 +2773,9 @@ impl Group {
             Group::Internal => "Their files are in PhotoCraft's own models folder. Click to fold the group away, or open it again",
             Group::External => "Their files are in a models folder of yours (Model Folders), only read. Click to fold the group away, or open it again",
             Group::Missing => "Their files are in none of the folders the engine reads. Click to fold the group away, or open it again",
+            Group::OwnComfy => {
+                "The Local AI setup can't download these: they need a ComfyUI you manage yourself, with the files put into its models folder. Click to fold the group away, or open it again"
+            }
         }
     }
 
@@ -2768,6 +2787,7 @@ impl Group {
             Group::Internal => t.accent,
             Group::External => t.warning,
             Group::Missing => t.danger,
+            Group::OwnComfy => t.text_dim,
         }
     }
 
@@ -2940,11 +2960,7 @@ fn engine_card(ui: &mut egui::Ui, setup: &Value, f: &mut Map<String, Value>, wid
     let route = text("route");
     let models = setup.get("models").and_then(Value::as_u64).unwrap_or(0);
     let (title, whose, about) = if managed {
-        (
-            format!("ComfyUI {}", text("engineVersion")).trim().to_string(),
-            Some((tr("Internal"), t.accent)),
-            text("engineFolder"),
-        )
+        (format!("ComfyUI {}", text("engineVersion")).trim().to_string(), Some((tr("Internal"), t.accent)), text("engineFolder"))
     } else if route == "existing" {
         (
             tr("Your own ComfyUI").to_string(),
@@ -2958,60 +2974,70 @@ fn engine_card(ui: &mut egui::Ui, setup: &Value, f: &mut Map<String, Value>, wid
             tr("The setup installs ComfyUI, the engine, with the models you choose. To use a ComfyUI you already have, fill in its address below.").to_string(),
         )
     };
-    egui::Frame::new().fill(t.card).stroke(egui::Stroke::new(1.0, t.card_border)).corner_radius(t.radius).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
-        ui.set_width(width - 26.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            ui.add(crate::icons::image("monitor", 24.0, if route.is_empty() && !managed { t.text_faint } else { t.icon }));
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(RichText::new(title).font(crate::theme::medium(13.5)).color(t.text));
-                    if let Some((whose, color)) = whose {
-                        folders::badge(ui, whose, color);
+    egui::Frame::new().fill(t.card).stroke(egui::Stroke::new(1.0, t.card_border)).corner_radius(t.radius).inner_margin(egui::Margin::symmetric(12, 10)).show(
+        ui,
+        |ui| {
+            ui.set_width(width - 26.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.add(crate::icons::image("monitor", 24.0, if route.is_empty() && !managed { t.text_faint } else { t.icon }));
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(title).font(crate::theme::medium(13.5)).color(t.text));
+                        if let Some((whose, color)) = whose {
+                            folders::badge(ui, whose, color);
+                        }
+                    });
+                    if managed {
+                        ui.add(egui::Label::new(RichText::new(&about).font(crate::theme::mono(11.5)).color(t.text_dim)).truncate()).on_hover_text(&about);
+                    } else {
+                        ui.add(egui::Label::new(RichText::new(&about).color(t.text_dim).size(11.5)).wrap());
+                    }
+                    // A setup that is running or stopped halfway says so; a finished one, what it has.
+                    let (line, color) = if !route.is_empty() && !installed {
+                        (text("text"), t.warning)
+                    } else if managed || route == "existing" {
+                        (format!("{models} {} · {}", tr("recommended models installed"), tr("Model Folders lists every model file")), t.text_faint)
+                    } else {
+                        (String::new(), t.text_faint)
+                    };
+                    if !line.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(line).color(color).size(11.0)).wrap());
                     }
                 });
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
                 if managed {
-                    ui.add(egui::Label::new(RichText::new(&about).font(crate::theme::mono(11.5)).color(t.text_dim)).truncate()).on_hover_text(&about);
+                    if widgets::secondary_button(ui, tr("Repair"), 80.0)
+                        .on_hover_text(tr("Check every installed file against its checksum, and download again what is damaged or missing"))
+                        .clicked()
+                    {
+                        f.insert(ACTION.into(), json!("setupRepair"));
+                    }
+                    if widgets::secondary_button(ui, tr("Remove Local AI…"), 150.0)
+                        .on_hover_text(tr("Delete the engine and the models PhotoCraft downloaded"))
+                        .clicked()
+                    {
+                        f.insert(ACTION.into(), json!("setupRemove"));
+                    }
                 } else {
-                    ui.add(egui::Label::new(RichText::new(&about).color(t.text_dim).size(11.5)).wrap());
-                }
-                // A setup that is running or stopped halfway says so; a finished one, what it has.
-                let (line, color) = if !route.is_empty() && !installed {
-                    (text("text"), t.warning)
-                } else if managed || route == "existing" {
-                    (format!("{models} {} · {}", tr("recommended models installed"), tr("Model Folders lists every model file")), t.text_faint)
-                } else {
-                    (String::new(), t.text_faint)
-                };
-                if !line.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(line).color(color).size(11.0)).wrap());
+                    let open = if route.is_empty() {
+                        widgets::primary_button(ui, tr("Set Up Local AI…"), 150.0)
+                    } else {
+                        widgets::secondary_button(ui, tr("Set Up Local AI…"), 150.0)
+                    };
+                    if open
+                        .on_hover_text(tr("Opens the setup wizard: it installs ComfyUI and the recommended models for you. These preferences are saved first"))
+                        .clicked()
+                    {
+                        f.insert(ACTION.into(), json!("setup"));
+                    }
                 }
             });
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if managed {
-                if widgets::secondary_button(ui, tr("Repair"), 80.0)
-                    .on_hover_text(tr("Check every installed file against its checksum, and download again what is damaged or missing"))
-                    .clicked()
-                {
-                    f.insert(ACTION.into(), json!("setupRepair"));
-                }
-                if widgets::secondary_button(ui, tr("Remove Local AI…"), 150.0).on_hover_text(tr("Delete the engine and the models PhotoCraft downloaded")).clicked() {
-                    f.insert(ACTION.into(), json!("setupRemove"));
-                }
-            } else {
-                let open = if route.is_empty() { widgets::primary_button(ui, tr("Set Up Local AI…"), 150.0) } else { widgets::secondary_button(ui, tr("Set Up Local AI…"), 150.0) };
-                if open
-                    .on_hover_text(tr("Opens the setup wizard: it installs ComfyUI and the recommended models for you. These preferences are saved first"))
-                    .clicked()
-                {
-                    f.insert(ACTION.into(), json!("setup"));
-                }
-            }
-        });
-    });
+        },
+    );
 }
 
 /// Engine: the ComfyUI that runs local models, how PhotoCraft reaches it, and how it starts it.
@@ -3171,7 +3197,9 @@ fn launch_settings(ui: &mut egui::Ui, ai: &mut Map<String, Value>, f: &mut Map<S
     ui.add_space(6.0);
     let find = ui.add_enabled_ui(!busy, |ui| widgets::secondary_button(ui, tr("Find Installation"), 130.0)).inner;
     if find
-        .on_hover_text(tr("Fill these in: from the ComfyUI that is running now, or else from the one ComfyUI Desktop installed. For any other installation use Browse"))
+        .on_hover_text(tr(
+            "Fill these in: from the ComfyUI that is running now, or else from the one ComfyUI Desktop installed. For any other installation use Browse",
+        ))
         .clicked()
     {
         f.insert(ACTION.into(), json!("find"));
@@ -3274,7 +3302,8 @@ pub(super) fn key_card(
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let icon = crate::icons::button(ui, "external-link", 18.0, false, url);
                 let link = ui.add(
-                    egui::Label::new(RichText::new(format!("{} {host}", tr("Get a key at"))).color(t.accent_text).size(11.5).underline()).sense(egui::Sense::click()),
+                    egui::Label::new(RichText::new(format!("{} {host}", tr("Get a key at"))).color(t.accent_text).size(11.5).underline())
+                        .sense(egui::Sense::click()),
                 );
                 if icon.clicked() || link.on_hover_text(url).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     open = Some(url);
@@ -3521,12 +3550,20 @@ fn models_page(ui: &mut egui::Ui, ai: &mut Map<String, Value>, f: &mut Map<Strin
     // lists; or that it isn't installed.
     let (internal, external) = folders::files_by_origin(f);
     let existing = f.get(SETUP).and_then(|s| s.get("route")).and_then(Value::as_str) == Some("existing");
+    // This app installed the ComfyUI: its setup can download the files of a model whose family is
+    // in the manifest; a missing one whose family isn't is the user's own ComfyUI's.
+    let managed = f.get(SETUP).and_then(|s| s.get("route")).and_then(Value::as_str) == Some("managed");
     let groups: Vec<Group> = parsed
         .iter()
         .map(|m| match m {
             Some(m) => {
-                let installed = !matches!(standing.missing(m), Some(Missing::Files(_) | Missing::NoLocalAi(_)));
-                Group::of(m, installed, &internal, &external, existing)
+                let lack = standing.missing(m);
+                if managed && matches!(lack, Some(Missing::Files(None))) {
+                    Group::OwnComfy
+                } else {
+                    let installed = !matches!(lack, Some(Missing::Files(_) | Missing::NoLocalAi(_)));
+                    Group::of(m, installed, &internal, &external, existing)
+                }
             }
             None => Group::Internal,
         })
@@ -3551,20 +3588,25 @@ fn models_page(ui: &mut egui::Ui, ai: &mut Map<String, Value>, f: &mut Map<Strin
     // order); a folded group shows its header alone.
     let mut collapsed: Vec<String> =
         ai.get("listCollapsed").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-    let folded = |g: Group, collapsed: &[String]| collapsed.iter().any(|c| c == g.key());
+    // The own-ComfyUI group starts folded: its key in the list is what opens it, the opposite of
+    // the other groups, whose key folds them away.
+    let folded = |g: Group, collapsed: &[String]| collapsed.iter().any(|c| c == g.key()) != (g == Group::OwnComfy);
     let members = |g: Group| (0..models.len()).filter(|&i| lists(filter, i) && groups.get(i) == Some(&g)).collect::<Vec<usize>>();
     let by_group: Vec<(Group, Vec<usize>)> = Group::ALL.into_iter().map(|g| (g, members(g))).filter(|(_, m)| !m.is_empty()).collect();
     let listed: Vec<usize> = by_group.iter().flat_map(|(_, m)| m.iter().copied()).collect();
     let shown: Vec<usize> = by_group.iter().filter(|(g, _)| !folded(*g, &collapsed)).flat_map(|(_, m)| m.iter().copied()).collect();
     // The selection is an index into all models: kept while the list holds it (a folded group
-    // still does), else the first shown.
+    // still does), else the first shown. The own-ComfyUI group's models are the exception: while
+    // it is folded they are out of sight, and what the selected model's panel shows of them —
+    // where to download the file — belongs inside that group.
+    let own_folded = |i: usize| groups.get(i) == Some(&Group::OwnComfy) && folded(Group::OwnComfy, &collapsed);
     let mut selected = f
         .get(SELECTED)
         .and_then(Value::as_u64)
         .map(|i| i as usize)
-        .filter(|i| listed.contains(i))
+        .filter(|i| listed.contains(i) && !own_folded(*i))
         .or_else(|| shown.first().copied())
-        .or_else(|| listed.first().copied());
+        .or_else(|| listed.iter().copied().find(|i| !own_folded(*i)));
     // The buttons under the list keep their row whatever the list holds.
     let footer = 34.0;
     let pane = (bottom - ui.cursor().top() - footer - 4.0).max(MIN_PANE_HEIGHT - footer);
@@ -3601,133 +3643,154 @@ fn models_page(ui: &mut egui::Ui, ai: &mut Map<String, Value>, f: &mut Map<Strin
                         let is_folded = folded(*group, &collapsed);
                         let note = (!offered).then(|| tr("not offered in the panel"));
                         if group_header(ui, *group, rows.len(), is_folded, note).clicked() {
-                            if is_folded {
-                                collapsed.retain(|c| c != group.key());
-                            } else {
+                            // Folding writes the group's key; for the own-ComfyUI group, which
+                            // starts folded, the key is what keeps it open instead.
+                            let stores_open = *group == Group::OwnComfy;
+                            if is_folded == stores_open {
                                 collapsed.push(group.key().to_string());
+                            } else {
+                                collapsed.retain(|c| c != group.key());
                             }
+                            ui.ctx().request_repaint();
                         }
                         if is_folded {
                             continue;
                         }
+                        // One line on what this group waits for, above its rows.
+                        if *group == Group::OwnComfy {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(tr("These need a ComfyUI you manage yourself: put their files into its models folder."))
+                                    .color(t.text_dim)
+                                    .size(11.0),
+                            );
+                        }
                         let tone = group.tone(&t);
                         for (at, &i) in rows.iter().enumerate() {
-                        // The neighbours in its group: where Move Up and Move Down take it.
-                        let (above, below) = (at.checked_sub(1).and_then(|a| rows.get(a)).copied(), rows.get(at + 1).copied());
-                        let model = parsed.get(i).and_then(Option::as_ref);
-                        // Can it run? A cloud model needs its key, a local one its files.
-                        let lack = model.and_then(|m| standing.missing(m));
-                        let Some(m) = models.get_mut(i).and_then(Value::as_object_mut) else { continue };
-                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
-                        let on = selected == Some(i);
-                        // The group's colour, weaker than its header's; the last row rounds it off.
-                        let r = t.radius_sm as u8;
-                        let corners = if at + 1 == rows.len() { egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r } } else { egui::CornerRadius::ZERO };
-                        ui.painter().rect_filled(rect, corners, tone.gamma_multiply(0.07));
-                        if on {
-                            ui.painter().rect_filled(rect, t.radius_sm, t.row_selected);
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(rect, t.radius_sm, t.hover);
-                        }
-                        if resp.clicked() {
-                            selected = Some(i);
-                        }
-                        let side = |x: f32| egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(22.0, rect.height()));
-                        let mut check =
-                            ui.new_child(egui::UiBuilder::new().max_rect(side(rect.left() + 4.0)).layout(egui::Layout::left_to_right(egui::Align::Center)));
-                        let mut enabled = m.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-                        let offer = format!("{} {}", tr("Offer in the AI Gen panel:"), text_of(m, "name"));
-                        // One that can't run can't be offered: its box is off and greyed, and its
-                        // own choice is kept for when it can run.
-                        if lack.is_none() {
-                            widgets::checkbox_named(&mut check, &mut enabled, "", &offer).on_hover_text(tr("Show in the AI Gen panel"));
-                            m.insert("enabled".into(), json!(enabled));
-                        } else {
-                            let mut off = false;
-                            check
-                                .add_enabled_ui(false, |ui| widgets::checkbox_named(ui, &mut off, "", &offer))
-                                .inner
-                                .on_disabled_hover_text(tr("It can't run yet, so the AI Gen panel doesn't offer it"));
-                        }
-                        let name = text_of(m, "name");
-                        // The way to make it run is always in view: it is what the row waits for.
-                        // The row's own buttons show on the row in use, so a long list stays
-                        // quiet: remove on the row under the pointer, and on the selected row the
-                        // two that move it up and down the list (the order of the panel's list).
-                        let fix = lack.as_ref().and_then(|lack| missing_action(lack, &name).map(|(icon, tip)| (lack, icon, tip)));
-                        let mut used = 0.0;
-                        if on || resp.hovered() || fix.is_some() {
-                            let mut tools = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(egui::Rect::from_min_max(
-                                        egui::pos2(rect.left() + 30.0, rect.top()),
-                                        egui::pos2(rect.right() - 4.0, rect.bottom()),
-                                    ))
-                                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                            );
-                            tools.spacing_mut().item_spacing.x = 0.0;
-                            if let Some((lack, icon, tip)) = &fix {
-                                if crate::icons::button(&mut tools, icon, 20.0, false, tip).clicked() {
-                                    act = Some((*lack).clone());
-                                }
-                                used += 24.0;
-                            }
-                            if on || resp.hovered() {
-                                if crate::icons::button(&mut tools, "trash", 20.0, false, tr("Remove this model")).clicked() {
-                                    remove = Some(i);
-                                }
-                                used += 24.0;
-                            }
+                            // The neighbours in its group: where Move Up and Move Down take it.
+                            let (above, below) = (at.checked_sub(1).and_then(|a| rows.get(a)).copied(), rows.get(at + 1).copied());
+                            let model = parsed.get(i).and_then(Option::as_ref);
+                            // Can it run? A cloud model needs its key, a local one its files.
+                            let lack = model.and_then(|m| standing.missing(m));
+                            let Some(m) = models.get_mut(i).and_then(Value::as_object_mut) else { continue };
+                            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
+                            let on = selected == Some(i);
+                            // The group's colour, weaker than its header's; the last row rounds it off.
+                            let r = t.radius_sm as u8;
+                            let corners = if at + 1 == rows.len() { egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r } } else { egui::CornerRadius::ZERO };
+                            ui.painter().rect_filled(rect, corners, tone.gamma_multiply(0.07));
                             if on {
-                                let down = tools
-                                    .add_enabled_ui(below.is_some(), |ui| {
-                                        crate::icons::button(ui, "chevron-down", 20.0, false, tr("Move down: later in the AI Gen panel's model list"))
-                                    })
-                                    .inner;
-                                let up = tools
-                                    .add_enabled_ui(above.is_some(), |ui| {
-                                        crate::icons::button(ui, "chevron-up", 20.0, false, tr("Move up: earlier in the AI Gen panel's model list"))
-                                    })
-                                    .inner;
-                                if let (true, Some(to)) = (down.clicked(), below) {
-                                    moved = Some((i, to));
-                                }
-                                if let (true, Some(to)) = (up.clicked(), above) {
-                                    moved = Some((i, to));
-                                }
-                                used += 40.0;
+                                ui.painter().rect_filled(rect, t.radius_sm, t.row_selected);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(rect, t.radius_sm, t.hover);
                             }
-                        }
-                        let width = (rect.width() - 34.0 - used).max(20.0);
-                        let line = |text: String, size: f32, color: egui::Color32| {
-                            let mut job = egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(size), color);
-                            job.wrap = egui::text::TextWrapping::truncate_at_width(width);
-                            ui.painter().layout_job(job)
-                        };
-                        let color = if enabled && lack.is_none() { t.text } else { t.text_faint };
-                        let title = line(name.clone(), 12.5, color);
-                        // What it is used for; or why it can't run yet.
-                        let (caption, caption_color) = match (&lack, model) {
-                            (Some(Missing::Key(p)), _) => (format!("{} {}", tr("Needs an API key from"), p.label()), t.warning),
-                            (Some(Missing::Files(_)), _) => (tr("Not installed").to_string(), t.warning),
-                            (Some(Missing::NoLocalAi(_)), _) => (tr("Local AI is not set up").to_string(), t.warning),
-                            (None, Some(model)) => (uses(model).into_iter().map(tr).collect::<Vec<_>>().join(" · "), t.text_faint),
-                            (None, None) => (String::new(), t.text_faint),
-                        };
-                        let under = line(caption.clone(), 10.5, caption_color);
-                        let elided = title.elided || under.elided;
-                        ui.painter().galley(egui::pos2(rect.left() + 30.0, rect.top() + 4.0), title, color);
-                        ui.painter().galley(egui::pos2(rect.left() + 30.0, rect.top() + 20.0), under, caption_color);
-                        if let (Some(Missing::Files(None)), Some(model)) = (&lack, model) {
-                            resp.on_hover_text(format!(
-                                "{name}\n{}: {}. {}",
-                                tr("The ComfyUI server doesn't list"),
-                                model.main_file(),
-                                tr("Download it, press Scan Server, or choose another file")
-                            ));
-                        } else if elided {
-                            resp.on_hover_text(format!("{name}\n{caption}"));
-                        }
+                            if resp.clicked() {
+                                selected = Some(i);
+                            }
+                            let side = |x: f32| egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(22.0, rect.height()));
+                            let mut check =
+                                ui.new_child(egui::UiBuilder::new().max_rect(side(rect.left() + 4.0)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            let mut enabled = m.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                            let offer = format!("{} {}", tr("Offer in the AI Gen panel:"), text_of(m, "name"));
+                            // One that can't run can't be offered: its box is off and greyed, and its
+                            // own choice is kept for when it can run.
+                            if lack.is_none() {
+                                widgets::checkbox_named(&mut check, &mut enabled, "", &offer).on_hover_text(tr("Show in the AI Gen panel"));
+                                m.insert("enabled".into(), json!(enabled));
+                            } else {
+                                let mut off = false;
+                                check
+                                    .add_enabled_ui(false, |ui| widgets::checkbox_named(ui, &mut off, "", &offer))
+                                    .inner
+                                    .on_disabled_hover_text(tr("It can't run yet, so the AI Gen panel doesn't offer it"));
+                            }
+                            let name = text_of(m, "name");
+                            // The way to make it run is always in view: it is what the row waits for.
+                            // The row's own buttons show on the row in use, so a long list stays
+                            // quiet: remove on the row under the pointer, and on the selected row the
+                            // two that move it up and down the list (the order of the panel's list).
+                            let fix = lack.as_ref().and_then(|lack| missing_action(lack, &name).map(|(icon, tip)| (lack, icon, tip)));
+                            // One the app's own Local AI setup can download gets the word Install in
+                            // its row, not just an icon: it is the button an ordinary user wants.
+                            let install = managed && matches!(lack, Some(Missing::Files(Some(_))));
+                            let mut used = 0.0;
+                            if on || resp.hovered() || fix.is_some() {
+                                let mut tools = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(egui::Rect::from_min_max(
+                                            egui::pos2(rect.left() + 30.0, rect.top()),
+                                            egui::pos2(rect.right() - 4.0, rect.bottom()),
+                                        ))
+                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                                );
+                                tools.spacing_mut().item_spacing.x = 0.0;
+                                if let Some((lack, icon, tip)) = &fix {
+                                    let clicked = if install {
+                                        widgets::primary_button(&mut tools, tr("Install"), 60.0).on_hover_text(tip).clicked()
+                                    } else {
+                                        crate::icons::button(&mut tools, icon, 20.0, false, tip).clicked()
+                                    };
+                                    if clicked {
+                                        act = Some((*lack).clone());
+                                    }
+                                    used += if install { 64.0 } else { 24.0 };
+                                }
+                                if on || resp.hovered() {
+                                    if crate::icons::button(&mut tools, "trash", 20.0, false, tr("Remove this model")).clicked() {
+                                        remove = Some(i);
+                                    }
+                                    used += 24.0;
+                                }
+                                if on {
+                                    let down = tools
+                                        .add_enabled_ui(below.is_some(), |ui| {
+                                            crate::icons::button(ui, "chevron-down", 20.0, false, tr("Move down: later in the AI Gen panel's model list"))
+                                        })
+                                        .inner;
+                                    let up = tools
+                                        .add_enabled_ui(above.is_some(), |ui| {
+                                            crate::icons::button(ui, "chevron-up", 20.0, false, tr("Move up: earlier in the AI Gen panel's model list"))
+                                        })
+                                        .inner;
+                                    if let (true, Some(to)) = (down.clicked(), below) {
+                                        moved = Some((i, to));
+                                    }
+                                    if let (true, Some(to)) = (up.clicked(), above) {
+                                        moved = Some((i, to));
+                                    }
+                                    used += 40.0;
+                                }
+                            }
+                            let width = (rect.width() - 34.0 - used).max(20.0);
+                            let line = |text: String, size: f32, color: egui::Color32| {
+                                let mut job = egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(size), color);
+                                job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+                                ui.painter().layout_job(job)
+                            };
+                            let color = if enabled && lack.is_none() { t.text } else { t.text_faint };
+                            let title = line(name.clone(), 12.5, color);
+                            // What it is used for; or why it can't run yet.
+                            let (caption, caption_color) = match (&lack, model) {
+                                (Some(Missing::Key(p)), _) => (format!("{} {}", tr("Needs an API key from"), p.label()), t.warning),
+                                (Some(Missing::Files(_)), _) => (tr("Not installed").to_string(), t.warning),
+                                (Some(Missing::NoLocalAi(_)), _) => (tr("Local AI is not set up").to_string(), t.warning),
+                                (None, Some(model)) => (uses(model).into_iter().map(tr).collect::<Vec<_>>().join(" · "), t.text_faint),
+                                (None, None) => (String::new(), t.text_faint),
+                            };
+                            let under = line(caption.clone(), 10.5, caption_color);
+                            let elided = title.elided || under.elided;
+                            ui.painter().galley(egui::pos2(rect.left() + 30.0, rect.top() + 4.0), title, color);
+                            ui.painter().galley(egui::pos2(rect.left() + 30.0, rect.top() + 20.0), under, caption_color);
+                            if let (Some(Missing::Files(None)), Some(model)) = (&lack, model) {
+                                resp.on_hover_text(format!(
+                                    "{name}\n{}: {}. {}",
+                                    tr("The ComfyUI server doesn't list"),
+                                    model.main_file(),
+                                    tr("Download it, press Scan Server, or choose another file")
+                                ));
+                            } else if elided {
+                                resp.on_hover_text(format!("{name}\n{caption}"));
+                            }
                         }
                     }
                 });
@@ -3894,7 +3957,10 @@ fn reset_question(ctx: &egui::Context, models: &mut [Value], f: &mut Map<String,
         };
         ui.add(egui::Label::new(RichText::new(text).color(if loras == 0 { t.text_dim } else { t.warning })).wrap());
         ui.add_space(6.0);
-        ui.add(egui::Label::new(RichText::new(tr("Its name and whether the AI Gen panel offers it stay. Cancel in Preferences undoes it.")).color(t.text_dim)).wrap());
+        ui.add(
+            egui::Label::new(RichText::new(tr("Its name and whether the AI Gen panel offers it stay. Cancel in Preferences undoes it.")).color(t.text_dim))
+                .wrap(),
+        );
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -3985,7 +4051,8 @@ fn prune_question(ctx: &egui::Context, models: &mut Vec<Value>, f: &mut Map<Stri
             }
             f.remove(SELECTED);
             f.insert(ACTION.into(), json!(format!("{PANEL_LORAS}{}", ids.join("\n"))));
-            let text = format!("{} {}", ids.len(), tr(if ids.len() == 1 { "model that wasn't installed removed" } else { "models that weren't installed removed" }));
+            let text =
+                format!("{} {}", ids.len(), tr(if ids.len() == 1 { "model that wasn't installed removed" } else { "models that weren't installed removed" }));
             f.insert(STATUS.into(), json!({"error": false, "text": text}));
             true
         }
@@ -4313,7 +4380,8 @@ pub fn after_body(app: &mut PhotocraftApp, f: &mut Map<String, Value>) {
     folders::ensure_listed(app, f);
     enhance::follow(app, f);
     // The list's folded groups are a view, not a setting to confirm: kept at once.
-    if let Some(folded) = f.get("values").and_then(|v| v.pointer("/integrations/ai/listCollapsed")).and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+    if let Some(folded) =
+        f.get("values").and_then(|v| v.pointer("/integrations/ai/listCollapsed")).and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
         && app.session.prefs().integrations.ai.list_collapsed != folded
     {
         app.session.prefs.edit(|p| p.integrations.ai.list_collapsed = folded);
