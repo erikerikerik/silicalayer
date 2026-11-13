@@ -2,12 +2,12 @@
 //! and the model settings in Edit › Preferences › Generative AI.
 //!
 //! The panel picks a model, takes a prompt and runs the engine's `ai.generate` as a background
-//! job: the result lands on a new layer over the selection. Its two tabs say what the user is
-//! there to do ([`Mode`]): **Create** a new image from the prompt alone, or **Edit** a picture
-//! that is there. Edit has a task row ([`EditTask`]): **Change** the picture, or the selected
-//! part of it, as the prompt says, or **Restyle** it (redraw it, keeping its composition). Which
-//! of the engine's techniques that is (`ai.generate`'s `mode`: txt2img, inpaint, img2img,
-//! imgEdit) follows from the task and from what the chosen model can do ([`technique`]); the
+//! job: the result lands on a new layer over the selection. Its three tabs say what the user is
+//! there to do ([`Mode`]): **Create** a new image from the prompt alone, **Inpaint** a selected
+//! area (or the whole picture) as the prompt says, or **Restyle** the picture (redraw it,
+//! keeping its composition). A one-line note under the tabs says what the tab in front does.
+//! Which of the engine's techniques that is (`ai.generate`'s `mode`: txt2img, inpaint, img2img,
+//! imgEdit) follows from the tab and from what the chosen model can do ([`technique`]); the
 //! settings few people change sit in a section that opens (Advanced). The settings page edits
 //! `integrations.ai` (the ComfyUI server, local and cloud models and their rendering parameters)
 //! in the Preferences dialog's draft, like every other section; API keys are saved apart from
@@ -40,7 +40,7 @@ pub const TAB: usize = 2;
 /// The engine command the panel runs.
 const GENERATE: &str = "ai.generate";
 
-/// What the user is there to do: the panel's two tabs.
+/// What the user is there to do: the panel's three tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
@@ -48,59 +48,47 @@ pub enum Mode {
     #[default]
     #[serde(alias = "txt2img")]
     Create,
-    /// A picture that is there is changed ([`EditTask`]). The aliases are the tabs an earlier
-    /// build had, one per technique: a state saved then still loads.
-    #[serde(alias = "inpaint", alias = "img2img", alias = "imgEdit")]
-    Edit,
+    /// The selected part of a picture, or the whole of it, is changed as the prompt says. The
+    /// aliases are the tabs and tasks an earlier build had: a state saved then still loads.
+    #[serde(alias = "edit", alias = "inpaint", alias = "imgEdit")]
+    Inpaint,
+    /// The picture is redrawn following the prompt, as closely as the strength says. The alias
+    /// is the technique an earlier tab named directly.
+    #[serde(alias = "img2img")]
+    Restyle,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 2] = [Mode::Create, Mode::Edit];
+    pub const ALL: [Mode; 3] = [Mode::Create, Mode::Inpaint, Mode::Restyle];
 
     pub fn label(self) -> &'static str {
         match self {
             Mode::Create => "Create",
-            Mode::Edit => "Edit",
+            Mode::Inpaint => "Inpaint",
+            Mode::Restyle => "Restyle",
         }
     }
 
     fn tip(self) -> &'static str {
         match self {
             Mode::Create => "Generate a new image from the prompt, into the selection or the whole canvas",
-            Mode::Edit => "Change a picture that is there: repaint a selection, change it as you say, or restyle it. The result is a new layer",
-        }
-    }
-}
-
-/// What Edit does with the picture: the row under the tabs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EditTask {
-    /// The picture, or with a selection the selected part of it, is changed as the prompt says.
-    #[default]
-    Change,
-    /// The picture is redrawn following the prompt, as closely as the strength says.
-    Restyle,
-}
-
-impl EditTask {
-    pub const ALL: [EditTask; 2] = [EditTask::Change, EditTask::Restyle];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            EditTask::Change => "Change",
-            EditTask::Restyle => "Restyle",
-        }
-    }
-
-    fn tip(self) -> &'static str {
-        match self {
-            EditTask::Change => {
+            Mode::Inpaint => {
                 "Change the picture as the prompt says. With a selection (any selection tool, or the mask tools under the prompt) only that part changes, and the rest stays exactly as it was"
             }
-            EditTask::Restyle => {
+            Mode::Restyle => {
                 "Redraw the picture following the prompt, keeping its composition: a layer of this document, or another open document. Strength is how far it may depart"
             }
+        }
+    }
+
+    /// The one-line note under the tabs: what the tab in front does.
+    fn desc(self) -> &'static str {
+        match self {
+            Mode::Create => "A new image from your prompt, into the selection or the whole canvas.",
+            Mode::Inpaint => {
+                "Select an area, then describe what goes there: only the selection changes. With no selection, the whole picture changes as the prompt says."
+            }
+            Mode::Restyle => "Redraws the whole picture in a new style and keeps its composition. Strength sets how far it may drift.",
         }
     }
 }
@@ -145,25 +133,23 @@ pub enum Method {
 pub struct AiGenUi {
     /// The tab in front.
     pub mode: Mode,
-    /// Edit: what to do with the picture.
-    pub task: EditTask,
     /// Create: the prompt alone, or the scene laid out in regions (a model that takes them).
     pub create_task: CreateTask,
     /// Create › Regions: the region selected in the list and on the canvas.
     pub region: Option<u32>,
     #[serde(skip)]
     regions: regions::RegionsUi,
-    /// Change: how a model that both edits and inpaints is asked.
+    /// Inpaint: how a model that both edits and inpaints is asked.
     pub method: Method,
     /// The model chosen for Create and for Restyle, which list the models that generate (empty:
     /// the first enabled one).
     pub model: String,
-    /// Change, filling: how far the result may depart from what the layer holds, 0..=1.
+    /// Inpaint, filling: how far the result may depart from what the layer holds, 0..=1.
     pub strength: f64,
-    /// Change: how much of the picture around the selection the model is shown, as a fraction of
+    /// Inpaint: how much of the picture around the selection the model is shown, as a fraction of
     /// the selection's longer edge.
     pub context: f64,
-    /// Change: the mask is being painted with the panel's brush (see [`mask_bar`]); while it is,
+    /// Inpaint: the mask is being painted with the panel's brush (see [`mask_bar`]); while it is,
     /// the Brush adds to the mask and the Eraser takes away, whatever the colours are.
     pub mask_brush: bool,
     /// Restyle: the picture to redraw (`None`: the active layer when it has pixels, else the
@@ -171,16 +157,16 @@ pub struct AiGenUi {
     pub img_source: Option<SourceRef>,
     /// Restyle: how far the result may depart from the picture, 0..=1.
     pub img_strength: f64,
-    /// The model chosen for Change, which lists the models that edit or inpaint.
+    /// The model chosen for Inpaint, which lists the models that edit or inpaint.
     pub edit_model: String,
-    /// Change, by instruction: the picture to change (`None`: the active layer when it has
+    /// Inpaint, by instruction: the picture to change (`None`: the active layer when it has
     /// pixels, else the first that is offered).
     pub edit_source: Option<SourceRef>,
     /// The reference chip whose name and picture are open under the chips (the references are
     /// the document's, see [`refs`]).
     #[serde(skip)]
     editing_ref: Option<usize>,
-    /// Change, by instruction: how much of a local model's schedule to run.
+    /// Inpaint, by instruction: how much of a local model's schedule to run.
     pub edit_quality: GenerationQuality,
     pub prompt: String,
     /// Ask for a transparent background (models that support it).
@@ -248,7 +234,6 @@ impl Default for AiGenUi {
     fn default() -> Self {
         Self {
             mode: Mode::default(),
-            task: EditTask::default(),
             create_task: CreateTask::default(),
             region: None,
             regions: regions::RegionsUi::default(),
@@ -292,12 +277,12 @@ impl Default for AiGenUi {
 }
 
 impl AiGenUi {
-    /// Is the task in front Change?
+    /// Is the tab in front Inpaint?
     fn changing(&self) -> bool {
-        self.mode == Mode::Edit && self.task == EditTask::Change
+        self.mode == Mode::Inpaint
     }
 
-    /// The model chosen for the task in front. Change has its own: it lists other models.
+    /// The model chosen for the tab in front. Inpaint has its own: it lists other models.
     fn chosen(&self) -> &str {
         if self.changing() { &self.edit_model } else { &self.model }
     }
@@ -323,8 +308,8 @@ impl AiGenUi {
         self.seed.map(|s| s & SEED_MASK)
     }
 
-    /// An animation is asked for: Animate (GIF) is ticked, the model can make one, and the task
-    /// is a new picture or an edit.
+    /// An animation is asked for: Animate (GIF) is ticked, the model can make one, and the tab
+    /// in front is a new picture or an edit.
     fn animating(&self, model: &Model, kind: GenerationMode) -> bool {
         self.animate && animates(model, kind)
     }
@@ -353,16 +338,16 @@ fn animates(model: &Model, kind: GenerationMode) -> bool {
 /// The seeds `ai.generate` renders with: 48 bits.
 const SEED_MASK: u64 = 0xFFFF_FFFF_FFFF;
 
-/// What `ai.generate` is asked for (its `mode`) with `model` chosen. The tab and the task say
-/// what the user is doing; for a change, the model says how it can be done: an edit model is
-/// shown the picture and told what to change, a model made for inpainting is given the selection
-/// as its mask, and one that does both follows [`AiGenUi::method`]. With no model to ask
-/// (`None`: none is set up for the task) a change is taken for an instruction.
+/// What `ai.generate` is asked for (its `mode`) with `model` chosen. The tab says what the user
+/// is doing; for an inpaint, the model says how it can be done: an edit model is shown the
+/// picture and told what to change, a model made for inpainting is given the selection as its
+/// mask, and one that does both follows [`AiGenUi::method`]. With no model to ask
+/// (`None`: none is set up for the tab) an inpaint is taken for an instruction.
 fn technique(ui: &AiGenUi, model: Option<&Model>) -> GenerationMode {
-    match (ui.mode, ui.task) {
-        (Mode::Create, _) => GenerationMode::Txt2img,
-        (Mode::Edit, EditTask::Restyle) => GenerationMode::Img2img,
-        (Mode::Edit, EditTask::Change) => {
+    match ui.mode {
+        Mode::Create => GenerationMode::Txt2img,
+        Mode::Restyle => GenerationMode::Img2img,
+        Mode::Inpaint => {
             let fill = match model.map_or((true, false), |m| (m.can_edit(), m.can_inpaint())) {
                 (true, true) => ui.method == Method::Fill,
                 (edits, _) => !edits,
@@ -481,14 +466,14 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Is `model` offered for a change (`changing`: the models that edit or inpaint), or for Create
+/// Is `model` offered for an inpaint (`changing`: the models that edit or inpaint), or for Create
 /// and Restyle (those that generate from a prompt: all but the dedicated inpainting and edit
 /// models)?
 fn fits(model: &Model, changing: bool) -> bool {
     if changing { model.can_edit() || model.can_inpaint() } else { model.can_generate() }
 }
 
-/// The models offered for the task in front: the ticked ones of the kinds the settings show that
+/// The models offered for the tab in front: the ticked ones of the kinds the settings show that
 /// can run now ([`usable`]), cloud models first, each kind in the order the settings give it
 /// ([`Settings::listed`]).
 fn enabled_models(app: &PhotocraftApp) -> Vec<Model> {
@@ -620,7 +605,7 @@ fn tr_static(s: &'static str) -> &'static str {
     crate::i18n::t(s)
 }
 
-/// The model the panel would run: the one chosen for the task in front while it is still
+/// The model the panel would run: the one chosen for the tab in front while it is still
 /// offered, else [`fallback`].
 fn current_model(app: &PhotocraftApp) -> Option<&Model> {
     let ui = &app.ui.ai_gen;
@@ -628,7 +613,7 @@ fn current_model(app: &PhotocraftApp) -> Option<&Model> {
     offered.iter().copied().find(|m| m.id == ui.chosen()).or_else(|| fallback(offered, ui.changing()))
 }
 
-/// The model offered for the task in front when none chosen is: for Change Qwen Image 2.1, the
+/// The model offered for the tab in front when none chosen is: for Inpaint Qwen Image 2.1, the
 /// recommended edit model ([`photocraft_aigen::preferred_edit`]), else the first offered.
 fn fallback<'a>(offered: impl IntoIterator<Item = &'a Model>, changing: bool) -> Option<&'a Model> {
     let mut offered = offered.into_iter();
@@ -664,30 +649,8 @@ fn mode_tabs(ui: &mut egui::Ui, mode: &mut Mode, enabled: bool) {
     });
 }
 
-/// Edit's tasks, under the tabs: plain names, the one in front underlined, so the row reads as
-/// part of the tab above it and not as a second set of tabs.
-fn task_row(ui: &mut egui::Ui, task: &mut EditTask, enabled: bool) {
-    let t = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for k in EditTask::ALL {
-            let on = *task == k;
-            let galley = ui.painter().layout_no_wrap(tr(k.label()).to_owned(), crate::theme::medium(11.5), t.text);
-            let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 16.0, 24.0), if enabled { egui::Sense::click() } else { egui::Sense::hover() });
-            let color = if on || (enabled && resp.hovered()) { t.text } else { t.text_dim };
-            ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
-            if on {
-                let y = rect.bottom() - 1.0;
-                ui.painter().line_segment([egui::pos2(rect.left() + 6.0, y), egui::pos2(rect.right() - 6.0, y)], egui::Stroke::new(2.0, t.accent));
-            }
-            if resp.on_hover_text(tr(k.tip())).clicked() {
-                *task = k;
-            }
-        }
-    });
-}
-
-/// Create's ways, under the tabs, as Edit's tasks are drawn. Regions is off for a model that
+/// Create's ways, under the tabs: plain names, the one in front underlined, so the row reads as
+/// part of the tab above it and not as a second set of tabs. Regions is off for a model that
 /// can't place them, and says which can.
 fn create_row(ui: &mut egui::Ui, task: &mut CreateTask, enabled: bool, model: Option<&Model>, able: &[String]) -> bool {
     let t = Tokens::get(ui.ctx());
@@ -789,7 +752,7 @@ enum Lead {
     Again,
 }
 
-/// The panel when no model can run for the task in front: why, and the way to one. While the
+/// The panel when no model can run for the tab in front: why, and the way to one. While the
 /// Local AI setup installs, that is what it says, with its progress. Centred in the `room` left
 /// below the tabs (when the panel fills a height), with margins either side, and its buttons of
 /// one width: side by side where they fit, else one above the other.
@@ -1027,7 +990,7 @@ pub fn load_prompt(app: &mut PhotocraftApp, layer: u64) -> bool {
     if let Some(laid_out) = laid_out {
         regions::restore(app, &laid_out);
     }
-    // The model it was made with, when it is still offered: Change's own choice for a change
+    // The model it was made with, when it is still offered: Inpaint's own choice for an inpaint
     // (a fill or an edit), the other one for a creation or a restyle.
     let made = app
         .session
@@ -1130,7 +1093,7 @@ const HINT_ROW: f32 = 6.0 + 17.0;
 /// What the rows under the prompt need besides the notes: spacing, the shortcut hint and the
 /// Generate row.
 const BELOW_PROMPT: f32 = 6.0 + HINT_ROW + GENERATE_ROW + 3.0 + 6.0;
-/// One of the panel's rows of controls (Edit's tasks, a picture to choose, the mask tools, the
+/// One of the panel's rows of controls (Create's ways, a picture to choose, the mask tools, the
 /// Advanced heading and what it opens), with its spacing.
 const ROW: f32 = 24.0 + 6.0;
 /// The brush the mask tools start with when the session's is smaller: a mask is painted broadly.
@@ -1143,8 +1106,8 @@ const SUBMIT_HINT: &str = if cfg!(target_os = "macos") { "\u{2318}\u{21a9} to ge
 /// The status bar's icons, each in a square this wide.
 const STATUS_ICON: f32 = 18.0;
 
-/// The rows the Advanced section opens for a generation of `kind` with `model`: the seed, for a
-/// change also its strength or quality with the context, the method when the model leaves that
+/// The rows the Advanced section opens for a generation of `kind` with `model`: the seed, for an
+/// inpaint also its strength or quality with the context, the method when the model leaves that
 /// open, and Alpha Channel for a new picture or an edit.
 fn advanced_rows(model: Option<&Model>, kind: GenerationMode) -> usize {
     match kind {
@@ -1161,31 +1124,30 @@ fn animate_rows(ui: &AiGenUi, model: Option<&Model>, kind: GenerationMode) -> us
     if model.is_some_and(|m| animates(m, kind)) { 1 + usize::from(ui.animate) * (1 + usize::from(ui.untimed)) } else { 0 }
 }
 
-/// The rows above the prompt that depend on the task: Edit's tasks, the picture to change or
+/// The rows above the prompt that depend on the technique: the picture to change or
 /// redraw, and the pictures an instruction may refer to (with a row to add one).
 fn rows_above(ui: &AiGenUi, kind: GenerationMode, references: usize) -> usize {
-    usize::from(ui.mode == Mode::Edit)
-        + match kind {
-            GenerationMode::Txt2img | GenerationMode::Inpaint => 0,
-            GenerationMode::Img2img => 1,
-            GenerationMode::ImgEdit => 1 + refs::rows(ui.editing_ref, references),
-        }
+    match kind {
+        GenerationMode::Txt2img | GenerationMode::Inpaint => 0,
+        GenerationMode::Img2img => 1,
+        GenerationMode::ImgEdit => 1 + refs::rows(ui.editing_ref, references),
+    }
 }
 
-/// The rows between the prompt and Generate: the mask tools of a change, the Advanced heading
+/// The rows between the prompt and Generate: the mask tools of an inpaint, the Advanced heading
 /// and, open, its rows.
 fn rows_below(ui: &AiGenUi, model: Option<&Model>, kind: GenerationMode) -> usize {
     usize::from(ui.changing()) + 1 + if ui.advanced { advanced_rows(model, kind) + animate_rows(ui, model, kind) + loras::rows(ui, model) } else { 0 }
 }
 
 /// The height the panel's content wants in the dock (`panel_docking`'s `dock_heights`): the
-/// tabs, the model, a prompt box of three lines, Generate and two lines of notes, and the rows
-/// the task in front adds.
+/// tabs, the note under them, the model, a prompt box of three lines, Generate and two lines
+/// of notes, and the rows the tab in front adds.
 pub fn wanted_height(app: &PhotocraftApp) -> f32 {
     let ui = &app.ui.ai_gen;
     let model = current_model(app);
     let kind = technique(ui, model);
-    let rows = 30.0 + 30.0 + 56.0 + BELOW_PROMPT + 2.0 * (NOTE_SIZE + 6.0) + 12.0;
+    let rows = 30.0 + ROW + 30.0 + 56.0 + BELOW_PROMPT + 2.0 * (NOTE_SIZE + 6.0) + 12.0;
     // The line that leads to the Local AI wizard, while there is one (it may wrap).
     let setup = if setup_line(app).is_some() { 2.0 * (NOTE_SIZE + 4.0) } else { 0.0 };
     // Create's ways (Prompt | Regions), and the regions under the scene.
@@ -1600,9 +1562,9 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui, fill: bool) {
     if !fill {
         return panel_body(app, ui, None, None);
     }
-    // The prompt box takes the height that is left. In a dock group too short even for a small
-    // one (the tabs and a task's rows need more than the group's compact height) the panel
-    // scrolls, so everything above the pinned row can still be reached.
+    // A prompt box that takes the height that is left. In a dock group too short even for a small
+    // one (the tabs, the note and Create's rows need more than the group's compact height) the
+    // panel scrolls, so everything above the pinned row can still be reached.
     let area = ui.max_rect();
     let room = ui.available_height();
     let mut tail = PanelTail::default();
@@ -1633,7 +1595,7 @@ struct PanelTail {
     reached: bool,
     kind: GenerationMode,
     current: Option<Model>,
-    /// The task's option on a row of its own, as [`ButtonRow`] decided it.
+    /// The tab's option on a row of its own, as [`ButtonRow`] decided it.
     option_row: bool,
     /// Generate can run.
     generate: bool,
@@ -1667,8 +1629,8 @@ fn panel_tail(app: &mut PhotocraftApp, ui: &mut egui::Ui, tail: &PanelTail) {
 }
 
 /// The row under the tabs: the model, Enhance prompt, Load from layer and the shortcut to the
-/// model's settings. `chosen` is the model chosen, kept for the task in front (Load from layer may
-/// choose another). Returns what Enhance was pressed for, to act on once the task is known.
+/// model's settings. `chosen` is the model chosen, kept for the tab in front (Load from layer may
+/// choose another). Returns what Enhance was pressed for, to act on once the technique is known.
 fn model_row(app: &mut PhotocraftApp, ui: &mut egui::Ui, models: &[Model], chosen: &mut String, width: f32, busy: bool) -> Option<enhance::Pressed> {
     // Model, Enhance prompt, Load from layer, and the shortcut to the model's settings.
     let mut settings = false;
@@ -1734,17 +1696,12 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
     let busy = job.is_some();
     // A prompt being enhanced is veiled, and nothing runs until it is back.
     let enhancing = enhance::running(app);
-    // What the user is there to do. A running generation keeps the tab and task it was started on.
+    // What the user is there to do. A running generation keeps the tab it was started on.
     let mut mode = app.ui.ai_gen.mode;
     mode_tabs(ui, &mut mode, !busy);
     app.ui.ai_gen.mode = mode;
     ui.add_space(6.0);
-    if mode == Mode::Edit {
-        let mut task = app.ui.ai_gen.task;
-        task_row(ui, &mut task, !busy);
-        app.ui.ai_gen.task = task;
-        ui.add_space(6.0);
-    } else {
+    if mode == Mode::Create {
         let model = current_model(app).cloned();
         let able: Vec<String> = enabled_models(app).into_iter().filter(|m| m.layout().is_some()).map(|m| m.name).collect();
         let mut task = app.ui.ai_gen.create_task;
@@ -1755,6 +1712,9 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
         }
         ui.add_space(6.0);
     }
+    // The one line that says what the tab in front does, wrapped to the panel's width.
+    ui.add(egui::Label::new(RichText::new(tr(mode.desc())).color(t.text_dim).size(11.5)).wrap());
+    ui.add_space(6.0);
     regions::follow(app);
     let changing = app.ui.ai_gen.changing();
     // The panel's brush paints the mask only while the mask is there to paint.
@@ -1768,7 +1728,7 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
         return;
     }
     // A model removed or disabled since it was chosen (or none chosen yet) falls back to the
-    // first one, or for Change to Qwen Image 2.1. Change keeps its own choice: it lists other
+    // first one, or for Inpaint to Qwen Image 2.1. Inpaint keeps its own choice: it lists other
     // models.
     let mut chosen = app.ui.ai_gen.chosen().to_string();
     if !models.iter().any(|m| m.id == chosen) {
@@ -1779,7 +1739,7 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
     let enhance_pressed = model_row(app, ui, &models, &mut chosen, width, busy);
     ui.add_space(6.0);
     let current = models.iter().find(|m| m.id == chosen).cloned().unwrap_or_default();
-    // What the model is asked for: the task says what the user is doing, the model how.
+    // What the model is asked for: the tab says what the user is doing, the model how.
     let kind = technique(&app.ui.ai_gen, Some(&current));
     let (inpaint, img2img, edit) = (kind == GenerationMode::Inpaint, kind == GenerationMode::Img2img, kind == GenerationMode::ImgEdit);
     if let Some(pressed) = enhance_pressed {
@@ -2063,13 +2023,13 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
 struct ButtonRow {
     kind: GenerationMode,
     width: f32,
-    /// The task's option has a row of its own above (a narrow panel with the height for it).
+    /// The tab's option has a row of its own above (a narrow panel with the height for it).
     option_row: bool,
     /// Generate can run.
     generate: bool,
 }
 
-/// Generate on the right, with the batch menu and Style before it, and the task's option on the
+/// Generate on the right, with the batch menu and Style before it, and the tab's option on the
 /// left: in one row, so the button stays in view in a short dock group, or with the option on a
 /// row of its own above. A running generation shows its progress and Cancel instead. Returns
 /// whether Generate was pressed.
@@ -2124,7 +2084,7 @@ fn batch_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     app.ui.ai_gen.batch = n;
 }
 
-/// The option the task has beside Generate: how closely a restyle follows the picture. The
+/// The option the tab has beside Generate: how closely a restyle follows the picture. The
 /// others have none there (Alpha Channel is in Advanced).
 fn option_of(app: &mut PhotocraftApp, ui: &mut egui::Ui, kind: GenerationMode, current: &Model) {
     let t = Tokens::get(ui.ctx());
@@ -2340,7 +2300,7 @@ fn generate_blocked(app: &PhotocraftApp, model: &Model) -> Option<String> {
         return Some(why);
     }
     let ui = &app.ui.ai_gen;
-    // A state set from outside may name a model the task does not list.
+    // A state set from outside may name a model the tab does not list.
     if ui.changing() && !fits(model, true) {
         return Some(format!("{} {}", model.name, tr("can't change a picture: choose a model that edits or inpaints.")));
     }
@@ -2798,9 +2758,9 @@ impl Filter {
         match self {
             Filter::All => "Ticked models are offered in the AI Gen panel. One that can't run yet (no API key, or not installed) can't be ticked until it can.",
             Filter::Create => "Models that make a picture from a prompt: the AI Gen panel's Create tab.",
-            Filter::Edit => "Models that change a picture as an instruction says: the AI Gen panel's Edit tab.",
+            Filter::Edit => "Models that change a picture as an instruction says: the AI Gen panel's Inpaint tab.",
             Filter::Inpaint => {
-                "Models that repaint a selection (the Edit tab). FLUX.1 Fill and Qwen Image with InstantX's ControlNet are made for it; any other can be tried by ticking its Supports inpainting box."
+                "Models that repaint a selection (the Inpaint tab). FLUX.1 Fill and Qwen Image with InstantX's ControlNet are made for it; any other can be tried by ticking its Supports inpainting box."
             }
         }
     }
@@ -4211,7 +4171,7 @@ fn model_settings(ui: &mut egui::Ui, m: &mut Map<String, Value>, files: Option<&
         text_row(ui, m, "name", "Name", "Model name");
         label(ui, "Used for");
         let used = model_of(&Value::Object(m.clone())).map(|model| uses(&model).into_iter().map(tr).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        ui.label(RichText::new(used).color(t.text)).on_hover_text(tr("What the AI Gen panel offers this model for: Create (text to image), or Edit (editing, inpainting). Animation (an animated GIF) follows from the model ID: GPT Image 2.6 models make them"));
+        ui.label(RichText::new(used).color(t.text)).on_hover_text(tr("What the AI Gen panel offers this model for: Create (text to image), or Inpaint (editing, inpainting). Animation (an animated GIF) follows from the model ID: GPT Image 2.6 models make them"));
         ui.end_row();
         if provider.is_local() {
             label(ui, "Architecture");
@@ -4340,7 +4300,7 @@ fn model_settings(ui: &mut egui::Ui, m: &mut Map<String, Value>, files: Option<&
         let was = serde_json::from_value::<Model>(Value::Object(m.clone())).map(|model| model.can_inpaint()).unwrap_or(false);
         let mut inpaint = was;
         widgets::checkbox(ui, &mut inpaint, tr("Supports inpainting")).on_hover_text(tr(
-            "Let this model fill a selection (the AI Gen panel's Edit tab). On for FLUX.2, which is given the picture as a reference. Other models are not told where the selection is: they can be tried, but tend to paint a picture of their own inside it. The Inpainting filter of the list shows the models that have this on",
+            "Let this model fill a selection (the AI Gen panel's Inpaint tab). On for FLUX.2, which is given the picture as a reference. Other models are not told where the selection is: they can be tried, but tend to paint a picture of their own inside it. The Inpainting filter of the list shows the models that have this on",
         ));
         if inpaint != was {
             m.insert("inpaint".into(), json!(inpaint));

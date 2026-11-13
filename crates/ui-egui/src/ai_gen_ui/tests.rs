@@ -645,7 +645,7 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
             id: "q".into(),
             name: "qwen image 2.1 int8 convrot".into(),
             unet: "qwen_image_2.1_int8_convrot.safetensors".into(),
-            // Ticked for inpainting, so a change offers it too.
+            // Ticked for inpainting, so Inpaint offers it too.
             inpaint: Some(true),
             ..Family::QwenImage.preset()
         },
@@ -657,9 +657,9 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
     assert!(generate_blocked(&app, &broken).unwrap().len() > 150);
     let ctx = egui::Context::default();
     PhotocraftApp::setup_context(&ctx, Default::default());
-    // Panels of several sizes, down to a short narrow one (the tabs, Prompt | Regions, the
-    // model, a two-line prompt, the Advanced heading, Generate and this reason): the notes
-    // always end inside.
+    // Panels of several sizes, down to a short narrow one (the tabs, the description, Prompt |
+    // Regions, the model, a two-line prompt, the Advanced heading, Generate and this reason): the
+    // notes always end inside.
     for (w, h) in [(300.0, 420.0), (260.0, 360.0), (420.0, 700.0)] {
         let mut overflow = 0.0f32;
         for _ in 0..3 {
@@ -676,10 +676,10 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
         }
         assert!(overflow <= 1.0, "{w}x{h}: the panel's content runs {overflow} points past its bottom");
     }
-    // The same for a change, which has rows more (its tasks, the mask tools), and with the
+    // The same for an inpaint, which has rows more (the mask tools), and with the
     // Advanced section open.
     app.run("select.rect", json!({"x": 8, "y": 8, "width": 16, "height": 16})).unwrap();
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     assert_eq!(technique(&app.ui.ai_gen, Some(&broken)), GenerationMode::Inpaint);
     for (w, h, advanced) in [(300.0, 420.0, false), (260.0, 390.0, false), (300.0, 500.0, true)] {
         app.ui.ai_gen.advanced = advanced;
@@ -694,7 +694,7 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
             .textures_delta
             .clear();
         }
-        assert!(overflow <= 1.0, "change {w}x{h}: the panel's content runs {overflow} points past its bottom");
+        assert!(overflow <= 1.0, "inpaint {w}x{h}: the panel's content runs {overflow} points past its bottom");
     }
 }
 
@@ -773,25 +773,24 @@ fn a_change_lists_the_models_that_edit_or_inpaint_and_keeps_its_own_choice() {
     let ids = |app: &PhotocraftApp| enabled_models(app).into_iter().map(|m| m.id).collect::<Vec<_>>();
     assert_eq!(ids(&app), ["ernie", "z", "ticked", "flux", "off"]);
     app.ui.ai_gen.model = "ernie".into();
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     assert_eq!(ids(&app), ["ticked", "flux", "off", "fill", "qwen"]);
     draw_panel(&mut app);
-    // A change has its own model: choosing one leaves the model of Create alone.
+    // Inpaint has its own model: choosing one leaves the model of Create alone.
     assert_eq!((app.ui.ai_gen.edit_model.as_str(), app.ui.ai_gen.model.as_str()), ("ticked", "ernie"));
     app.ui.ai_gen.edit_model = "fill".into();
     draw_panel(&mut app);
     assert_eq!((app.ui.ai_gen.chosen(), current_model(&app).map(|m| m.id.as_str())), ("fill", Some("fill")));
     // Restyle lists the models that generate, and shares the model of Create.
-    app.ui.ai_gen.task = EditTask::Restyle;
+    app.ui.ai_gen.mode = Mode::Restyle;
     assert_eq!(ids(&app), ["ernie", "z", "ticked", "flux", "off"]);
-    app.ui.ai_gen.mode = Mode::Create;
     draw_panel(&mut app);
     assert_eq!(app.ui.ai_gen.chosen(), "ernie");
-    // What the engine is asked for follows from the task and from what the model can do.
+    // What the engine is asked for follows from the tab and from what the model can do.
     let model = |id: &str| app.session.prefs().integrations.ai.models.iter().find(|m| m.id == id).cloned().unwrap();
     let mut ui = AiGenUi::default();
     assert_eq!(technique(&ui, Some(&model("fill"))), GenerationMode::Txt2img);
-    ui.mode = Mode::Edit;
+    ui.mode = Mode::Inpaint;
     let asked = |ui: &AiGenUi| ["ticked", "flux", "off", "fill", "qwen"].map(|id| technique(ui, Some(&model(id))));
     use GenerationMode::{Img2img, ImgEdit, Inpaint};
     // An edit model is given an instruction, a model that only inpaints the selection as its mask.
@@ -801,28 +800,52 @@ fn a_change_lists_the_models_that_edit_or_inpaint_and_keeps_its_own_choice() {
     ui.method = Method::Fill;
     assert_eq!(asked(&ui), [Inpaint, Inpaint, ImgEdit, Inpaint, Inpaint]);
     assert_eq!(technique(&ui, None), ImgEdit, "no model to ask: as an instruction");
-    ui.task = EditTask::Restyle;
+    ui.mode = Mode::Restyle;
     assert_eq!(asked(&ui), [Img2img; 5]);
     // No model that can: the panel says so instead of offering a list of nothing.
     let only = vec![Model { id: "ernie".into(), ..Family::Ernie.preset() }];
     app.run("prefs.set", json!({"path": "integrations.ai.models", "value": only})).unwrap();
-    app.ui.ai_gen.mode = Mode::Edit;
-    app.ui.ai_gen.task = EditTask::Change;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     assert!(ids(&app).is_empty() && current_model(&app).is_none());
     draw_panel(&mut app);
-    assert_eq!(app.ui.ai_gen.mode, Mode::Edit);
+    assert_eq!(app.ui.ai_gen.mode, Mode::Inpaint);
     assert!(generate(&mut app).unwrap_err().contains("No AI model"));
-    // The state names the tabs and tasks; the tabs of an earlier build, one per technique, load.
-    assert_eq!(serde_json::to_value(Mode::ALL).unwrap(), json!(["create", "edit"]));
-    assert_eq!(serde_json::to_value((EditTask::ALL, [Method::Instruct, Method::Fill])).unwrap(), json!([["change", "restyle"], ["instruct", "fill"]]));
-    for (saved, mode) in [("txt2img", Mode::Create), ("inpaint", Mode::Edit), ("img2img", Mode::Edit), ("imgEdit", Mode::Edit), ("edit", Mode::Edit)] {
-        let old: AiGenUi = serde_json::from_value(json!({"mode": saved, "inpaintModel": "gone"})).unwrap();
+    // The state names the tabs; the names an earlier build saved still load, and its task field
+    // is ignored.
+    assert_eq!(serde_json::to_value(Mode::ALL).unwrap(), json!(["create", "inpaint", "restyle"]));
+    assert_eq!(serde_json::to_value([Method::Instruct, Method::Fill]).unwrap(), json!(["instruct", "fill"]));
+    for (saved, mode) in
+        [("txt2img", Mode::Create), ("inpaint", Mode::Inpaint), ("img2img", Mode::Restyle), ("imgEdit", Mode::Inpaint), ("edit", Mode::Inpaint)]
+    {
+        let old: AiGenUi = serde_json::from_value(json!({"mode": saved, "task": "change"})).unwrap();
         assert_eq!(old, AiGenUi { mode, ..Default::default() }, "{saved}");
+        assert_eq!(serde_json::from_str::<Mode>(&format!("\"{saved}\"")).unwrap(), mode);
     }
+    // A state saved while Edit still had its task row: the task is gone and the field ignored.
+    let old: AiGenUi = serde_json::from_value(json!({"mode": "edit", "task": "restyle"})).unwrap();
+    assert_eq!(old.mode, Mode::Inpaint);
     let old: AiGenUi = serde_json::from_value(json!({"prompt": "x"})).unwrap();
-    assert_eq!((old.mode, old.task, old.method, old.strength, old.context), (Mode::Create, EditTask::Change, Method::Instruct, 1.0, 0.25));
+    assert_eq!((old.mode, old.method, old.strength, old.context), (Mode::Create, Method::Instruct, 1.0, 0.25));
     let hostile = AiGenUi { strength: f64::NAN, context: -7.0, ..Default::default() };
     assert_eq!((hostile.strength(), hostile.context()), (1.0, 0.0));
+}
+
+/// The panel is three tabs, Create, Inpaint and Restyle, each with its one-line description under
+/// the tabs: all three draw, docked and floating, without panicking.
+#[test]
+fn the_three_tabs_draw_each_with_its_line_of_description() {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    add_model(&mut app, Model { id: "q21".into(), ..Family::QwenImage21.preset() });
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    assert_eq!(Mode::ALL, [Mode::Create, Mode::Inpaint, Mode::Restyle]);
+    for mode in Mode::ALL {
+        app.ui.ai_gen.mode = mode;
+        assert!(!mode.desc().is_empty() && !mode.tip().is_empty(), "{mode:?} says nothing about itself");
+        let want = wanted_height(&app);
+        assert!(want.is_finite() && want > 0.0, "{mode:?}");
+        draw_panel(&mut app);
+    }
 }
 
 #[test]
@@ -831,8 +854,8 @@ fn inpainting_from_the_panel_needs_a_selection_on_a_pixel_layer_and_adds_a_maske
     let z = Model { inpaint: Some(true), ..z_image("z") };
     add_model(&mut app, z.clone());
     app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
-    // A model that inpaints and does not edit: a change with it is an inpainting.
-    app.ui.ai_gen.mode = Mode::Edit;
+    // A model that inpaints and does not edit: Inpaint with it is an inpainting.
+    app.ui.ai_gen.mode = Mode::Inpaint;
     app.ui.ai_gen.prompt = "a pond".into();
     // No selection: Generate is off and says what to do.
     assert!(generate_blocked(&app, &z).unwrap().contains("needs a selection"));
@@ -892,19 +915,19 @@ fn the_panel_asks_for_room_for_its_generate_button() {
     let mut app = app();
     let base = wanted_height(&app);
     assert!(base.is_finite() && base > crate::dock::Group::Properties.compact_height(), "{base}");
-    // A change has a row more: the mask tools (Edit's tasks take the place of Create's Prompt |
-    // Regions). Advanced, open, adds its own.
+    // An inpaint trades rows: its mask tools add one under the prompt, and it has no row where
+    // Create chooses Prompt | Regions.
     add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
-    app.ui.ai_gen.mode = Mode::Edit;
-    assert_eq!(wanted_height(&app), base + ROW);
+    app.ui.ai_gen.mode = Mode::Inpaint;
+    assert_eq!(wanted_height(&app), base);
     app.ui.ai_gen.advanced = true;
     // (The strength and context, the seed, and the LoRAs heading of a local model.)
-    assert_eq!(wanted_height(&app), base + 4.0 * ROW);
+    assert_eq!(wanted_height(&app), base + 3.0 * ROW);
     // A model that changes a picture both ways has the method to choose as well.
     add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
     app.ui.ai_gen.edit_model = "flux".into();
     app.ui.ai_gen.method = Method::Fill;
-    assert_eq!(wanted_height(&app), base + 5.0 * ROW);
+    assert_eq!(wanted_height(&app), base + 4.0 * ROW);
     // Create: the seed, Alpha Channel and the LoRAs heading.
     app.ui.ai_gen.mode = Mode::Create;
     assert_eq!(wanted_height(&app), base + 3.0 * ROW);
@@ -983,9 +1006,9 @@ fn the_list_says_what_each_model_is_used_for_and_can_be_narrowed_to_it() {
     let found: Vec<Model> = serde_json::from_value(fresh["values"]["integrations"]["ai"]["models"].clone()).unwrap();
     assert_eq!((added, repaired, matched), (found.len(), 0, 0));
     assert_eq!(found.iter().filter(|m| m.family.inpaint_only()).map(|m| m.family).collect::<Vec<_>>(), [Family::Flux1Fill, Family::QwenInpaint]);
-    // With no model that edits or inpaints, a change says how to get one (and draws).
+    // With no model that edits or inpaints, Inpaint says how to get one (and draws).
     app.run("prefs.set", json!({"path": "integrations.ai.models", "value": [z_image("z")]})).unwrap();
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     assert!(enabled_models(&app).is_empty());
     draw_panel(&mut app);
 }
@@ -995,8 +1018,7 @@ fn image_to_image_from_the_panel_picks_a_layer_or_another_document() {
     let mut app = app();
     add_model(&mut app, z_image("z"));
     add_model(&mut app, Model { id: "fill".into(), ..Family::Flux1Fill.preset() });
-    app.ui.ai_gen.mode = Mode::Edit;
-    app.ui.ai_gen.task = EditTask::Restyle;
+    app.ui.ai_gen.mode = Mode::Restyle;
     app.ui.ai_gen.prompt = "as a watercolour".into();
     // The models that generate are offered; one made for inpainting is not.
     assert_eq!(enabled_models(&app).into_iter().map(|m| m.id).collect::<Vec<_>>(), ["z"]);
@@ -1047,14 +1069,12 @@ fn image_to_image_from_the_panel_picks_a_layer_or_another_document() {
     let old: AiGenUi = serde_json::from_value(json!({"prompt": "x"})).unwrap();
     assert_eq!((old.img_source, old.img_strength), (None, 0.6));
     assert_eq!(AiGenUi { img_strength: f64::NAN, ..Default::default() }.img_strength(), 0.6);
-    // The dock gives the task its rows: the Source picker (Edit's tasks take the place of Create's row).
-    assert_eq!(
-        wanted_height(&app),
-        {
-            app.ui.ai_gen.mode = Mode::Create;
-            wanted_height(&app)
-        } + ROW
-    );
+    // The dock gives the tab its rows: Restyle's Source picker takes the place of Create's
+    // Prompt | Regions row, the note under the tabs standing in both.
+    assert_eq!(wanted_height(&app), {
+        app.ui.ai_gen.mode = Mode::Create;
+        wanted_height(&app)
+    });
 }
 
 #[test]
@@ -1062,7 +1082,7 @@ fn the_mask_tools_mark_what_to_repaint_from_the_panel() {
     use crate::state::Tool;
     let mut app = app();
     add_model(&mut app, Model { inpaint: Some(true), ..z_image("z") });
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     app.ui.ai_gen.prompt = "a boat".into();
     // No document: the bar draws, disabled.
     draw_panel(&mut app);
@@ -1108,14 +1128,12 @@ fn the_mask_tools_mark_what_to_repaint_from_the_panel() {
     app.run("select.editInQuickMaskMode", json!({"on": true})).unwrap();
     app.ui.ai_gen.mask_brush = true;
     assert!(!mask_brushing(&app));
-    // The dock makes room for the bar (Edit's tasks take the place of Create's row).
-    assert_eq!(
-        wanted_height(&app),
-        {
-            app.ui.ai_gen.mode = Mode::Create;
-            wanted_height(&app)
-        } + ROW
-    );
+    // The dock makes room for the bar (its one row under the tabs stands where Create's Prompt |
+    // Regions row is).
+    assert_eq!(wanted_height(&app), {
+        app.ui.ai_gen.mode = Mode::Create;
+        wanted_height(&app)
+    });
 }
 
 #[test]
@@ -1126,29 +1144,29 @@ fn editing_from_the_panel_picks_a_source_references_and_a_quality() {
     add_model(&mut app, Model { id: "edit".into(), ..Family::QwenEdit.preset() });
     add_model(&mut app, Model { id: "gpt-image-2".into(), ..Model::cloud(Provider::Openai, "GPT Image 2", "gpt-image-2", false) });
     app.session.ai.set_key(Provider::Openai, "sk-test");
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     app.ui.ai_gen.prompt = "make the sky stormy".into();
     // The models that edit are offered, local and cloud; one that only generates is not, and an
     // edit model is offered nowhere else.
     let ids = |app: &PhotocraftApp| enabled_models(app).into_iter().map(|m| m.id).collect::<Vec<_>>();
     assert_eq!(ids(&app), ["gpt-image-2", "q21", "edit"]);
-    for (mode, task) in [(Mode::Create, EditTask::Change), (Mode::Edit, EditTask::Restyle)] {
-        (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (mode, task);
-        assert_eq!(ids(&app), ["gpt-image-2", "z", "q21"], "{mode:?} {task:?}");
+    for mode in [Mode::Create, Mode::Restyle] {
+        app.ui.ai_gen.mode = mode;
+        assert_eq!(ids(&app), ["gpt-image-2", "z", "q21"], "{mode:?}");
     }
-    (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (Mode::Edit, EditTask::Change);
+    app.ui.ai_gen.mode = Mode::Inpaint;
     let q21 = Model { id: "q21".into(), ..Family::QwenImage21.preset() };
-    // None chosen: Change runs Qwen Image 2.1, the recommended edit model, though a cloud model
+    // None chosen: Inpaint runs Qwen Image 2.1, the recommended edit model, though a cloud model
     // is listed first; Create runs the first.
     app.ui.ai_gen.edit_model = String::new();
     assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("q21"));
     app.ui.ai_gen.mode = Mode::Create;
     assert_eq!(current_model(&app).map(|m| m.id.as_str()), Some("gpt-image-2"));
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     // No document, then one with nothing in it: Generate is off and says what is missing.
     app.ui.ai_gen.edit_model = "q21".into();
     draw_panel(&mut app);
-    assert_eq!(app.ui.ai_gen.edit_model, "q21", "a change keeps its own choice of model");
+    assert_eq!(app.ui.ai_gen.edit_model, "q21", "Inpaint keeps its own choice of model");
     app.run("file.new", json!({"width": 40, "height": 30, "background": "transparent"})).unwrap();
     assert!(generate_blocked(&app, &q21).unwrap().contains("Editing needs a picture"));
     assert_eq!((edit_source(&app), target_size(&app)), (None, None));
@@ -1200,7 +1218,7 @@ fn editing_from_the_panel_picks_a_source_references_and_a_quality() {
     let kept = app.ui.ai_gen.clone();
     assert!(load_prompt(&mut app, layer));
     assert_eq!(app.ui.ai_gen, AiGenUi { prompt: "make the sky stormy".into(), edit_model: "q21".into(), ..kept });
-    (app.ui.ai_gen.mode, app.ui.ai_gen.edit_model) = (Mode::Edit, "q21".into());
+    (app.ui.ai_gen.mode, app.ui.ai_gen.edit_model) = (Mode::Inpaint, "q21".into());
     draw_panel(&mut app);
     // A cloud model edits too (its quality is its own setting); so does every tab's draw.
     app.ui.ai_gen.edit_model = "gpt-image-2".into();
@@ -1210,16 +1228,17 @@ fn editing_from_the_panel_picks_a_source_references_and_a_quality() {
     let state = serde_json::to_value(&app.ui.ai_gen).unwrap();
     assert_eq!((&state["editSource"], &state["editQuality"]), (&json!({"layer": background}), &json!("draft")));
     let old: AiGenUi = serde_json::from_value(json!({"prompt": "x", "mode": "imgEdit", "editReferences": [{"layer": 3}]})).unwrap();
-    assert_eq!((old.mode, old.edit_source, old.edit_quality), (Mode::Edit, None, GenerationQuality::Standard));
-    // The dock gives the task its rows: the source, the chips and the mask tools (Edit's tasks
-    // take the place of Create's row); a chip open shows its name and picture too.
+    assert_eq!((old.mode, old.edit_source, old.edit_quality), (Mode::Inpaint, None, GenerationQuality::Standard));
+    // The dock gives the tab its rows: the source, the chips and the mask tools (the description
+    // under the tabs stands where Create's Prompt | Regions row is); a chip open shows its name
+    // and picture too.
     let tall = wanted_height(&app);
     app.ui.ai_gen.editing_ref = Some(0);
     assert_eq!(wanted_height(&app), tall + 2.0 * ROW);
     app.ui.ai_gen.editing_ref = Some(5);
     assert_eq!(wanted_height(&app), tall, "a chip that is gone is not open");
     app.ui.ai_gen.mode = Mode::Create;
-    assert_eq!(tall, wanted_height(&app) + 3.0 * ROW);
+    assert_eq!(tall, wanted_height(&app) + 2.0 * ROW);
 }
 
 #[test]
@@ -1244,7 +1263,8 @@ fn references_are_named_chips_the_document_keeps() {
     let luna = app.session.active().unwrap().active_layer.unwrap().0;
     assert!(app.session.set_active(0));
     app.run("layer.select", json!({"layer": background})).unwrap();
-    (app.ui.ai_gen.mode, app.ui.ai_gen.task, app.ui.ai_gen.edit_model) = (Mode::Edit, EditTask::Change, "q21".into());
+    app.ui.ai_gen.mode = Mode::Inpaint;
+    app.ui.ai_gen.edit_model = "q21".into();
     // The other document's layer is on offer, after its document.
     let offered = refs::offered(&app.session);
     let theirs = SourceRef::DocumentLayer { document: there, layer: luna };
@@ -1339,7 +1359,7 @@ fn a_painted_mask_scopes_a_change_by_instruction() {
     let q21 = Model { id: "q21".into(), ..Family::QwenImage21.preset() };
     add_model(&mut app, q21.clone());
     app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
-    app.ui.ai_gen.mode = Mode::Edit;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     app.ui.ai_gen.prompt = "make it a pond".into();
     app.ui.ai_gen.context = 0.0;
     // An edit model: the change is an instruction, and nothing marked means the whole layer.
@@ -1366,7 +1386,7 @@ fn a_painted_mask_scopes_a_change_by_instruction() {
 }
 
 #[test]
-fn the_advanced_section_opens_the_settings_of_the_task_in_front() {
+fn the_advanced_section_opens_the_settings_of_the_tab_in_front() {
     let mut app = app();
     add_model(&mut app, z_image("z"));
     add_model(&mut app, Model { id: "flux".into(), ..Family::Flux2.preset() });
@@ -1380,18 +1400,18 @@ fn the_advanced_section_opens_the_settings_of_the_task_in_front() {
         let model = current_model(app);
         advanced_rows(model, technique(&app.ui.ai_gen, model))
     };
-    // Closed, it is its heading; open, the rows of the task: the seed, for a change also its
-    // strength or quality with the context, and the method when the model leaves that open.
+    // Closed, it is its heading; open, the rows of the tab in front: the seed, for an inpaint
+    // also its strength or quality with the context, and the method when the model leaves it open.
     let closed = wanted_height(&app);
     app.ui.ai_gen.advanced = true;
     app.ui.ai_gen.seed = Some(7);
     // (Create: the seed and Alpha Channel.)
     assert_eq!((rows(&app), wanted_height(&app)), (2, closed + 2.0 * ROW));
     draw_panel(&mut app);
-    (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (Mode::Edit, EditTask::Restyle);
+    app.ui.ai_gen.mode = Mode::Restyle;
     assert_eq!(rows(&app), 1);
     draw_panel(&mut app);
-    app.ui.ai_gen.task = EditTask::Change;
+    app.ui.ai_gen.mode = Mode::Inpaint;
     for (id, method, want) in [
         // (An instruction also has Alpha Channel; a fill paints what is there.)
         ("flux", Method::Instruct, 4),
@@ -1463,13 +1483,11 @@ fn generated_layers(app: &mut PhotocraftApp) -> [u64; 4] {
     };
     app.ui.ai_gen = AiGenUi { model: "z2".into(), prompt: "a green field".into(), alpha: false, ..Default::default() };
     let txt = made(app);
-    let restyle = (Mode::Edit, EditTask::Restyle);
-    app.ui.ai_gen =
-        AiGenUi { mode: restyle.0, task: restyle.1, model: "z".into(), prompt: "as a watercolour".into(), img_strength: 0.35, ..Default::default() };
+    app.ui.ai_gen = AiGenUi { mode: Mode::Restyle, model: "z".into(), prompt: "as a watercolour".into(), img_strength: 0.35, ..Default::default() };
     app.ui.ai_gen.img_source = Some(SourceRef::Layer(background));
     let img = made(app);
     app.run("select.rect", json!({"x": 8, "y": 4, "width": 20, "height": 10})).unwrap();
-    app.ui.ai_gen = AiGenUi { mode: Mode::Edit, edit_model: "z2".into(), prompt: "a pond".into(), strength: 0.75, context: 0.5, ..Default::default() };
+    app.ui.ai_gen = AiGenUi { mode: Mode::Inpaint, edit_model: "z2".into(), prompt: "a pond".into(), strength: 0.75, context: 0.5, ..Default::default() };
     let inpaint = made(app);
     [background, txt, img, inpaint]
 }
@@ -1485,8 +1503,8 @@ fn load_prompt_puts_a_generated_layers_prompt_and_model_back_and_nothing_else() 
     assert!(!load_prompt(&mut app, background));
     assert!(!load_prompt(&mut app, u64::MAX));
     assert_eq!(app.ui.ai_gen, other);
-    // A fill (Change's model), a restyle and a creation (the other): the prompt and the model it
-    // was made with; the tab, task and settings stay.
+    // A fill (Inpaint's model), a restyle and a creation (the other): the prompt and the model it
+    // was made with; the tab and settings stay.
     for (layer, prompt, model, edit_model) in [(inpaint, "a pond", "z", "z2"), (img, "as a watercolour", "z", "z2"), (txt, "a green field", "z2", "z2")] {
         assert!(load_prompt(&mut app, layer));
         assert_eq!(app.ui.ai_gen, AiGenUi { prompt: prompt.into(), model: model.into(), edit_model: edit_model.into(), ..other.clone() });
@@ -1580,7 +1598,7 @@ mod clicks {
         assert_eq!(h.state().session.active().unwrap().active_layer, Some(photocraft_doc::LayerId(inpaint)));
         let before = h.state().ui.ai_gen.clone();
         assert_eq!((before.mode, before.model.as_str(), before.prompt.as_str()), (Mode::Create, "z", "something else"));
-        // Load from layer puts its prompt in the box and chooses its model (Change's, for a
+        // Load from layer puts its prompt in the box and chooses its model (the inpaint's, for a
         // fill): no other tab.
         let at = h.get_by_label(LOAD).rect().center();
         click(&mut h, at);
@@ -2059,7 +2077,8 @@ fn a_narrow_panel_keeps_everything_inside_it() {
     app.run("edit.fill", json!({"color": "#336699"})).unwrap();
     app.run("select.deselect", json!({})).unwrap();
     let layer = app.session.active().unwrap().active_layer.unwrap().0;
-    (app.ui.ai_gen.mode, app.ui.ai_gen.task, app.ui.ai_gen.edit_model) = (Mode::Edit, EditTask::Change, "q21".into());
+    app.ui.ai_gen.mode = Mode::Inpaint;
+    app.ui.ai_gen.edit_model = "q21".into();
     app.ui.ai_gen.prompt = "add @dracco rising from the lake".into();
     let _ = doc;
     let reference = |name: &str| json!({"layer": layer, "name": name});
@@ -2099,8 +2118,8 @@ fn a_long_model_name_keeps_generate_and_the_gear_in_the_panel() {
     app.run("edit.fill", json!({"color": "#336699"})).unwrap();
     app.run("select.deselect", json!({})).unwrap();
     app.ui.ai_gen.prompt = "a frog is eating a fly while it sits on a lily pad".into();
-    for mode in [Mode::Edit, Mode::Create] {
-        (app.ui.ai_gen.mode, app.ui.ai_gen.task) = (mode, EditTask::Change);
+    for mode in [Mode::Inpaint, Mode::Create] {
+        app.ui.ai_gen.mode = mode;
         (app.ui.ai_gen.edit_model, app.ui.ai_gen.model) = ("q21".into(), "q21".into());
         // From where the buttons beside the model keep their words to where the name nearly fits.
         for width in [300.0, 420.0, 520.0, 600.0, 700.0] {
@@ -2942,15 +2961,15 @@ fn enhance_puts_the_answer_in_the_prompt_and_the_original_can_come_back() {
     let line = enhance::enhanced_by(&app).unwrap();
     assert!(line.contains("Claude (claude-haiku-5-5)"), "{line}");
     assert!(enhance::restore_tip(&app).contains("Shift-click"));
-    // The task and the image model go with the prompt.
+    // What is being made and the image model go with the prompt.
     let asked = fake.asked.lock().unwrap().last().cloned().unwrap();
     assert!(asked.contains("a new image") && asked.contains("The image model is Z-Image"), "{asked}");
     draw_panel(&mut app);
     assert_eq!(menu(&mut app, enhance::RESTORE_MENU, &json!({})), Some(Ok(json!({"restored": true}))));
     assert_eq!(app.ui.ai_gen.prompt, "cat window");
     assert_eq!(menu(&mut app, enhance::RESTORE_MENU, &json!({})), Some(Ok(json!({"restored": false}))));
-    // An edit's instruction is enhanced as one.
-    app.ui.ai_gen.mode = Mode::Edit;
+    // An inpaint instruction is enhanced as one.
+    app.ui.ai_gen.mode = Mode::Inpaint;
     menu(&mut app, enhance::ENHANCE_MENU, &json!({})).unwrap().unwrap();
     assert!(fake.asked.lock().unwrap().last().unwrap().contains("Keep it an instruction"));
 }
