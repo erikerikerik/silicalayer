@@ -1930,6 +1930,13 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tai
     if laying_out && typed {
         regions::keep_scene(app);
     }
+    // Restyle is a search for a look: the presets sit under the prompt as tiles, where they can
+    // be compared and tried, not behind a button in the bottom row (the picker is still there,
+    // behind the strip's More… tile).
+    if mode == Mode::Restyle {
+        ui.add_space(6.0);
+        styles::strip(app, ui, !busy && enhancing.is_none());
+    }
     ui.add_space(6.0);
     // How to start a generation without leaving the box; Return alone still adds a line.
     let hint = tr(SUBMIT_HINT);
@@ -2029,7 +2036,8 @@ struct ButtonRow {
     generate: bool,
 }
 
-/// Generate on the right, with the batch menu and Style before it, and the tab's option on the
+/// Generate on the right, with the batch menu and Style before it (Restyle keeps Style out — its
+/// presets are the strip under the prompt), and the tab's option on the
 /// left: in one row, so the button stays in view in a short dock group, or with the option on a
 /// row of its own above. A running generation shows its progress and Cancel instead. Returns
 /// whether Generate was pressed.
@@ -2057,7 +2065,10 @@ fn button_row(app: &mut PhotocraftApp, ui: &mut egui::Ui, job: Option<&JobInfo>,
             let animating = app.ui.ai_gen.animating(current, row.kind);
             ui.add_enabled_ui(!animating, |ui| batch_menu(app, ui));
             // Style says which preset is chosen unless the row is too narrow for its words.
-            styles::button(app, ui, true, row.width >= STYLE_WORDS);
+            // Restyle shows its presets as the strip under the prompt instead.
+            if row.kind != GenerationMode::Img2img {
+                styles::button(app, ui, true, row.width >= STYLE_WORDS);
+            }
         });
     });
     if let Some(id) = cancel {

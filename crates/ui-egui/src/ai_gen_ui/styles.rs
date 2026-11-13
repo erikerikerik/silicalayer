@@ -1,5 +1,6 @@
 //! Style presets in the shell: the Style button beside Generate and the picker it opens, a grid
-//! of thumbnails under a tab list of the presets' groups (All, Photography, …). The thumbnails
+//! of thumbnails under a tab list of the presets' groups (All, Photography, …), and the strip of
+//! tiles the Restyle tab shows under its prompt ([`strip`]). The thumbnails
 //! show one subject throughout, so the treatments compare; hovering one shows it larger with a
 //! few words about the look. "No preset" leaves the prompt as it is.
 //!
@@ -53,6 +54,9 @@ const COLUMNS: usize = 4;
 const GRID_HEIGHT: f32 = 2.0 * (TILE + 30.0) + 60.0;
 /// The larger preview on hover.
 const PREVIEW: f32 = 256.0;
+/// The strip's tiles: one row across the panel, at least three of them, a side within these.
+const STRIP_MIN: f32 = 64.0;
+const STRIP_MAX: f32 = 84.0;
 
 /// The preset chosen in the panel, while it is one there is.
 pub(super) fn chosen(app: &PhotocraftApp) -> Option<&'static Style> {
@@ -130,7 +134,11 @@ pub(super) fn button(app: &mut PhotocraftApp, ui: &mut egui::Ui, enabled: bool, 
         ui.painter().rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
         let color = if on { t.text } else { t.text_faint };
         let icon_color = if on && style.is_some() { t.accent } else { color };
-        let icon = if words { egui::Rect::from_min_size(rect.left_center() + vec2(8.0, -8.0), vec2(16.0, 16.0)) } else { egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0)) };
+        let icon = if words {
+            egui::Rect::from_min_size(rect.left_center() + vec2(8.0, -8.0), vec2(16.0, 16.0))
+        } else {
+            egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0))
+        };
         crate::icons::paint(ui, icon, "palette", 14.0, icon_color);
         if words {
             let room = rect.right() - 8.0 - (icon.right() + 6.0);
@@ -157,6 +165,80 @@ pub(super) fn button(app: &mut PhotocraftApp, ui: &mut egui::Ui, enabled: bool, 
                 ui.close();
             }
         });
+}
+
+/// The style presets under the prompt of the Restyle tab, where the look is the point: one row of
+/// tiles filling the panel's width, never fewer than three — No preset, the chosen one first when
+/// there is one, then the presets in [`THUMBS`] order, and a More… tile last that opens the same
+/// picker as the Style button. Too narrow for them all, it still keeps No preset, the chosen one
+/// and More…. Not `enabled`: drawn dimmed, nothing responds.
+pub(super) fn strip(app: &mut PhotocraftApp, ui: &mut egui::Ui, enabled: bool) {
+    let t = Tokens::get(ui.ctx());
+    let mut more = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.label(RichText::new(tr("Style")).color(if enabled { t.text_dim } else { t.text_faint }).size(11.5));
+        // As many tiles as fit at 64–84 px with the picker's gap, at least three; the last slot
+        // is More…, so `count - 1` of the presets are in view.
+        let avail = ui.available_width().max(0.0);
+        let count = ((avail + GAP) / (STRIP_MIN + GAP)).floor().max(3.0) as usize;
+        let side = ((avail - (count as f32 - 1.0) * GAP) / count as f32).clamp(24.0, STRIP_MAX);
+        let chosen_id = chosen(app).map(|s| s.id);
+        let mut tiles: Vec<Option<&'static Style>> = vec![None];
+        if let Some(s) = chosen(app) {
+            tiles.push(Some(s));
+        }
+        tiles.extend(THUMBS.iter().filter(|(id, _)| Some(*id) != chosen_id).filter_map(|(id, _)| photocraft_aigen::style::find(id)).map(Some));
+        tiles.truncate(count - 1);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
+            for style in tiles {
+                let on = style.map(|s| s.id) == chosen_id;
+                if tile_at(ui, style, on, side).clicked() {
+                    app.ui.ai_gen.style = style.map_or(String::new(), |s| s.id.to_string());
+                }
+            }
+            more = Some(more_tile(ui, side));
+        });
+    });
+    let Some(resp) = more else { return };
+    let resp = resp.on_hover_text(tr("Every style preset"));
+    // The release that opens the picker is a click outside it, which egui would take as a reason
+    // to close again; IgnoreClicks on the frame after a click holds it open. A plain click (the
+    // press-menu drag-release flow, and every test) presses and releases in the frame that opens,
+    // so the next frame already closes on click outside again.
+    let close = if resp.clicked() { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside };
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(close)
+        .align(egui::RectAlign::TOP_END)
+        .align_alternatives(&[egui::RectAlign::BOTTOM_END, egui::RectAlign::TOP_START, egui::RectAlign::BOTTOM_START])
+        .show(|ui| {
+            if let Some(picked) = picker(app, ui) {
+                app.ui.ai_gen.style = picked.map(|s| s.id.to_string()).unwrap_or_default();
+                ui.close();
+            }
+        });
+}
+
+/// The strip's last tile: a plain tile with a grid glyph and the word "More…". Its response opens
+/// the picker.
+fn more_tile(ui: &mut egui::Ui, side: f32) -> egui::Response {
+    let t = Tokens::get(ui.ctx());
+    let live = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side + 22.0), egui::Sense::click());
+    let name = tr("More…");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, live, name));
+    let picture = egui::Rect::from_min_size(rect.min, vec2(side, side));
+    let radius = t.radius_sm + 2.0;
+    ui.painter().rect_filled(picture, radius, t.field);
+    crate::icons::paint(ui, egui::Rect::from_center_size(picture.center(), vec2(28.0, 28.0)), "grid-2x2", 24.0, if live { t.text } else { t.text_faint });
+    let border = if live && resp.hovered() { egui::Stroke::new(1.5, t.text_dim) } else { egui::Stroke::new(1.0, t.field_border) };
+    ui.painter().rect_stroke(picture, radius, border, egui::StrokeKind::Inside);
+    let color = if live { t.text_dim } else { t.text_faint };
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), egui::FontId::proportional(12.0), color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(side);
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(egui::pos2(rect.center().x - galley.size().x / 2.0, picture.bottom() + 4.0), galley, color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// The picker: the groups as tabs, then the tiles of the tab in front ("No preset" first).
@@ -221,19 +303,32 @@ fn tabs(ui: &mut egui::Ui, tab: &mut usize) {
     ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], egui::Stroke::new(1.0, t.separator));
 }
 
-/// One tile: the thumbnail with its name under it; the chosen one framed in the accent with a
-/// check. `None` is No preset. Hovering shows the picture larger, with what the look is.
+/// One picker-grid tile: the [`tile_at`] size for the grid ([`TILE`] squares).
 fn tile(ui: &mut egui::Ui, style: Option<&'static Style>, on: bool) -> egui::Response {
+    tile_at(ui, style, on, TILE)
+}
+
+/// One tile of `side` px: the thumbnail with its name under it; the chosen one framed in the
+/// accent with a check. `None` is No preset. Hovering shows the picture larger, with what the
+/// look is. A disabled `ui` (the strip while a job runs) draws the tile dimmed, and nothing
+/// responds to it.
+fn tile_at(ui: &mut egui::Ui, style: Option<&'static Style>, on: bool, side: f32) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(vec2(TILE, TILE + 22.0), egui::Sense::click());
+    let live = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side + 22.0), egui::Sense::click());
     let name = style.map_or(tr("No preset"), |s| s.name);
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, name));
-    let picture = egui::Rect::from_min_size(rect.min, vec2(TILE, TILE));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, live, on, name));
+    let picture = egui::Rect::from_min_size(rect.min, vec2(side, side));
     let radius = t.radius_sm + 2.0;
     let texture = style.and_then(|s| texture(ui.ctx(), s.id));
     match &texture {
         Some(tex) => {
-            egui::Image::new((tex.id(), vec2(TILE, TILE))).corner_radius(radius).paint_at(ui, picture);
+            // While dimmed the thumbnail is drawn semi-transparent, like the name under it.
+            let mut img = egui::Image::new((tex.id(), picture.size())).corner_radius(radius);
+            if !live {
+                img = img.tint(egui::Color32::from_white_alpha(110));
+            }
+            img.paint_at(ui, picture);
         }
         None => {
             // No preset: a plain tile.
@@ -255,9 +350,15 @@ fn tile(ui: &mut egui::Ui, style: Option<&'static Style>, on: bool) -> egui::Res
         ui.painter().circle_filled(badge.center(), 10.0, t.accent);
         crate::icons::paint(ui, badge.shrink(3.0), "check", 13.0, t.primary_text);
     }
-    let color = if on { t.text } else { t.text_dim };
+    let color = if !live {
+        t.text_faint
+    } else if on {
+        t.text
+    } else {
+        t.text_dim
+    };
     let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), egui::FontId::proportional(12.0), color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(TILE);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(side);
     let galley = ui.painter().layout_job(job);
     ui.painter().galley(egui::pos2(rect.center().x - galley.size().x / 2.0, picture.bottom() + 4.0), galley, color);
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);

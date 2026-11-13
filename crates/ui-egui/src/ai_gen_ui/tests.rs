@@ -757,6 +757,68 @@ fn the_prompt_box_says_how_to_generate_from_inside_it() {
     assert!(hint.top() >= prompt.bottom(), "the hint at {:?} is not under the prompt box at {prompt:?}", hint);
 }
 
+/// The Restyle panel, `style` chosen, drawn in a box this size.
+fn restyle_at(width: f32, style: &str) -> egui_kittest::Harness<'static, PhotocraftApp> {
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+    app.ui.ai_gen.mode = Mode::Restyle;
+    app.ui.ai_gen.style = style.into();
+    docked_panel(app, vec2(width, 520.0))
+}
+
+#[test]
+fn restyle_shows_its_presets_as_a_strip_under_the_prompt() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::Queryable;
+    for width in [280.0, 480.0] {
+        let h = restyle_at(width, "cinematic");
+        // No preset, the chosen one first, and More…: one row, in that order, filling the panel.
+        let none = h.get_by_label("No preset").rect();
+        let cinematic = h.get_by_label("Cinematic").rect();
+        let more = h.get_by_label("More…").rect();
+        assert!(
+            (none.top() - cinematic.top()).abs() < 1.0 && (cinematic.top() - more.top()).abs() < 1.0,
+            "{width}: {none:?} {cinematic:?} {more:?} are not one row"
+        );
+        assert!(none.right() <= cinematic.left() + 1.0 && cinematic.right() <= more.left() + 1.0, "{width}: {none:?} {cinematic:?} {more:?} are out of order");
+        assert!(more.right() <= width + 1.0, "{width}: More… overflows the panel at {:?}", more.right());
+        assert!(none.width() >= 24.0 && none.width() <= 90.0, "{width}: tiles {none:?} are not 64–84 px squares");
+        // The prompt's own label is above it, and the strip of tiles is right under the box.
+        let prompt = h.get_by_role(Role::MultilineTextInput).rect();
+        assert!(none.top() > prompt.bottom(), "{width}: the strip is not under the prompt");
+        // A wide panel shows more presets, a narrow one stops at the first ones after the chosen.
+        assert_eq!(h.query_by_label("Natural Photo").is_some(), width >= 480.0, "{width}");
+        assert!(h.query_by_label("Pixel Art").is_none(), "{width}: the presets past the row live in the picker");
+    }
+    // With nothing chosen, No preset leads the strip with the first presets.
+    let h = restyle_at(480.0, "");
+    let none = h.get_by_label("No preset").rect();
+    let natural = h.get_by_label("Natural Photo").rect();
+    let more = h.get_by_label("More…").rect();
+    assert!(none.right() <= natural.left() + 1.0 && natural.right() <= more.left() + 1.0, "{none:?} {natural:?} {more:?}");
+}
+
+#[test]
+fn only_create_and_inpaint_keep_the_style_button_in_the_bottom_row() {
+    use egui_kittest::kittest::Queryable;
+    for mode in [Mode::Create, Mode::Inpaint] {
+        let mut app = app();
+        add_model(&mut app, z_image("z"));
+        app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+        app.ui.ai_gen.mode = mode;
+        let h = docked_panel(app, vec2(300.0, 520.0));
+        // None of these is a named widget, so the strip's own dim labels never shadow the
+        // button's accessibility entry: the button only on Create and Inpaint, the strip only
+        // on Restyle.
+        assert!(h.query_by_label("Style").is_some(), "{mode:?} keeps the button");
+        assert!(h.query_by_label("More…").is_none(), "{mode:?} has no strip");
+    }
+    let h = restyle_at(480.0, "cinematic");
+    assert!(h.query_by_label("Style").is_none(), "Restyle gives the row to Generate, the batch and its option");
+    assert!(h.query_by_label("More…").is_some(), "Restyle shows the strip");
+}
+
 #[test]
 fn a_change_lists_the_models_that_edit_or_inpaint_and_keeps_its_own_choice() {
     let mut app = app();
@@ -1672,6 +1734,49 @@ mod clicks {
         let at = h.get_by_label("Style").rect().center();
         click(&mut h, at);
         assert!(h.query_by_label("Pixel Art").is_none());
+        let at = h.get_by_label("No preset").rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen.style, "");
+    }
+
+    /// The Restyle tab keeps its presets as tiles under the prompt; the Style button in the
+    /// bottom row belongs to the other tabs.
+    fn restyle_panel() -> Harness<'static, PhotocraftApp> {
+        let mut app = app();
+        add_model(&mut app, z_image("z"));
+        app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
+        // A panel tall and wide enough that no row is cut: nothing scrolls over the strip.
+        menu(&mut app, PANEL, &json!({"show": true})).unwrap().unwrap();
+        app.ui.dock.heights.insert(crate::dock::Group::Properties, 900.0);
+        app.ui.ai_gen.mode = Mode::Restyle;
+        let mut h = Harness::builder().with_size(vec2(1440.0, 900.0)).with_max_steps(64).build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+            app
+        });
+        h.run_steps(8);
+        h
+    }
+
+    /// The strip's last tile brings up the picker the Style button used to own.
+    #[test]
+    fn the_more_tile_opens_the_style_picker() {
+        let mut h = restyle_panel();
+        let at = h.get_by_label("More…").rect().center();
+        click(&mut h, at);
+        // The picker is open: its tab list answers, and the tab in front cuts the grid to its
+        // group. (The plain labels "Style" and "Style Presets" have no accessibility entry;
+        // only the strip's tiles and the picker's tabs and tiles do.)
+        assert!(h.query_by_label("Photography").is_some(), "the picker did not open");
+        let at = h.get_by_label("Traditional art").rect().center();
+        click(&mut h, at);
+        assert!(h.query_by_label("Watercolour").is_some(), "the tab shows its group only");
+        // Choosing there lands on the tile.
+        let at = h.get_by_label("Watercolour").rect().center();
+        click(&mut h, at);
+        assert_eq!(h.state().ui.ai_gen.style, "watercolour");
+        assert!(h.query_by_label("Photography").is_none(), "choosing closes the picker");
+        // The strip's own tiles answer without the picker: its first tile is No preset, and
+        // clicking it takes the chosen one away as the picker's does.
         let at = h.get_by_label("No preset").rect().center();
         click(&mut h, at);
         assert_eq!(h.state().ui.ai_gen.style, "");
