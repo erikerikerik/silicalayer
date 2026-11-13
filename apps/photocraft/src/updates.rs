@@ -1,18 +1,31 @@
-//! Release checks against this fork's GitHub releases. Only public release metadata is requested.
+//! Release-check transport, kept for Phase 6 and not wired into the app.
 //!
-//! Upstream checks `storytold/photocraft` through `craft-update`, which reads stable releases
-//! only. Every LayerShop release is a pre-release on `SlavomirDurej/layershop`, tagged
-//! `layershop-v0.10.0-preview.3`, so the whole release list is read here and the highest version
-//! wins. Only the version number counts: a release is news when it is higher than this build's
-//! (`build_info::VERSION`). Previews of the version already installed don't count, since a build
-//! doesn't know its own preview number.
+//! SilicaLayer has no public release feed yet (the app repository is private), and upstream
+//! LayerShop's releases must never be offered as this fork's updates: they belong to a different
+//! author's app and lack this port. `services::native` therefore builds no check service, so
+//! nothing here runs at launch and no release feed is contacted. Phase 6 adds a signed updater
+//! against SilicaLayer's own releases; until then this module stays compiled but unreferenced,
+//! and the constants below must be pointed at SilicaLayer's releases, never at another author's.
+//!
+//! LayerShop's original behaviour, for reference when the updater lands: upstream PhotoCraft
+//! checks `storytold/photocraft` through `craft-update`, which reads stable releases only. Every
+//! LayerShop release is a pre-release, tagged `layershop-v0.10.0-preview.3`, so the whole release
+//! list is read here and the highest version wins. Only the version number counts: a release is
+//! news when it is higher than this build's (`build_info::VERSION`). Previews of the version
+//! already installed don't count, since a build doesn't know its own preview number.
+
+// The whole module is unreferenced until Phase 6 wires a SilicaLayer-owned updater (see above);
+// this keeps it compiling without dead-code warnings. `the_app_wires_no_update_check` below
+// proves the app still builds without a check service.
+#![allow(dead_code)]
 
 use photocraft_engine::updates_cmds::{CheckFn, CheckResult, Release};
 use serde_json::Value;
 
-/// Every release of this fork, newest first.
+/// Every release of this fork, newest first. Phase 6: SilicaLayer's own feed, never upstream's.
 pub const FEED: &str = "https://api.github.com/repos/SlavomirDurej/layershop/releases?per_page=30";
 /// Where people download releases; a release page off github.com is replaced by this.
+/// Phase 6: SilicaLayer's own releases page, never upstream's.
 pub const RELEASES: &str = "https://github.com/SlavomirDurej/layershop/releases";
 
 pub fn service() -> CheckFn {
@@ -150,5 +163,16 @@ mod tests {
         let odd = json!([1, null, "x", {"tag_name": 5}, {"tag_name": "v999.0.0", "name": 3, "html_url": []}]).to_string();
         assert_eq!(newer_release(&odd, "0.1.0").unwrap().map(|r| r.version), Some("999.0.0".to_string()));
         assert!(newer_release("[]", "not a version").is_err());
+    }
+
+    /// Task 025: the app must never check a release feed at launch, SilicaLayer has no public
+    /// feed yet, and upstream LayerShop's releases are not this fork's updates. Phase 6 wires a
+    /// signed updater against SilicaLayer's own releases; until then this keeps [`service`]
+    /// referenced and pins the app's services to a missing check.
+    #[test]
+    fn the_app_wires_no_update_check() {
+        // Building the service is just a boxed closure: no thread, no network.
+        let _check: CheckFn = service();
+        assert!(crate::services::native(None).check_updates.is_none(), "the app builds no update check");
     }
 }
