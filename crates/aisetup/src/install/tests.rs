@@ -491,6 +491,53 @@ fn a_repair_replaces_a_damaged_file_and_keeps_the_good_ones() {
     assert!(!unet.exists() && !part_of(&unet).exists());
 }
 
+/// The rule of task 028: a test image proves what a run changed. One that added no new model
+/// and left the engine as it stood has nothing to prove, and the engine gets no prompt.
+#[test]
+fn a_run_that_adds_nothing_and_leaves_the_engine_alone_renders_no_test_image() {
+    let rig = Rig::new();
+    let first = rig.run(&["qwen-image-2-1"]).0.unwrap();
+    assert!(first.test.is_some(), "the first install renders one");
+    let prompts = rig.comfy.prompts.load(Ordering::SeqCst);
+    // The same choices again, the engine and the model files as they are.
+    let (result, progress) = rig.run(&["qwen-image-2-1"]);
+    let done = result.unwrap();
+    assert_eq!(done.installed, ["qwen-image-2-1"]);
+    assert!(done.test.is_none(), "{:?}", done.test);
+    assert!(done.test_error.clone().unwrap().contains("no new model"), "{:?}", done.test_error);
+    assert_eq!(rig.comfy.prompts.load(Ordering::SeqCst), prompts, "no prompt was sent");
+    assert!(progress.steps.iter().all(|s| s.state == StepState::Done), "{:?}", progress.steps);
+}
+
+/// A first install has a new engine to prove, and tests the model it installed - the only
+/// one it has, and the one the panel would otherwise not have reached for.
+#[test]
+fn a_first_install_tests_the_model_it_installed() {
+    let rig = Rig::new();
+    let done = rig.run(&["z-image-turbo"]).0.unwrap();
+    assert_eq!(done.installed, ["z-image-turbo"]);
+    let test = done.test.unwrap();
+    assert_eq!((test.model.as_str(), test.model_name.as_str()), ("z-image-turbo", "Z-Image Turbo"));
+    assert_eq!(rig.comfy.prompts.load(Ordering::SeqCst), 1);
+}
+
+/// The other half of task 028: a run that replaced the engine renders a test image even when
+/// no model is new - the engine is what has to prove it runs.
+#[test]
+fn a_repair_that_replaced_the_engine_still_renders_a_test_image() {
+    let rig = Rig::new();
+    rig.run(&["qwen-image-2-1"]).0.unwrap();
+    let layout = rig.layout();
+    // Damage the engine itself (an antivirus took the Python); the model files are untouched.
+    std::fs::remove_file(&layout.python).unwrap();
+    let (result, progress) = rig.run_job(rig.job(Choices { recheck: true, ..rig.choices(&["qwen-image-2-1"]) }), plenty);
+    let done = result.unwrap();
+    assert_eq!(std::fs::read(&layout.python).unwrap(), b"MZ python", "the engine was unpacked again");
+    let test = done.test.unwrap_or_else(|| panic!("the repair rendered no test image: {:?}", done.test_error));
+    assert_eq!(test.model.as_str(), "qwen-image-2-1", "no model is new, so the first ready one runs");
+    assert!(progress.steps.iter().all(|s| s.state == StepState::Done), "{:?}", progress.steps);
+}
+
 #[test]
 fn an_engine_that_does_not_start_fails_the_setup_with_its_own_words() {
     let server = FakeServer { refuse: Some("ComfyUI stopped while starting: ImportError: DLL load failed".into()), ..FakeServer::default() };

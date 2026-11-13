@@ -628,6 +628,27 @@ fn index_of(plan: &Plan, step: &Step) -> Option<usize> {
     plan.steps.iter().position(|s| s.step == *step)
 }
 
+/// The model folders as they stand now: the engine's own folder and the user's own folders
+/// (managed), or the server's listing the wizard captured plus what has been downloaded into
+/// the server's models folder (the user's own ComfyUI). A run lists this before its first
+/// download and again after the last one to tell what it made ready.
+fn model_folders(job: &Job, layout: &Layout, managed: bool) -> BTreeMap<String, Vec<String>> {
+    let mut folders =
+        if managed { runtime::list_all_models(&layout.models_dir, &layout.extra_models) } else { job.choices.server_files.clone().unwrap_or_default() };
+    if !managed {
+        // What was downloaded into the server's models folder is there too.
+        for (folder, names) in runtime::list_models(&layout.models_dir) {
+            let have = folders.entry(folder).or_default();
+            for name in names {
+                if !have.iter().any(|f| f.rsplit(['/', '\\']).next() == Some(name.as_str())) {
+                    have.push(name);
+                }
+            }
+        }
+    }
+    folders
+}
+
 fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
     let layout = Layout::new(&job.manifest, &job.choices)?;
     let managed = job.choices.route == Route::Managed;
@@ -641,6 +662,11 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
     shared.set_steps(&plan);
     shared.message("Checking the folders");
     preflight(job, &plan, &layout, env.free_space)?;
+
+    // What stands in the models folders before anything is downloaded: the test image compares
+    // readiness after the run against this to find the models this run made ready (task 028).
+    // Only a run that renders a test image asks.
+    let folders_before = index_of(&plan, &Step::Verify).is_some().then(|| model_folders(job, &layout, managed));
 
     // ----- downloads, two at a time; the engine is unpacked as soon as its archive is there -----
     let downloads: Vec<(usize, &Planned)> = plan.steps.iter().enumerate().filter(|(_, s)| s.step.is_download() && !s.done && s.skipped.is_none()).collect();
@@ -761,19 +787,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
         runtime::create_data_dirs(&layout)?;
     }
     shared.message("Setting up the models");
-    let mut folders =
-        if managed { runtime::list_all_models(&layout.models_dir, &layout.extra_models) } else { job.choices.server_files.clone().unwrap_or_default() };
-    if !managed {
-        // What was just downloaded into the server's models folder is there too.
-        for (folder, names) in runtime::list_models(&layout.models_dir) {
-            let have = folders.entry(folder).or_default();
-            for name in names {
-                if !have.iter().any(|f| f.rsplit(['/', '\\']).next() == Some(name.as_str())) {
-                    have.push(name);
-                }
-            }
-        }
-    }
+    let folders = model_folders(job, &layout, managed);
     let mut settings = job.settings.clone();
     let configured = match (&launch, managed) {
         (Some(launch), true) => configure::managed(&mut settings, &job.manifest, &url, launch, &folders),
@@ -845,7 +859,27 @@ local models can only run on the processor: open this setup again and continue i
             }
             return Err(e);
         }
-        let test_model = configure::test_model(&settings, &configured.ready).filter(|m| outcome.installed.contains(&m.id) || !managed);
+        // The models this run has just made ready: whole now, and not standing whole in the
+        // folders before it started (for a model the manifest does not know: not runnable
+        // before either). The engine counts as changed when this run unpacked it - a plan that
+        // called for the unpack really did run it, as any failure returned before here - and
+        // on the processor, whose run never renders and keeps its own note for any ready model.
+        let empty = BTreeMap::new();
+        let before = folders_before.as_ref().unwrap_or(&empty);
+        let whole_before = configure::installed(&job.manifest, before);
+        let ready_before = configure::runnable(&job.settings, before);
+        let new_ids: Vec<String> = configured
+            .ready
+            .iter()
+            .filter(|id| match job.manifest.model(id) {
+                Some(_) => !whole_before.contains(id),
+                None => !ready_before.contains(id),
+            })
+            .cloned()
+            .collect();
+        let engine_changed = managed && (job.choices.cpu || plan.steps.iter().any(|s| s.step == Step::UnpackRuntime && !s.done));
+        let test_model =
+            configure::test_model(&settings, &configured.ready, &new_ids, engine_changed).filter(|m| outcome.installed.contains(&m.id) || !managed);
         match test_model {
             // On the processor these models take far too long (and too much memory) for a test.
             Some(_) if managed && job.choices.cpu => {
@@ -899,9 +933,18 @@ on the processor these models take a very long time per image, if they fit in me
                 }
             }
             None => {
-                outcome.test_error =
-                    Some("The engine is installed and running. No model was installed whole, so there was nothing to render a test image with.".into());
-                shared.set(i, StepState::Done, "No model to test with");
+                if configured.ready.is_empty() {
+                    outcome.test_error =
+                        Some("The engine is installed and running. No model was installed whole, so there was nothing to render a test image with.".into());
+                    shared.set(i, StepState::Done, "No model to test with");
+                } else {
+                    // The task 028 rule: a run that added no new model and left the engine alone
+                    // has nothing a test image could prove.
+                    outcome.test_error = Some(
+                        "The engine is installed and running. This run added no new model and left the engine as it was, so no test image was rendered.".into(),
+                    );
+                    shared.set(i, StepState::Done, "Nothing new to test");
+                }
             }
         }
     }
