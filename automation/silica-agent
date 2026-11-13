@@ -220,7 +220,7 @@ one_run() {
   mkdir -p "$RUN_LOG"
   dirty=$(git -C "$ROOT" status --porcelain)
   if [ -z "$dirty" ]; then
-    prompt=$(printf 'Read AGENTS.md, automation/GOVERNANCE.md, all SilicaLayer governing documents available in this checkout, and %s. Implement only that bounded task, editing only the files it names. Do not run builds or tests; the supervisor does that after unloading the model. Do not commit, push, access the network, use secrets, change CI, release, publish, or ask questions. Keep the tree buildable and stop after the smallest tested-by-design change.' "$TASK_FILE")
+    prompt=$(printf 'Read AGENTS.md, automation/GOVERNANCE.md, all SilicaLayer governing documents available in this checkout, and %s. Implement only that bounded task, editing only the files it names. Never open image or other binary files (.png, .jpg, .icns, .ico, .tiff, .ttf); the model reads text only. Do not run builds or tests; the supervisor does that after unloading the model. Do not commit, push, access the network, use secrets, change CI, release, publish, or ask questions. Keep the tree buildable and stop after the smallest tested-by-design change.' "$TASK_FILE")
     run_agent implement "$prompt" "$RUN_LOG/implement.jsonl" 0 || task_failure "implementation session failed; see $RUN_LOG"
   else
     if [ ! -f "$STATE/checkpoint" ] || ! grep -Fqx "task=$TASK_NAME" "$STATE/checkpoint"; then
@@ -241,14 +241,14 @@ one_run() {
     [ "$attempt" -lt "$MAX_REPAIRS" ] || task_failure "gate failed after $MAX_REPAIRS repairs; see $RUN_LOG"
     attempt=$((attempt + 1))
     tail -c 24000 "$RUN_LOG/gate-$((attempt - 1)).log" > "$RUN_LOG/failure-tail.log"
-    prompt=$(printf 'The bounded task is %s. The supervisor tests failed; inspect %s and the current diff, identify the root cause, and make the smallest repair. Edit only files the task names or that the failure points to; do not create unrelated files or change unrelated features. Do not run builds/tests, commit, push, access the network, use secrets, weaken checks, or broaden scope. Stop after editing.' "$TASK_FILE" "$RUN_LOG/failure-tail.log")
+    prompt=$(printf 'The bounded task is %s. The supervisor tests failed; inspect %s and the current diff, identify the root cause, and make the smallest repair. Edit only files the task names or that the failure points to; do not create unrelated files or change unrelated features. Never open image or other binary files (.png, .jpg, .icns, .ico, .tiff, .ttf); the model reads text only. Do not run builds/tests, commit, push, access the network, use secrets, weaken checks, or broaden scope. Stop after editing.' "$TASK_FILE" "$RUN_LOG/failure-tail.log")
     run_agent repair "$prompt" "$RUN_LOG/repair-$attempt.jsonl" "$attempt" || task_failure "repair session failed; see $RUN_LOG"
     unload_model
     if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then
       task_failure "repair changed supervisor policy, task definitions, or CI"
     fi
   done
-  prompt=$(printf 'Independently review the current uncommitted diff for the task in %s. Check correctness, security, recoverability, architecture, tests, and scope against AGENTS.md. Fix only confirmed issues in the diff. Do not create files or modules, add test harnesses, or edit files the task does not name. Do not run builds/tests, commit, push, access the network, use secrets, or broaden scope. If no issue exists, make no edit.' "$TASK_FILE")
+  prompt=$(printf 'Independently review the current uncommitted diff for the task in %s. Check correctness, security, recoverability, architecture, tests, and scope against AGENTS.md. Fix only confirmed issues in the diff. Do not create files or modules, add test harnesses, or edit files the task does not name. Never open image or other binary files (.png, .jpg, .icns, .ico, .tiff, .ttf); the model reads text only. Do not run builds/tests, commit, push, access the network, use secrets, or broaden scope. If no issue exists, make no edit.' "$TASK_FILE")
   run_agent review "$prompt" "$RUN_LOG/review.jsonl" 0 || task_failure "review session failed; see $RUN_LOG"
   unload_model
   if ! git -C "$ROOT" diff --quiet HEAD -- opencode.json automation .github; then

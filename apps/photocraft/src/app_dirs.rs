@@ -3,7 +3,7 @@
 //! logs, the window layout, the GPU startup marker and the Local AI setup's record all live under
 //! the one directory [`config_dir`] returns; the Local AI engine and models under
 //! [`local_ai_dirs`]. Every folder is named after the product's folder name ([`DIR_NAME`],
-//! `SilicaLyr` on macOS, `LayerShop` elsewhere).
+//! `SilicaLayer` on macOS, `LayerShop` elsewhere).
 //!
 //! In order:
 //! 1. `PHOTOCRAFT_CONFIG_DIR`, when set (tests, agents, custom setups).
@@ -12,7 +12,7 @@
 //!    USB stick leaves nothing in `%APPDATA%`. The Windows portable zip ships with `portable.txt`;
 //!    the MSI doesn't. If that folder can't be written (read-only medium, Program Files), the app
 //!    warns and falls back.
-//! 3. The platform convention: macOS `~/Library/Application Support/SilicaLyr` (moved there
+//! 3. The platform convention: macOS `~/Library/Application Support/SilicaLayer` (moved there
 //!    from the `LayerShop` folder this fork used before the rebrand, once, at start-up, by
 //!    `migrate_macos_data_dir`), Windows `%APPDATA%\LayerShop`, Linux
 //!    `$XDG_CONFIG_HOME/layershop` or `~/.config/layershop`.
@@ -26,10 +26,10 @@ use std::sync::OnceLock;
 
 /// The name of every per-user folder the app keeps (lowercase on Linux). It is deliberately
 /// not the brand name from `photocraft_ui_egui::brand`: only macOS got a folder of the new
-/// brand's own, `SilicaLyr`; Windows and Linux keep the `LayerShop` folder their installers
+/// brand's own, `SilicaLayer`; Windows and Linux keep the `LayerShop` folder their installers
 /// and existing users depend on. Machine names (crates, binaries, bundle ids) are a separate
 /// matter again.
-pub const DIR_NAME: &str = if cfg!(target_os = "macos") { "SilicaLyr" } else { "LayerShop" };
+pub const DIR_NAME: &str = if cfg!(target_os = "macos") { "SilicaLayer" } else { "LayerShop" };
 
 /// Files beside the executable that switch on portable mode (either one; contents are ignored).
 pub const PORTABLE_MARKERS: [&str; 2] = ["portable.txt", "PhotoCraft.portable"];
@@ -104,7 +104,7 @@ pub fn recovery_dir() -> Option<PathBuf> {
 ///   `~/.local/state/layershop/Recovery`, where the XDG Base Directory spec puts state that
 ///   should outlive a restart but isn't configuration; dotfile managers and config sync often copy
 ///   `~/.config` whole. As the spec asks, a relative `XDG_STATE_HOME` is ignored.
-/// - macOS: `~/Library/Application Support/SilicaLyr/Recovery` as before. Apple's guidelines
+/// - macOS: `~/Library/Application Support/SilicaLayer/Recovery` as before. Apple's guidelines
 ///   put
 ///   app-created data that can't be regenerated there; `~/Library/Caches` may be purged by the
 ///   system.
@@ -513,7 +513,7 @@ pub fn platform_dir(env: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> 
 }
 
 /// macOS only: the `LayerShop` data folder this run keeps using when
-/// [`migrate_macos_data_dir`] could not rename it to `SilicaLyr`; `platform_dir` returns it
+/// [`migrate_macos_data_dir`] could not rename it to `SilicaLayer`; `platform_dir` returns it
 /// instead of the new folder, which would be empty. The log entry the migration writes says why.
 #[cfg(target_os = "macos")]
 static MACOS_KEPT_DIR: OnceLock<PathBuf> = OnceLock::new();

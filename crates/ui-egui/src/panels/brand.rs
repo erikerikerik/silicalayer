@@ -1,13 +1,14 @@
 //! The product's identity in the UI: its name, and the mark at the left of the title bar.
 //!
-//! This fork ships as SilicaLyr: a fork of LayerShop, itself a fork of PhotoCraft. The code
+//! This fork ships as SilicaLayer: a fork of LayerShop, itself a fork of PhotoCraft. The code
 //! and the translation catalogs it inherits say "PhotoCraft", and the strings this fork's own
 //! code added say "LayerShop"; [`display`] is the one place that turns either into [`NAME`] on
 //! the way to the screen, so neither the catalogs nor upstream's strings need editing.
 //!
-//! The mark is the app icon (`assets/app-icon/`, see its README), where Photoshop shows its
-//! "Ps" tile. The PNG carries the icon's rounded corners; it is decoded once per context into a
-//! mipmapped texture, so it stays crisp at the title bar's size on any display scale.
+//! The mark is the app icon's tile (`assets/app-icon/silicalayer-mark-128.png`, see its README),
+//! where Photoshop shows its "Ps" tile. The PNG carries the tile's rounded corners; it is decoded
+//! once per context into a mipmapped texture, so it stays crisp at the title bar's size on any
+//! display scale.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -17,7 +18,7 @@ use photocraft_codecs::{ChannelLayout, SampleType};
 
 /// The product's name as users see it. The brand is spelled without the second "e"; machine
 /// names (crates, binaries, bundle ids) keep theirs and are not this constant's business.
-pub const NAME: &str = "SilicaLyr";
+pub const NAME: &str = "SilicaLayer";
 
 /// The name the UI strings and their translations were written with.
 const SOURCE_NAME: &str = "PhotoCraft";
@@ -28,7 +29,7 @@ const PREDECESSOR_NAME: &str = "LayerShop";
 /// The credit the About window gives the projects this one is built from. Shown as written: it
 /// does not pass through [`display`], which would put this build's own name in it.
 pub const BASED_ON: &str =
-    "Built on the PhotoCraft engine by the ArtCraft team, with workflows from LayerShop by Slavomir Durej. The Apple Silicon port is SilicaLyr's own.";
+    "Built on the PhotoCraft engine by the ArtCraft team, with workflows from LayerShop by Slavomir Durej. The Apple Silicon port is SilicaLayer's own.";
 
 /// At most this many distinct strings are rewritten and kept. UI strings that name the product
 /// number in the low hundreds; the cap is for text that turns out not to be a fixed UI string.
@@ -59,7 +60,7 @@ pub fn display(s: &str) -> &str {
 }
 
 /// 128 px: sharp at 20 pt on a 3× display, and the mipmaps keep it clean at 1×.
-const ICON_PNG: &[u8] = include_bytes!("../../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.photocraft.png");
+const ICON_PNG: &[u8] = include_bytes!("../../../../assets/app-icon/silicalayer-mark-128.png");
 
 /// The icon's pixels (one transparent pixel if it couldn't be decoded, which a test rules out).
 fn decode() -> egui::ColorImage {

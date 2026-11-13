@@ -1,10 +1,11 @@
 //! Community and project links: the Help menu, the About dialog, the start screen and the title
 //! bar all open these.
 //!
-//! This fork ships as LayerShop (see [`crate::brand`]), so the product's own links (website, source,
-//! issues) are LayerShop's. Upstream's community links stay in the Help menu, where their labels
-//! say whose they are ("Join the ArtCraft Discord…"); the unlabelled community buttons are off
-//! ([`COMMUNITY_BUTTON`]).
+//! This fork ships as SilicaLayer (see [`crate::brand`]) and has no website of its own, so the
+//! product's own links (source, issues) are its GitHub repository. LayerShop, the fork this one
+//! forks, and the upstream ArtCraft are credited by name, and their links stay in the Help menu
+//! and the About row, where their labels say whose they are ("Join the ArtCraft Discord…"); the
+//! unlabelled community buttons are off ([`COMMUNITY_BUTTON`]).
 
 use serde_json::{Value, json};
 
@@ -12,11 +13,14 @@ use crate::PhotocraftApp;
 
 pub const DISCORD: &str = "https://discord.gg/artcraft";
 pub const ARTCRAFT_WEBSITE: &str = "https://getartcraft.com";
-pub const APP_PAGE: &str = "https://layershop.aardvarkstudios.net";
+/// SilicaLayer has no website of its own: its home is its GitHub repository.
+pub const APP_PAGE: &str = "https://github.com/erikerikerik/silicalayer";
 /// The Home screen's Learn item: LayerShop's guides.
 pub const TUTORIALS: &str = "https://layershop.aardvarkstudios.net/learn/";
-pub const GITHUB: &str = "https://github.com/SlavomirDurej/layershop";
-pub const ISSUES: &str = "https://github.com/SlavomirDurej/layershop/issues";
+pub const GITHUB: &str = "https://github.com/erikerikerik/silicalayer";
+pub const ISSUES: &str = "https://github.com/erikerikerik/silicalayer/issues";
+/// The predecessor's site, credited by name: LayerShop, the fork this one forks.
+pub const LAYERSHOP_WEBSITE: &str = "https://layershop.aardvarkstudios.net";
 
 /// Show the "Join us on Discord" buttons (start screen, About, title bar)? They open upstream's
 /// server, and "us" under this fork's name would say it is LayerShop's. Off here; Help › Join the
@@ -56,11 +60,14 @@ pub fn discord_button(app: &mut PhotocraftApp, ui: &mut egui::Ui, min_width: f32
     r
 }
 
-/// "PhotoCraft website · GitHub · ArtCraft" as links, centred. Clicks route through [`open`] (the
+/// "GitHub · LayerShop · ArtCraft" as links, centred. Clicks route through [`open`] (the
 /// platform browser service) rather than `ui.hyperlink_to`, which uses the unreliable `ctx.open_url`.
 pub fn link_row(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = crate::theme::Tokens::get(ui.ctx());
-    let links = [(tl!("PhotoCraft website"), APP_PAGE), (tl!("GitHub"), GITHUB), (tl!("ArtCraft"), ARTCRAFT_WEBSITE)];
+    // "LayerShop" bypasses tl! on purpose: brand::display would rename it to this build's own
+    // name, and a link labelled with the product's name that opens LayerShop's site is what this
+    // row must not be. It is credited by name as written, like [`crate::brand::BASED_ON`].
+    let links = [(tl!("GitHub"), GITHUB), ("LayerShop", LAYERSHOP_WEBSITE), (tl!("ArtCraft"), ARTCRAFT_WEBSITE)];
     let font = egui::FontId::proportional(12.5);
     let sep = "  ·  ";
     let width: f32 = links.iter().map(|(l, _)| ui.painter().layout_no_wrap((*l).into(), font.clone(), t.text).size().x).sum::<f32>()
@@ -111,6 +118,16 @@ mod tests {
         // The direct open() helper (Discord button / start-page links) also uses it.
         open(&mut app, &ctx, DISCORD);
         assert_eq!(opened.lock().unwrap().last().map(String::as_str), Some(DISCORD));
+    }
+
+    #[test]
+    fn product_links_point_at_the_silicalayer_repository() {
+        // Erik's report: About and Help opened LayerShop's website and repository. SilicaLayer's
+        // home is its own repository; LayerShop's site stays only as the credited predecessor.
+        assert_eq!(APP_PAGE, "https://github.com/erikerikerik/silicalayer");
+        assert_eq!(GITHUB, "https://github.com/erikerikerik/silicalayer");
+        assert_eq!(ISSUES, "https://github.com/erikerikerik/silicalayer/issues");
+        assert_eq!(LAYERSHOP_WEBSITE, "https://layershop.aardvarkstudios.net");
     }
 
     #[test]

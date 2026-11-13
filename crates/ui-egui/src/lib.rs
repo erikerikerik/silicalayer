@@ -12,16 +12,16 @@
 /// PhotoCraft as craft-update knows it, with its 128 px icon and accent colour: the update
 /// prompt shows both, and an AppImage's menu entry gets the icon.
 ///
-/// LayerShop: its own name and the fork's releases. Its update check is the app's
+/// SilicaLayer: its own name and the fork's releases. Its update check is the app's
 /// (`apps/photocraft/src/updates.rs`, the fork's release list) and craft-update's in-place
 /// updater stays off (`updates_ui::SELF_UPDATE`); the machine id stays `photocraft`, which the
 /// bundle id and settings folders are made from.
 #[cfg(not(target_arch = "wasm32"))]
 pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
     name: brand::NAME,
-    // The update cards say "LayerShop by …"; the installer's Manufacturer.
-    developer: "Slavomir Durej",
-    repo: "SlavomirDurej/layershop",
+    // The update cards say "SilicaLayer by …"; the installer's Manufacturer.
+    developer: "erikerikerik",
+    repo: "erikerikerik/silicalayer",
     icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.photocraft.png")),
     accent: Some([0x2f, 0x7b, 0xf5]),
     ..craft_update::suite::PHOTOCRAFT

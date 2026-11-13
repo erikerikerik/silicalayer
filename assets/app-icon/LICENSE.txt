@@ -1,10 +1,11 @@
-LayerShop app icon (photocraft.svg, photocraft-small.svg and every file derived from them in
-this directory: photocraft-1024.png, photocraft.icns, photocraft.ico, hicolor/).
+SilicaLayer app icon (silicalayer-1024.png, silicalayer-mac-1024.png, silicalayer-small.svg,
+silicalayer-small-tile.svg and every file derived from them in this directory:
+photocraft-1024.png, photocraft.icns, photocraft.ico, silicalayer-mark-128.png, hicolor/).
 
-Original artwork made for LayerShop by Slavomir Durej: three stacked sheets on a dark tile,
-drawn by a script (tools/make-app-icon.py in the LayerShop website project). No third-party
-material. It replaces the app icon of upstream PhotoCraft in this fork. Licensed like the rest of
-the project, under either of
+Original artwork for SilicaLayer: a glowing crystal on three translucent layers. The crystal art
+was supplied by Erik Kristianson for this project; the simplified small-size drawing (the two
+SVGs) was drawn for SilicaLayer to match it. No third-party material. It replaces LayerShop's
+icon in this fork. Licensed like the rest of the project, under either of
 
   * Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
   * MIT license (https://opensource.org/licenses/MIT)

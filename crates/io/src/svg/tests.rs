@@ -345,11 +345,12 @@ fn a_single_path_clip_becomes_the_groups_vector_mask() {
         .collect();
     let off = ours.chunks(4).zip(theirs.chunks(4)).filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x.abs_diff(*y) > 48)).count();
     assert!(off < 64, "{off} pixels differ");
-    // The report's file: PhotoCraft's own icon opens without the clip-path warning.
-    let icon_svg = include_bytes!("../../../../assets/app-icon/photocraft.svg");
-    let icon = import_svg("photocraft.svg", icon_svg).unwrap();
+    // The report's file: SilicaLayer's own icon opens without the clip-path warning.
+    let icon_svg = include_bytes!("../../../../assets/app-icon/silicalayer-small-tile.svg");
+    let icon = import_svg("silicalayer-small-tile.svg", icon_svg).unwrap();
     assert!(icon.warnings.iter().all(|w| !w.contains("clip-path")), "{:?}", icon.warnings);
-    // LayerShop's icon draws its rounded square without a clip; upstream's clips to it.
+    // SilicaLayer's icon draws its rounded tile without a clip; an icon that clips to its tile
+    // would have to import that clip as a vector mask.
     if icon_svg.windows(8).any(|w| w == b"clipPath") {
         assert!(icon.document.layers.iter().any(|l| l.vector_mask.is_some()), "its rounded square is a vector mask");
     }

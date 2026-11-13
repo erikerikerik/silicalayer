@@ -1,39 +1,40 @@
-# LayerShop app icon
+# SilicaLayer app icon
 
-**Three stacked sheets on a dark tile**: layers, seen from above at an angle. The top sheet carries
-the ember gradient of the LayerShop website; the two below it are plain greys. It is the mark of
-the website (`layershop` logo and favicon) on a tile, so the app, its window and the site match.
+**A glowing crystal on three translucent layers**: silica (the crystal) and layers, the two halves
+of the name, in the spirit of the illustrative emblems of early Creative Suite icons. The crystal
+glows cyan to magenta; the layers below it carry the same gradient.
 
-This fork ships as LayerShop, so this folder holds LayerShop's icon in place of upstream
-PhotoCraft's kitsune. The file names are unchanged (`photocraft.*`, `ai.storyteller.photocraft.*`):
-they are machine names, and keeping them means the build, the tests and the packaging scripts need
-no edits.
+This fork ships as SilicaLayer, so this folder holds its icon in place of LayerShop's three
+sheets (and upstream PhotoCraft's kitsune before that). The output file names are unchanged
+(`photocraft.*`, `ai.storyteller.photocraft.*`): they are machine names, and keeping them means
+the build, the tests and the packaging scripts need no edits.
 
-## Palette
+## Masters
 
-| Colour | Hex | Used for |
+| File | What it is | Used for |
 |---|---|---|
-| Tile | `#1b1f26` | the rounded tile, with a `#3a414d` edge |
-| Ember gradient | `#ffc24d` → `#ff8a3d` → `#ff5d6c` | the top sheet, left to right |
-| Light grey | `#cbcfd6` | the middle sheet |
-| Mid grey | `#7c828d` | the bottom sheet |
+| `silicalayer-1024.png` | The crystal art, free-form on transparency | Windows and Linux, 40 px and up |
+| `silicalayer-mac-1024.png` | The same art on a dark indigo tile (`#2a2075` → `#0c0926`), 824 px body with a 185 px corner radius, on Apple's 1024 px grid | macOS, 128 px and up |
+| `silicalayer-small.svg` | A simplified drawing of the same idea (two crystals, three plates) on a 512-unit canvas | 32 px and below on Windows and Linux, and the scalable Linux icon |
+| `silicalayer-small-tile.svg` | The simplified drawing on a full-bleed tile (`rx=112`) | macOS up to 64 px (padded onto the 824/1024 grid), and the title-bar mark |
 
-## Geometry
+The detailed art turns to mush below about 40 px, so small sizes use the simplified drawing: the
+crystal keeps two flat facets and a white tip, and dark gaps between the plates keep the three
+layers readable at 32 px.
 
-A 512-unit tile (`viewBox="0 0 512 512"`), rounded square with `rx=105`. The mark is centred and
-70% of the tile wide (80% at 24 px and below, so it reads at 16 px). The macOS render pads the
-tile onto Apple's 824/1024 icon grid; the Windows and Linux renders fill the canvas.
+macOS 26 puts any icon that doesn't fill Apple's rounded-square body into a grey tile of its own,
+so the Mac icon carries its own tile. Windows and Linux show the art free-form.
 
 ## Files
 
-- `photocraft.svg`, `photocraft-small.svg`: the master (the same drawing; upstream kept two traces).
-- `photocraft-1024.png`: 1024 px render on the macOS grid.
-- `photocraft.icns`: macOS bundle icon (`CFBundleIconFile`).
+- `photocraft-1024.png`: a copy of `silicalayer-mac-1024.png` (the window and Dock icon of
+  unbundled macOS runs, `apps/photocraft/src/app_icon.rs`).
+- `photocraft.icns`: macOS bundle icon (`CFBundleIconFile`), 16–1024 px.
 - `photocraft.ico`: Windows icon, 16–256 px, embedded in the `.exe` by `apps/photocraft/build.rs`.
 - `hicolor/<size>/apps/ai.storyteller.photocraft.png` (16–512) and `hicolor/scalable/...svg`:
-  Linux icon theme. The 128 px one is also the mark at the left of the title bar
-  (`crates/ui-egui/src/brand.rs`), and the 256 px one the window icon
-  (`apps/photocraft/src/app_icon.rs`).
+  Linux icon theme. The 256 px one is the window icon on Windows and Linux.
+- `silicalayer-mark-128.png`: the mark at the left of the title bar
+  (`crates/ui-egui/src/panels/brand.rs`), where Photoshop shows its "Ps" tile.
 
 On Windows the taskbar shows the icon of the Start Menu shortcut that launches the exe, so the
 MSI's `<Icon Id>` keeps the `.exe` extension (ICE50); `app_icon.rs` documents the details and tests
@@ -41,10 +42,7 @@ the `.ico` sizes and the WiX icon references.
 
 ## Regenerate
 
-The drawing is code, not a traced picture: `tools/make-app-icon.py` in the LayerShop website
-project writes the SVGs, the PNGs and the `.icns` from one set of numbers (it needs Pillow), then
-prints the `cargo xtask ico` command that packs the `.ico`. `packaging/icons.sh` (upstream's
-script, which renders the SVG with `resvg`) works too, but crops the tile for the small sizes as
-the kitsune needed; prefer the Python script for this icon.
+`packaging/icons.sh` writes every output from the four masters. It needs `resvg`, and `sips`
+(macOS) or ImageMagick; on macOS `iconutil` writes the `.icns`.
 
 License: see `LICENSE.txt`.

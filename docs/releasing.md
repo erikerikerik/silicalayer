@@ -420,10 +420,12 @@ The keychain is deleted at the end of the job.
 
 ## Icons
 
-`assets/app-icon/photocraft.svg` is the canonical icon: the owner's ArtCraft drawing of a
-nine-tailed kitsune, vectorised (MIT OR Apache-2.0, see `LICENSE.txt` there; palette and
-geometry in `README.md`). `packaging/icons.sh` regenerates the 1024 px PNG, the `.icns`, the `.ico` (packed by
-`cargo xtask ico`) and the hicolor PNGs from it. It needs `resvg`, plus `iconutil` on macOS.
+The masters are the four files in `assets/app-icon/`: `silicalayer-1024.png`,
+`silicalayer-mac-1024.png`, `silicalayer-small.svg` and `silicalayer-small-tile.svg` (MIT OR
+Apache-2.0, see `LICENSE.txt` there; palette and geometry in `README.md`). `packaging/icons.sh`
+regenerates the 1024 px PNG, the `.icns`, the `.ico` (packed by
+`cargo xtask ico`) and the hicolor PNGs from them. It needs `resvg`, and `sips` (macOS) or
+ImageMagick, plus `iconutil` on macOS.
 The outputs are committed, so packaging never needs those tools.
 
 ## Checks
