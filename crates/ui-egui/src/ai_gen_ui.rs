@@ -1123,8 +1123,13 @@ const PROMPT_HEIGHT: f32 = 84.0;
 const SCENE_HEIGHT: f32 = 64.0;
 /// The least the prompt box shrinks to in a short panel: two lines.
 const MIN_PROMPT_HEIGHT: f32 = 40.0;
-/// What the rows under the prompt need besides the notes: spacing and the Generate row.
-const BELOW_PROMPT: f32 = 6.0 + 32.0 + 3.0 + 6.0;
+/// The Generate row (and, while a generation runs, its progress and Cancel).
+const GENERATE_ROW: f32 = 32.0;
+/// The shortcut hint under the prompt box, with the space above it.
+const HINT_ROW: f32 = 6.0 + 17.0;
+/// What the rows under the prompt need besides the notes: spacing, the shortcut hint and the
+/// Generate row.
+const BELOW_PROMPT: f32 = 6.0 + HINT_ROW + GENERATE_ROW + 3.0 + 6.0;
 /// One of the panel's rows of controls (Edit's tasks, a picture to choose, the mask tools, the
 /// Advanced heading and what it opens), with its spacing.
 const ROW: f32 = 24.0 + 6.0;
@@ -1132,6 +1137,9 @@ const ROW: f32 = 24.0 + 6.0;
 const MASK_BRUSH_MIN: f32 = 40.0;
 /// Size of the status bar's text, and of the panel's other notes.
 const NOTE_SIZE: f32 = 11.0;
+/// What starts a generation from inside the prompt box, said under it. Return alone still adds
+/// a line, so the hint is the way out, not a redefinition of Return.
+const SUBMIT_HINT: &str = if cfg!(target_os = "macos") { "\u{2318}\u{21a9} to generate" } else { "Ctrl+Enter to generate" };
 /// The status bar's icons, each in a square this wide.
 const STATUS_ICON: f32 = 18.0;
 
@@ -1586,15 +1594,76 @@ fn change_row(app: &mut PhotocraftApp, ui: &mut egui::Ui, current: &Model, fill:
 
 /// The AI Gen panel body. With `fill` the prompt box takes the height the panel has left (the
 /// dock group: drag its edge and the prompt grows); without it the box has a fixed height.
+/// In the dock everything but the Generate row scrolls: the row is pinned to the panel's
+/// bottom, outside the scroll area, so a short group can always start a generation.
 pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui, fill: bool) {
     if !fill {
-        return panel_body(app, ui, None);
+        return panel_body(app, ui, None, None);
     }
     // The prompt box takes the height that is left. In a dock group too short even for a small
     // one (the tabs and a task's rows need more than the group's compact height) the panel
-    // scrolls, so Generate can always be reached.
+    // scrolls, so everything above the pinned row can still be reached.
+    let area = ui.max_rect();
     let room = ui.available_height();
-    egui::ScrollArea::vertical().id_salt("ai-gen-panel").auto_shrink([false, false]).show(ui, |ui| panel_body(app, ui, Some(room).filter(|r| r.is_finite())));
+    let mut tail = PanelTail::default();
+    egui::ScrollArea::vertical().id_salt("ai-gen-panel").auto_shrink([false, false]).show(ui, |ui| {
+        panel_body(app, ui, Some(room).filter(|r| r.is_finite()), Some(&mut tail));
+    });
+    // A panel that stopped at "nothing set up" has no Generate row to pin.
+    if !tail.reached {
+        return;
+    }
+    // The row sits over the scroll area's bottom edge, on the panel's own colour so content
+    // scrolls under it and not through it; the slack keeps the button's focus ring inside the
+    // panel. `panel_body` leaves the same height of scroll below the notes.
+    let bar =
+        egui::Rect::from_min_size(egui::pos2(area.left(), (area.bottom() - tail.height() - 6.0).max(area.top())), vec2(area.width(), tail.height() + 6.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+    let t = Tokens::get(child.ctx());
+    child.painter().rect_filled(bar, 0.0, t.card);
+    panel_tail(app, &mut child, &tail);
+}
+
+/// What [`panel_body`] leaves for [`panel`] to draw pinned to the dock panel's bottom, and
+/// what that needs: the row is drawn after the scroll area, when the body's own locals are
+/// gone.
+#[derive(Default)]
+struct PanelTail {
+    /// Whether the body got as far as the Generate row at all.
+    reached: bool,
+    kind: GenerationMode,
+    current: Option<Model>,
+    /// The task's option on a row of its own, as [`ButtonRow`] decided it.
+    option_row: bool,
+    /// Generate can run.
+    generate: bool,
+    /// Cmd+Return (Ctrl+Enter) was pressed in the prompt box; the pinned row acts on it.
+    submit: bool,
+}
+
+impl PanelTail {
+    /// The height the pinned row takes, its option row included.
+    fn height(&self) -> f32 {
+        GENERATE_ROW + f32::from(self.option_row) * ROW
+    }
+}
+
+/// The pinned Generate row of the dock panel: [`button_row`] with the state the body left, and
+/// its dispatch (which the body skips when the row is pinned, so a shortcut does not run twice).
+fn panel_tail(app: &mut PhotocraftApp, ui: &mut egui::Ui, tail: &PanelTail) {
+    let Some(current) = tail.current.as_ref() else {
+        return;
+    };
+    let job = running(app);
+    let rows = ButtonRow { kind: tail.kind, width: ui.available_width(), option_row: tail.option_row, generate: tail.generate };
+    let clicked = button_row(app, ui, job.as_ref(), current, rows);
+    if job.is_none()
+        && tail.generate
+        && (clicked || tail.submit)
+        && let Err(e) = generate(app)
+    {
+        crate::notices::error(app, format!("{}: {e}", tr("AI Generate")));
+    }
 }
 
 /// The row under the tabs: the model, Enhance prompt, Load from layer and the shortcut to the
@@ -1653,8 +1722,10 @@ fn model_row(app: &mut PhotocraftApp, ui: &mut egui::Ui, models: &[Model], chose
     enhance_pressed
 }
 
-/// [`panel`]'s content; `room` is the height it has to fill, when it fills one.
-fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>) {
+/// [`panel`]'s content; `room` is the height it has to fill, when it fills one. With `tail` the
+/// Generate row is left in it for [`panel_tail`] to pin below the scroll area instead of being
+/// drawn in flow.
+fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>, tail: Option<&mut PanelTail>) {
     let t = Tokens::get(ui.ctx());
     let top = ui.cursor().top();
     // Which local models can run is the server's to say.
@@ -1900,6 +1971,10 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>) {
         regions::keep_scene(app);
     }
     ui.add_space(6.0);
+    // How to start a generation without leaving the box; Return alone still adds a line.
+    let hint = tr(SUBMIT_HINT);
+    ui.label(RichText::new(hint).color(t.text_dim).size(11.5)).widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, hint));
+    ui.add_space(6.0);
 
     // Create › Regions: the boxes the scene is laid out in.
     if laying_out {
@@ -1940,8 +2015,15 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>) {
         }
     }
 
-    let rows = ButtonRow { kind, width, option_row: option_row && job.is_none(), generate: why.is_none() && enhancing.is_none() };
-    let clicked = button_row(app, ui, job.as_ref(), &current, rows);
+    let option_row = option_row && job.is_none();
+    let rows = ButtonRow { kind, width, option_row, generate: why.is_none() && enhancing.is_none() };
+    let pinned = tail.is_some();
+    let mut clicked = false;
+    if let Some(tail) = tail {
+        *tail = PanelTail { reached: true, kind, current: Some(current.clone()), option_row: rows.option_row, generate: rows.generate, submit };
+    } else {
+        clicked = button_row(app, ui, job.as_ref(), &current, rows);
+    }
     ui.add_space(3.0);
 
     // The way into the Local AI wizard: its progress while it runs, an offer until it has.
@@ -1960,7 +2042,14 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: Option<f32>) {
         Some(StatusClick::Again) => enhance::act(app, enhance::Pressed::Again, kind, &current.id),
         None => {}
     }
-    if job.is_none()
+    // The pinned row floats over the bottom of the scroll area: leave the same height of scroll
+    // below the notes so the last of them can be scrolled clear of it.
+    if pinned {
+        ui.add_space(GENERATE_ROW + f32::from(option_row) * ROW + 6.0);
+    }
+    // A pinned row's press (and the prompt's shortcut) is dispatched by `panel_tail`, once.
+    if !pinned
+        && job.is_none()
         && why.is_none()
         && enhancing.is_none()
         && (clicked || submit)

@@ -668,7 +668,7 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
                 // The content itself, as the dock group lays it out (there it scrolls only when
                 // even a two-line prompt box doesn't fit).
-                panel_body(&mut app, &mut child, Some(h));
+                panel_body(&mut app, &mut child, Some(h), None);
                 overflow = child.min_rect().bottom() - area.bottom();
             })
             .textures_delta
@@ -688,7 +688,7 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
             ctx.run_ui(Default::default(), |ui| {
                 let area = egui::Rect::from_min_size(ui.max_rect().min, vec2(w, h));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
-                panel_body(&mut app, &mut child, Some(h));
+                panel_body(&mut app, &mut child, Some(h), None);
                 overflow = child.min_rect().bottom() - area.bottom();
             })
             .textures_delta
@@ -696,6 +696,65 @@ fn a_long_reason_under_generate_fits_in_the_panel() {
         }
         assert!(overflow <= 1.0, "change {w}x{h}: the panel's content runs {overflow} points past its bottom");
     }
+}
+
+/// The docked panel (`panel` with `fill`) laid out in a box this size, fonts ready.
+fn docked_panel(app: PhotocraftApp, size: egui::Vec2) -> egui_kittest::Harness<'static, PhotocraftApp> {
+    let mut h = egui_kittest::Harness::builder().with_size(size).build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            let ctx = ui.ctx().clone();
+            if !ctx.fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                return;
+            }
+            panel(app, ui, true);
+        },
+        app,
+    );
+    PhotocraftApp::setup_context(&h.ctx, Default::default());
+    h.run_steps(4);
+    h
+}
+
+#[test]
+fn a_short_panel_pins_generate_to_its_bottom() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+    app.ui.ai_gen.prompt = "a cat on a bench".into();
+    // Advanced open: more rows than the panel has, so its body scrolls. Generate must not
+    // scroll away with them: the row is pinned to the panel's bottom, outside the scroll area.
+    app.ui.ai_gen.advanced = true;
+    let size = vec2(300.0, 260.0);
+    let h = docked_panel(app, size);
+    let panel = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    let generate = h.get_by_label("Generate").rect();
+    assert!(panel.contains(generate.min) && panel.contains(generate.max), "Generate at {generate:?} is not inside the {size:?} panel");
+    // And pinned, not merely the last row of a panel that happens to fit: it sits at the
+    // very bottom, while the rows above it scrolled past.
+    assert!(
+        panel.bottom() - generate.bottom() <= 12.0,
+        "Generate ends {} points above the panel's bottom: it is in flow, not pinned",
+        panel.bottom() - generate.bottom()
+    );
+}
+
+#[test]
+fn the_prompt_box_says_how_to_generate_from_inside_it() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::Queryable;
+    let mut app = app();
+    add_model(&mut app, z_image("z"));
+    app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+    app.ui.ai_gen.prompt = "a cat on a bench".into();
+    let h = docked_panel(app, vec2(300.0, 420.0));
+    // The platform's own wording: the symbol on macOS, the keys named everywhere else.
+    assert_eq!(SUBMIT_HINT, if cfg!(target_os = "macos") { "\u{2318}\u{21a9} to generate" } else { "Ctrl+Enter to generate" });
+    let hint = h.get_by_label(SUBMIT_HINT).rect();
+    let prompt = h.get_by_role(Role::MultilineTextInput);
+    assert_eq!(prompt.value().as_deref(), Some("a cat on a bench"), "the box under the hint should be the prompt");
+    let prompt = prompt.rect();
+    assert!(hint.top() >= prompt.bottom(), "the hint at {:?} is not under the prompt box at {prompt:?}", hint);
 }
 
 #[test]
