@@ -5,9 +5,10 @@
 //! code added say "LayerShop"; [`display`] is the one place that turns either into [`NAME`] on
 //! the way to the screen, so neither the catalogs nor upstream's strings need editing.
 //!
-//! The mark is the app icon (`assets/app-icon/`, see its README), where Photoshop shows its
-//! "Ps" tile. The PNG carries the icon's rounded corners; it is decoded once per context into a
-//! mipmapped texture, so it stays crisp at the title bar's size on any display scale.
+//! The mark is the app icon's tile (`assets/app-icon/silicalayer-mark-128.png`, see its README),
+//! where Photoshop shows its "Ps" tile. The PNG carries the tile's rounded corners; it is decoded
+//! once per context into a mipmapped texture, so it stays crisp at the title bar's size on any
+//! display scale.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -59,7 +60,7 @@ pub fn display(s: &str) -> &str {
 }
 
 /// 128 px: sharp at 20 pt on a 3× display, and the mipmaps keep it clean at 1×.
-const ICON_PNG: &[u8] = include_bytes!("../../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.photocraft.png");
+const ICON_PNG: &[u8] = include_bytes!("../../../../assets/app-icon/silicalayer-mark-128.png");
 
 /// The icon's pixels (one transparent pixel if it couldn't be decoded, which a test rules out).
 fn decode() -> egui::ColorImage {
