@@ -52,10 +52,33 @@ pub(crate) fn bundled() -> Result<std::sync::Arc<Manifest>> {
     SHARED.get_or_init(|| Manifest::bundled().map(|m| std::sync::Arc::new(m.clone())).map_err(|e| e.to_string())).clone().map_err(EngineError::Other)
 }
 
-/// How a model suits a card with `vram_gb` of memory: `tooLarge` when it is known to need more,
-/// `tested` when it has run on a card no larger, else `untested`. Nothing is claimed to fit that
-/// has not been seen to.
-fn fit(model: &photocraft_aisetup::manifest::ModelEntry, vram_gb: Option<u64>) -> &'static str {
+/// How a model suits this machine's `vram_gb` of memory. On a card (`host` not
+/// [`RuntimePlatform::MacosArm64`]): `tooLarge` when it is known to need more, `tested` when it
+/// has run on a card no larger, else `untested`. On an Apple-silicon Mac the card numbers say
+/// nothing about unified memory, so a model is `tested` only when the manifest's `apple-silicon`
+/// preset names it and the machine has the memory the probe calls qualified
+/// ([`photocraft_aisetup::probe::MIN_QUALIFIED_UNIFIED_MEMORY_MB`]); everything else is
+/// `untested`, and only a model needing more than the machine has is `tooLarge`. Nothing is
+/// claimed to fit that has not been seen to.
+///
+/// [`RuntimePlatform::MacosArm64`]: photocraft_aisetup::RuntimePlatform::MacosArm64
+fn fit(
+    model: &photocraft_aisetup::manifest::ModelEntry,
+    vram_gb: Option<u64>,
+    host: Option<photocraft_aisetup::RuntimePlatform>,
+    apple_silicon: &[String],
+) -> &'static str {
+    if host == Some(photocraft_aisetup::RuntimePlatform::MacosArm64) {
+        return match vram_gb {
+            Some(gb) if model.min_vram_gb.is_some_and(|need| u64::from(need) > gb) => "tooLarge",
+            Some(gb)
+                if apple_silicon.iter().any(|id| *id == model.id) && gb.saturating_mul(1024) >= photocraft_aisetup::probe::MIN_QUALIFIED_UNIFIED_MEMORY_MB =>
+            {
+                "tested"
+            }
+            _ => "untested",
+        };
+    }
     match vram_gb {
         Some(have) if model.min_vram_gb.is_some_and(|need| u64::from(need) > have) => "tooLarge",
         Some(have) if model.tested_vram_gb.iter().any(|tested| u64::from(*tested) <= have) => "tested",
@@ -81,7 +104,8 @@ fn manifest_value(m: &Manifest, installed: &[String], linked: &[String], vram_gb
                 "licence": {"name": model.licence.name, "url": model.licence.url, "commercial": model.licence.commercial},
                 "page": model.page, "gated": model.gated, "minVramGb": model.min_vram_gb, "testedVramGb": model.tested_vram_gb,
                 "bytes": m.download_bytes(std::slice::from_ref(&model.id)), "files": files,
-                "installed": installed.contains(&model.id), "linked": linked.contains(&model.id), "fit": fit(model, vram_gb), "minComfy": model.min_comfy,
+                "installed": installed.contains(&model.id), "linked": linked.contains(&model.id),
+                "fit": fit(model, vram_gb, host, m.preset("apple-silicon")), "minComfy": model.min_comfy,
             })
         })
         .collect();

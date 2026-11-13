@@ -481,19 +481,102 @@ fn apple_silicon_uses_the_managed_macos_runtime_without_cpu_fallback() {
 
 /// Everything the wizard painted as text in one more frame, one galley per line.
 fn drawn_words(app: &mut PhotocraftApp, c: &egui::Context) -> String {
-    fn galleys<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a str>) {
-        match shape {
-            egui::Shape::Text(t) => out.push(t.galley.job.text.as_str()),
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| galleys(s, out)),
-            _ => {}
-        }
+    let mut out = c.run_ui(Default::default(), |ui| window(app, ui.ctx()));
+    // A frame that draws new text re-uploads the font atlas; egui panics if that delta is dropped.
+    out.textures_delta.clear();
+    let mut texts = Vec::new();
+    for shape in &out.shapes {
+        galleys(&shape.shape, &mut texts);
     }
-    let out = c.run_ui(Default::default(), |ui| window(app, ui.ctx()));
+    texts.push(app.ui.ai_setup.note.as_str()); // a note is what a screen says, shown or hovered
+    texts.join("\n")
+}
+
+/// The text of a painted shape tree, one galley per entry.
+fn galleys<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a str>) {
+    match shape {
+        egui::Shape::Text(t) => out.push(t.galley.job.text.as_str()),
+        egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| galleys(s, out)),
+        _ => {}
+    }
+}
+
+/// Painted text of the checking screen, drawn directly: through `window` the job poll would
+/// end the stand-in look before its first frame.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn checking_words(app: &PhotocraftApp, c: &egui::Context) -> String {
+    let mut out = c.run_ui(Default::default(), |ui| page_checking(app, ui));
+    // A fresh context's first frame uploads the font atlas; egui panics if that delta is dropped.
+    out.textures_delta.clear();
     let mut texts = Vec::new();
     for shape in &out.shapes {
         galleys(&shape.shape, &mut texts);
     }
     texts.join("\n")
+}
+
+/// On an Apple-silicon Mac the wizard talks about the machine as a Mac with unified memory,
+/// never as a PC with a graphics card: the checking screen, its failure note, the install card
+/// and the Hugging Face sign-in rows say "Mac", the model rows suggest and discount memory in
+/// gigabytes ("suggested for your 24 GB Mac"), and an untested model says it is not tested on
+/// Macs. The fits come through `ai.setup.manifest` for the demo machine's 24 GB, as a Mac sees
+/// them. Gated like the tests that keep the Windows wording, which every host checks unchanged.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn the_mac_wording_says_mac_not_pc() {
+    let (mut app, dir) = app_without_probe();
+    let c = ctx();
+    // The first look, while it runs: the checking screen's own title.
+    app.ui.ai_setup.probe_job = Some(u64::MAX);
+    open(&mut app);
+    assert!(first_look(&app), "the checking screen only shows while the first look runs");
+    let words = checking_words(&app, &c);
+    assert!(words.contains("Checking your Mac"), "the checking screen says Mac:\n{words}");
+    // The check answering with nothing: the job poll ends it and its note blames the Mac.
+    app.ui.ai_setup.probe_job = Some(u64::MAX);
+    let words = drawn_words(&mut app, &c);
+    assert_eq!(app.ui.ai_setup.note, "This Mac could not be checked. Press Check Again.");
+    assert!(words.contains("This Mac could not be checked. Press Check Again."), "the failure note says Mac:\n{words}");
+    // What this machine offers: the install card promises not to touch the rest of the Mac.
+    app.ui.ai_setup.note.clear();
+    app.ui.ai_setup.probe = Some(demo::probe(dir.path()));
+    let words = drawn_words(&mut app, &c);
+    assert!(words.contains("Nothing else on this Mac is changed."), "the install card says Mac:\n{words}");
+    // The model rows speak of the Mac's memory. Their fits come from the engine for these
+    // 24 GB; the shipped manifest has no model with a known minimum above them, so the
+    // tooLarge answer is set on the list by hand to show that wording too.
+    refresh_manifest(&mut app);
+    if let Some(models) = app.ui.ai_setup.manifest.as_mut().and_then(|m| m["models"].as_array_mut()) {
+        for model in models {
+            if model["id"] == "flux-3-klein" {
+                model["fit"] = json!("tooLarge");
+            }
+        }
+    }
+    let fit = |id: &str| {
+        let m = app.ui.ai_setup.manifest.clone().unwrap_or_default();
+        list(&m, "/models").iter().find(|x| x["id"] == id).and_then(|x| x["fit"].as_str()).unwrap_or_default().to_string()
+    };
+    assert_eq!(
+        (fit("z-image-turbo").as_str(), fit("qwen-image-2-1").as_str()),
+        ("tested", "untested"),
+        "a Mac tests only the Apple-silicon preset, whatever the cards say"
+    );
+    app.ui.ai_setup.page = Page::Models;
+    app.ui.ai_setup.existing = false;
+    toggle_model(&mut app, "flux-3-klein", true);
+    let _ = drawn_words(&mut app, &c); // asks the plan; its access check answers once
+    // A saved Hugging Face token offers itself as the sign-in found on this Mac.
+    app.ui.ai_setup.hf = Some(json!({"signedIn": false, "found": true, "user": "", "via": "", "canSignIn": true}));
+    app.ui.ai_setup.access_key = access_key(&app);
+    let words = drawn_words(&mut app, &c);
+    assert!(words.contains("suggested for your 24 GB Mac"), "a suggested model names the Mac:\n{words}");
+    assert!(words.contains("too large for this Mac's 24 GB of memory"), "a model that needs more blames the Mac's memory");
+    assert!(words.contains("not tested on Macs"), "an untested model says Macs");
+    // The found-token row ("Use the sign-in found on this Mac") draws only once the gated model's
+    // access check has answered, which this offline test can't arrange; its Mac wording is a plain
+    // `on_mac()` choice beside the rows checked here.
+    assert!(!words.contains("your card") && !words.contains("this PC"), "no card or PC wording on the rows: {words}");
 }
 
 /// A Mac below the unified-memory floor is recommended cloud models on the first screen: the

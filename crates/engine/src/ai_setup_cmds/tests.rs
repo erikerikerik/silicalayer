@@ -190,9 +190,12 @@ mod native {
             (Some(18_520_930_264), Some(3))
         );
         let qwen = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "qwen-image-2-1").unwrap();
+        // It has been run on 24 GB cards; on a Mac only the Apple-silicon preset is ever
+        // `tested`, so this one is `untested` there whatever the memory.
+        let qwen_fit = if apple { "untested" } else { "tested" };
         assert_eq!(
             (qwen["id"].as_str(), qwen["installed"].as_bool(), qwen["fit"].as_str(), qwen["licence"]["commercial"].as_bool()),
-            (Some("qwen-image-2-1"), Some(false), Some("tested"), Some(false))
+            (Some("qwen-image-2-1"), Some(false), Some(qwen_fit), Some(false))
         );
         // Each says which ComfyUI it needs: FIBO 2 the one the setup installs. It is offered, not
         // ticked: no preset but Everything has it.
@@ -223,6 +226,49 @@ mod native {
         assert_eq!((status["available"].as_bool(), status["state"].as_str(), status["running"].as_bool()), (Some(false), Some("none"), Some(false)));
         assert_eq!(s.execute("ai.setup.cancel", json!({})).unwrap()["stopping"], false);
         assert!(!poll(&mut s) && s.ai_setup.seq() == 0 && s.ai_setup.last().is_none());
+    }
+
+    /// On an Apple-silicon Mac the card numbers in the manifest say nothing about unified
+    /// memory: only the `apple-silicon` preset's models are `tested`, and only on a machine
+    /// with the memory the probe calls qualified (24 GB). Everything else is `untested`, and
+    /// a model needing more than the machine has is still `tooLarge`. Elsewhere the card rule
+    /// is untouched.
+    #[test]
+    fn ai_setup_mac_fits_only_the_apple_silicon_models_on_qualified_memory() {
+        let m = Manifest::bundled().unwrap().clone();
+        let apple = m.preset("apple-silicon").to_vec();
+        let mac = Some(photocraft_aisetup::RuntimePlatform::MacosArm64);
+        let win = Some(photocraft_aisetup::RuntimePlatform::WindowsPortable);
+        let z = m.model("z-image-turbo").unwrap();
+        let qwen = m.model("qwen-image-2-1").unwrap();
+        // 24 GB of unified memory: the preset's model is tested, a model outside it is not,
+        // even one the card rule vouches for at this size.
+        assert_eq!((fit(z, Some(24), mac, &apple), fit(qwen, Some(24), mac, &apple)), ("tested", "untested"));
+        // Below the qualified floor even the preset's model is only untested.
+        assert_eq!(fit(z, Some(16), mac, &apple), "untested");
+        // A model needing more than the machine has is tooLarge there too: the manifest has
+        // no such row, so one is made by raising the floor of a real entry.
+        let big = {
+            let mut e = z.clone();
+            e.min_vram_gb = Some(32);
+            e
+        };
+        assert_eq!(fit(&big, Some(24), mac, &apple), "tooLarge");
+        assert_eq!(fit(&big, Some(48), mac, &apple), "tested", "qualified memory covers the floor");
+        // No memory read: nothing is claimed to fit.
+        assert_eq!((fit(z, None, mac, &apple), fit(z, None, mac, &[])), ("untested", "untested"));
+        // The card rule elsewhere, and on an unknown host, is exactly what it was: tested on
+        // a card no smaller than one it has run on, tooLarge above a known floor, else untested.
+        assert_eq!(fit(z, Some(24), win, &apple), "tested");
+        assert_eq!(fit(z, Some(8), win, &apple), "untested");
+        assert_eq!(fit(&big, Some(24), win, &apple), "tooLarge");
+        assert_eq!((fit(z, Some(24), None, &apple), fit(z, Some(24), win, &[])), ("tested", "tested"));
+        // The same through the command, on the machine the test runs on.
+        let mut s = Session::new();
+        let v = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
+        let want = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { (Some("tested"), Some("untested")) } else { (Some("tested"), Some("tested")) };
+        let got = |id: &str| v["models"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap()["fit"].as_str();
+        assert_eq!((got("z-image-turbo"), got("qwen-image-2-1")), want);
     }
 
     /// Task 017: the diagnostics report reads only: a session with no setup env, no record, no
