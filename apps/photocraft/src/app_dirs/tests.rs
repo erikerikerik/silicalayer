@@ -37,11 +37,36 @@ fn no_marker_uses_the_platform_dir() {
     assert!(!exe.join(portable_data_dir()).exists(), "no portable folder without a marker");
     // The convention per platform.
     if cfg!(target_os = "macos") {
-        assert_eq!(dir, root.join("home/Library/Application Support/LayerShop"));
+        assert_eq!(dir, root.join("home/Library/Application Support/SilicaLayr"));
     } else if cfg!(windows) {
         assert_eq!(dir, root.join("appdata").join("LayerShop"));
     } else {
         assert_eq!(dir, root.join("home/.config/layershop"));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The Local AI folders follow the data folder: macOS got SilicaLayr's own and they moved
+/// with it; Windows keeps `%LOCALAPPDATA%\LayerShop` and Linux the XDG config folder.
+#[test]
+fn the_local_ai_folders_sit_under_the_data_folder() {
+    let root = temp("local-ai");
+    let env = env_of(&[("HOME", &root.join("home")), ("APPDATA", &root.join("appdata")), ("LOCALAPPDATA", &root.join("local"))]);
+    let d = resolve(&env, None);
+    let dir = d.dir.unwrap();
+    let (engine, models) = local_ai_dirs(&d, &env).unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(dir, root.join("home/Library/Application Support/SilicaLayr"));
+        assert_eq!(engine, dir.join("LocalAI").join("engine"));
+        assert_eq!(models, dir.join("LocalAI").join("models"));
+    } else if cfg!(windows) {
+        assert_eq!(dir, root.join("appdata").join("LayerShop"));
+        assert_eq!(engine, root.join("local").join("LayerShop").join("engine"));
+        assert_eq!(models, root.join("local").join("LayerShop").join("models"));
+    } else {
+        assert_eq!(dir, root.join("home/.config/layershop"));
+        assert_eq!(engine, dir.join("LocalAI").join("engine"));
+        assert_eq!(models, dir.join("LocalAI").join("models"));
     }
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -466,5 +491,125 @@ fn the_write_probe_never_follows_an_entry_already_at_its_name() {
     std::os::unix::fs::symlink(&victim, data.join(format!(".write-test-{pid}-{}", WRITE_PROBE_ATTEMPTS - 1))).unwrap();
     assert!(ensure_writable(&data).is_err());
     assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The one-time macOS move of the data folder out of the `LayerShop` name this fork used
+/// before the rebrand, on temporary folders.
+#[cfg(target_os = "macos")]
+fn record_in(dir: &Path, support: &Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let text = format!(
+        "{{\"phase\": \"done\", \"version\": 1, \"ownership\": \"managed\", \"port\": 8188, \
+         \"choices\": {{\"engineDir\": \"{dir}/LocalAI/engine\", \"modelsDir\": \"{dir}/LocalAI/models\", \
+         \"extraModelsDirs\": [\"/Users/dev/Models\", \"{support}/LayerShopMore/models\"]}}, \
+         \"nextRelease\": {{\"note\": \"a field this app does not know\"}}}}",
+        dir = dir.display(),
+        support = support.display()
+    );
+    std::fs::write(dir.join("ai-setup.json"), &text).unwrap();
+    text
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_old_data_folder_moves_and_its_record_points_at_the_new_one() {
+    let root = temp("migration-old");
+    let support = root.join("Library/Application Support");
+    let old = support.join("LayerShop");
+    let new = support.join("SilicaLayr");
+    std::fs::create_dir_all(old.join("Recovery")).unwrap();
+    std::fs::write(old.join("preferences.json"), b"settings").unwrap();
+    record_in(&old, &support);
+    assert_eq!(migrate_data_folder(&new, &old), Migrated::Renamed);
+    assert!(!old.exists(), "the folder was renamed, never copied around");
+    assert_eq!(std::fs::read(new.join("preferences.json")).unwrap(), b"settings", "everything moved with it");
+    assert!(new.join("Recovery").is_dir());
+    let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(new.join("ai-setup.json")).unwrap()).unwrap();
+    let choices = &record["choices"];
+    assert_eq!(choices["engineDir"].as_str(), Some(new.join("LocalAI/engine").to_str().unwrap()));
+    assert_eq!(choices["modelsDir"].as_str(), Some(new.join("LocalAI/models").to_str().unwrap()));
+    // A models folder the user chose outside the data folder keeps its path, and so does one
+    // whose name only starts with the old folder's text.
+    assert_eq!(choices["extraModelsDirs"][0].as_str(), Some("/Users/dev/Models"));
+    assert_eq!(choices["extraModelsDirs"][1].as_str(), Some(format!("{}/LayerShopMore/models", support.display()).as_str()));
+    // Everything the app does not know, from this or a newer version, survives the rewrite.
+    assert_eq!(record["nextRelease"]["note"].as_str(), Some("a field this app does not know"));
+    assert_eq!(record["version"], 1);
+    assert_eq!(record["port"], 8188);
+    assert!(!new.join("ai-setup.json.new").exists(), "the rewrite leaves no temp file");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_data_folder_is_left_as_it_is() {
+    let root = temp("migration-new");
+    let new = root.join("Library/Application Support/SilicaLayr");
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(new.join("preferences.json"), b"mine").unwrap();
+    let old = root.join("Library/Application Support/LayerShop");
+    assert_eq!(migrate_data_folder(&new, &old), Migrated::Nothing);
+    assert_eq!(std::fs::read(new.join("preferences.json")).unwrap(), b"mine");
+    assert!(!old.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn when_both_folders_exist_the_new_one_wins_and_the_old_is_untouched() {
+    let root = temp("migration-both");
+    let support = root.join("Library/Application Support");
+    let old = support.join("LayerShop");
+    let new = support.join("SilicaLayr");
+    let original = record_in(&old, &support);
+    std::fs::create_dir_all(&new).unwrap();
+    std::fs::write(new.join("preferences.json"), b"mine").unwrap();
+    assert_eq!(migrate_data_folder(&new, &old), Migrated::UsedNew);
+    assert_eq!(std::fs::read_to_string(old.join("ai-setup.json")).unwrap(), original, "the old record still names the old folder");
+    assert_eq!(std::fs::read(new.join("preferences.json")).unwrap(), b"mine", "and the new data is untouched");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn no_folder_at_all_creates_nothing() {
+    let root = temp("migration-none");
+    let support = root.join("Library/Application Support");
+    assert_eq!(migrate_data_folder(&support.join("SilicaLayr"), &support.join("LayerShop")), Migrated::Nothing);
+    assert!(!support.exists(), "nothing was created");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_link_where_the_old_folder_should_be_is_not_moved_and_is_kept_for_this_run() {
+    let root = temp("migration-fail");
+    let support = root.join("Library/Application Support");
+    std::fs::create_dir_all(&support).unwrap();
+    // A link to a folder on another volume: renaming it would leave the data behind.
+    let real = root.join("Volume");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("preferences.json"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&real, support.join("LayerShop")).unwrap();
+    let kept: OnceLock<PathBuf> = OnceLock::new();
+    let outcome = migrate_macos_data_dir_from(&root, &kept);
+    assert!(matches!(&outcome, Migrated::Failed(why) if why.contains("isn't a folder")), "{outcome:?}");
+    assert_eq!(kept.get(), Some(&support.join("LayerShop")), "this run keeps using the old folder");
+    assert_eq!(std::fs::read(real.join("preferences.json")).unwrap(), b"keep", "the linked data is untouched");
+    assert!(!support.join("SilicaLayr").exists(), "no empty second data set is started");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_start_up_wrapper_moves_the_real_folder_names_under_a_temp_home() {
+    let root = temp("migration-home");
+    let support = root.join("Library/Application Support");
+    std::fs::create_dir_all(support.join("LayerShop")).unwrap();
+    let kept: OnceLock<PathBuf> = OnceLock::new();
+    assert_eq!(migrate_macos_data_dir_from(&root, &kept), Migrated::Renamed);
+    assert!(support.join("SilicaLayr").is_dir() && !support.join("LayerShop").exists());
+    assert!(kept.get().is_none(), "the fallback is only for a failed move");
     let _ = std::fs::remove_dir_all(&root);
 }

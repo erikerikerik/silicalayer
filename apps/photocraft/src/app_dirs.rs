@@ -2,7 +2,8 @@
 //! preferences, API keys and the Hugging Face sign-in, brush presets, crash-recovery autosaves,
 //! logs, the window layout, the GPU startup marker and the Local AI setup's record all live under
 //! the one directory [`config_dir`] returns; the Local AI engine and models under
-//! [`local_ai_dirs`]. Every folder is named after the product ([`DIR_NAME`], the brand name).
+//! [`local_ai_dirs`]. Every folder is named after the product's folder name ([`DIR_NAME`],
+//! `SilicaLayr` on macOS, `LayerShop` elsewhere).
 //!
 //! In order:
 //! 1. `PHOTOCRAFT_CONFIG_DIR`, when set (tests, agents, custom setups).
@@ -11,8 +12,10 @@
 //!    USB stick leaves nothing in `%APPDATA%`. The Windows portable zip ships with `portable.txt`;
 //!    the MSI doesn't. If that folder can't be written (read-only medium, Program Files), the app
 //!    warns and falls back.
-//! 3. The platform convention: macOS `~/Library/Application Support/LayerShop`, Windows
-//!    `%APPDATA%\LayerShop`, Linux `$XDG_CONFIG_HOME/layershop` or `~/.config/layershop`.
+//! 3. The platform convention: macOS `~/Library/Application Support/SilicaLayr` (moved there
+//!    from the `LayerShop` folder this fork used before the rebrand, once, at start-up, by
+//!    `migrate_macos_data_dir`), Windows `%APPDATA%\LayerShop`, Linux
+//!    `$XDG_CONFIG_HOME/layershop` or `~/.config/layershop`.
 //!
 //! One exception: the platform convention keeps crash-recovery autosaves out of what is synced
 //! with the settings: the Windows roaming profile and the Linux config folder ([`recovery_dir`]).
@@ -21,15 +24,21 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The name of every per-user folder the app keeps (lowercase on Linux).
-pub const DIR_NAME: &str = photocraft_ui_egui::brand::NAME;
+/// The name of every per-user folder the app keeps (lowercase on Linux). It is deliberately
+/// not the brand name from `photocraft_ui_egui::brand`: only macOS got a folder of the new
+/// brand's own, `SilicaLayr`; Windows and Linux keep the `LayerShop` folder their installers
+/// and existing users depend on. Machine names (crates, binaries, bundle ids) are a separate
+/// matter again.
+pub const DIR_NAME: &str = if cfg!(target_os = "macos") { "SilicaLayr" } else { "LayerShop" };
 
 /// Files beside the executable that switch on portable mode (either one; contents are ignored).
 pub const PORTABLE_MARKERS: [&str; 2] = ["portable.txt", "PhotoCraft.portable"];
 
-/// The data folder created beside the executable in portable mode: `LayerShopData`.
+/// The data folder created beside the executable in portable mode: `LayerShopData`, on every
+/// platform. Portable mode is deliberately unchanged by the macOS rename of the platform
+/// folder: silently moving a stick's data on a rebrand is worse than a legacy folder name.
 pub fn portable_data_dir() -> String {
-    format!("{DIR_NAME}Data")
+    "LayerShopData".to_string()
 }
 
 /// How [`DataDir::dir`] was chosen.
@@ -95,7 +104,8 @@ pub fn recovery_dir() -> Option<PathBuf> {
 ///   `~/.local/state/layershop/Recovery`, where the XDG Base Directory spec puts state that
 ///   should outlive a restart but isn't configuration; dotfile managers and config sync often copy
 ///   `~/.config` whole. As the spec asks, a relative `XDG_STATE_HOME` is ignored.
-/// - macOS: `~/Library/Application Support/LayerShop/Recovery` as before. Apple's guidelines put
+/// - macOS: `~/Library/Application Support/SilicaLayr/Recovery` as before. Apple's guidelines
+///   put
 ///   app-created data that can't be regenerated there; `~/Library/Caches` may be purged by the
 ///   system.
 ///
@@ -485,15 +495,180 @@ pub fn resolve(env: impl Fn(&str) -> Option<OsString>, exe_dir: Option<&Path>) -
 }
 
 /// The platform convention, from `env` (so tests can fake `HOME`/`APPDATA`/`XDG_CONFIG_HOME`).
+/// On macOS, when `migrate_macos_data_dir` could not move the old folder, this is the old
+/// folder for the rest of the run rather than an empty second data set.
 pub fn platform_dir(env: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let home = env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        if let Some(kept) = MACOS_KEPT_DIR.get() {
+            return Some(kept.clone());
+        }
         return home.map(|h| h.join("Library/Application Support").join(DIR_NAME));
     }
     if cfg!(windows) {
         return env("APPDATA").filter(|a| !a.is_empty()).map(|a| PathBuf::from(a).join(DIR_NAME));
     }
     env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map(PathBuf::from).or_else(|| home.map(|h| h.join(".config"))).map(|c| c.join(DIR_NAME.to_lowercase()))
+}
+
+/// macOS only: the `LayerShop` data folder this run keeps using when
+/// [`migrate_macos_data_dir`] could not rename it to `SilicaLayr`; `platform_dir` returns it
+/// instead of the new folder, which would be empty. The log entry the migration writes says why.
+#[cfg(target_os = "macos")]
+static MACOS_KEPT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// What [`migrate_data_folder`] decided. The whole migration is macOS-only: it is the one
+/// platform whose folder name the rebrand moves.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Migrated {
+    /// The new folder is already in place with no old one beside it, or there is neither:
+    /// nothing to do, nothing created.
+    Nothing,
+    /// The new folder is in place and the old one exists too: the new one is used and the old
+    /// one is left exactly as it is, for whoever empties it by hand.
+    UsedNew,
+    /// The old folder was renamed to the new one, and the stored paths in the moved
+    /// `ai-setup.json` now name the new folder.
+    Renamed,
+    /// The rename failed; the string says why, and the old folder is kept for this run.
+    Failed(String),
+}
+
+/// One-time move of the macOS data folder out of the `LayerShop` name this fork used before
+/// the rebrand, called at start-up before anything reads settings (main.rs). It must run
+/// before the first [`current`], whose answer caches the folder for the process.
+#[cfg(target_os = "macos")]
+pub fn migrate_macos_data_dir() {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) else {
+        return;
+    };
+    migrate_macos_data_dir_from(&home, &MACOS_KEPT_DIR);
+}
+
+/// [`migrate_macos_data_dir`] with the user folder and the failed-rename fallback state passed
+/// in, so tests drive the wrapper without the environment or the process-wide one.
+#[cfg(target_os = "macos")]
+fn migrate_macos_data_dir_from(home: &Path, kept: &OnceLock<PathBuf>) -> Migrated {
+    let old = home.join("Library/Application Support/LayerShop");
+    let new = home.join("Library/Application Support").join(DIR_NAME);
+    let outcome = migrate_data_folder(&new, &old);
+    match &outcome {
+        Migrated::Renamed => log::info!("moved the data folder {} to {}", old.display(), new.display()),
+        Migrated::UsedNew => log::info!("using {}; the old data folder {} is left as it is", new.display(), old.display()),
+        Migrated::Nothing => {}
+        Migrated::Failed(why) => {
+            let _ = kept.set(old.clone());
+            log::warn!("keeping the old data folder {} for this run: {why}", old.display());
+        }
+    }
+    outcome
+}
+
+/// The move itself, as a function of the two folder paths so tests can use temp folders.
+///
+/// When `new_dir` doesn't exist and `old_dir` is a folder, `old_dir` is renamed to `new_dir`
+/// — one `rename` on the same volume, never a copy-and-delete, so settings, recovery files
+/// and Local AI data are never half-moved or lost — and the stored paths in the moved
+/// `ai-setup.json` are rewritten from the old folder to the new ([`rewrite_record_paths`]).
+/// A new name already in use, a missing old folder, a link or file standing where the old
+/// folder should be, and a failed rename all leave every file exactly where it was.
+#[cfg(target_os = "macos")]
+pub fn migrate_data_folder(new_dir: &Path, old_dir: &Path) -> Migrated {
+    if std::fs::symlink_metadata(new_dir).is_ok() {
+        return if std::fs::symlink_metadata(old_dir).is_ok() { Migrated::UsedNew } else { Migrated::Nothing };
+    }
+    let Ok(meta) = std::fs::symlink_metadata(old_dir) else {
+        return Migrated::Nothing;
+    };
+    if !meta.is_dir() {
+        // A link or a file: its data, if any, lives elsewhere and would stay behind a rename.
+        return Migrated::Failed(format!("{} isn't a folder", old_dir.display()));
+    }
+    if let Err(e) = std::fs::rename(old_dir, new_dir) {
+        return Migrated::Failed(format!("could not rename {} to {}: {e}", old_dir.display(), new_dir.display()));
+    }
+    rewrite_record_paths(&new_dir.join("ai-setup.json"), &old_dir.to_string_lossy(), &new_dir.to_string_lossy());
+    Migrated::Renamed
+}
+
+/// The Local AI record's size cap: `photocraft_aisetup::state::load` treats anything larger
+/// as no record, so it is not something a move should rewrite.
+#[cfg(target_os = "macos")]
+const ASETUP_RECORD_MAX: u64 = 1 << 20;
+
+/// Point the moved `ai-setup.json`'s stored paths at the new folder. Best-effort: a record
+/// that can't be read or parsed — files the app itself treats as no record — is left exactly
+/// as it is; anything else that goes wrong is logged, never fatal to the move that happened.
+#[cfg(target_os = "macos")]
+fn rewrite_record_paths(path: &Path, old_prefix: &str, new_prefix: &str) {
+    if let Err(e) = try_rewrite_record_paths(path, old_prefix, new_prefix) {
+        log::warn!("couldn't update the moved Local AI record {}: {e}", path.display());
+    }
+}
+
+/// The rewrite, reporting why it didn't happen. The record keeps its unknown fields and its
+/// version: a record written by a newer app must survive the move, so it is rewritten as JSON
+/// values rather than re-serialised through the typed one (which fails closed).
+#[cfg(target_os = "macos")]
+fn try_rewrite_record_paths(path: &Path, old_prefix: &str, new_prefix: &str) -> Result<(), String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(()); // no record: nothing to fix
+    };
+    if !meta.is_file() || meta.len() > ASETUP_RECORD_MAX {
+        return Err(format!("{} is not a record-sized regular file", path.display()));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(()); // not a record the app could load; not the move's to repair
+    };
+    let mut moved = 0usize;
+    let record = rewrite_record_value(record, old_prefix, new_prefix, 0, &mut moved);
+    if moved == 0 {
+        return Ok(());
+    }
+    let rendered = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+    // Written beside the target and renamed over it, like `aisetup::state::save`: a crash
+    // part way leaves the old record, never a half-written one.
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".new");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, rendered.as_bytes()).map_err(|e| e.to_string())?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Rewrite every string in `value` naming a path under `old_prefix` — a `/` boundary is
+/// required, so a chosen folder that merely starts with the same text is not touched.
+#[cfg(target_os = "macos")]
+fn rewrite_record_value(value: serde_json::Value, old_prefix: &str, new_prefix: &str, depth: u32, moved: &mut usize) -> serde_json::Value {
+    /// The app's record nests a handful of levels; deeper is hostile input, kept as it is.
+    const MAX_DEPTH: u32 = 64;
+    if depth > MAX_DEPTH {
+        return value;
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(|v| rewrite_record_value(v, old_prefix, new_prefix, depth + 1, moved)).collect())
+        }
+        serde_json::Value::Object(fields) => {
+            serde_json::Value::Object(fields.into_iter().map(|(k, v)| (k, rewrite_record_value(v, old_prefix, new_prefix, depth + 1, moved))).collect())
+        }
+        serde_json::Value::String(s) => match s.strip_prefix(old_prefix) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                *moved += 1;
+                serde_json::Value::String(format!("{new_prefix}{rest}"))
+            }
+            _ => serde_json::Value::String(s),
+        },
+        other => other,
+    }
 }
 
 /// Where the Local AI setup puts the engine and the models unless the user chooses otherwise:
