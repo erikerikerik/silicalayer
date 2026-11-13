@@ -367,8 +367,8 @@ pub fn installed_engines(engine_dir: &Path) -> Vec<(PathBuf, Marker)> {
 }
 
 /// Remove what the setup put in `engine_dir`: every engine that carries the marker, unfinished
-/// unpacks, engines set aside for a repair ([`REPLACED`]) and runtime archives. Anything else in
-/// the folder is not this app's and stays.
+/// unpacks, engines set aside for a repair ([`REPLACED`]) while they still carry the marker, and
+/// runtime archives. Anything else in the folder is not this app's and stays.
 /// The data folder of writable engine output ([`DATA_FOLDER`]) stays too — like the models —
 /// unless `remove_data` says the user chose to delete their workflows and output with it.
 /// Returns the bytes freed.
@@ -387,7 +387,10 @@ pub fn remove_engines(engine_dir: &Path, remove_data: bool) -> Result<u64> {
                 std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
                 freed = freed.saturating_add(size);
             }
-        } else if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking") || name.ends_with(REPLACED)) {
+        } else if kind.is_dir() && (read_marker(&path).is_some() || name.ends_with(".unpacking")) {
+            // No name rule for [`REPLACED`] folders: a set-aside engine is always a moved engine
+            // folder, so it carries the marker and the first test takes it; a `*.replaced` folder
+            // without one is not this app's and must stay.
             let size = size_of(&path);
             std::fs::remove_dir_all(&path).map_err(|e| disk(&path, "remove", &e))?;
             freed = freed.saturating_add(size);
@@ -700,6 +703,24 @@ mod tests {
         // A marker that is not one (a huge file, junk) marks nothing.
         std::fs::write(theirs.join(MARKER), b"not json").unwrap();
         assert!(read_marker(&theirs).is_none());
+    }
+
+    /// A set-aside engine is always a moved engine folder, so it carries the marker and goes with
+    /// the setup; a folder that merely ends in `.replaced` without one is not this app's.
+    #[test]
+    fn a_replaced_folder_is_removed_only_when_it_carries_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let engines = dir.path().join("engine");
+        let aside = engines.join("0.41.0.replaced");
+        let theirs = engines.join("notes.replaced");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("keep.txt"), b"mine").unwrap();
+        write_marker(&aside, &Marker::managed(RuntimePlatform::WindowsPortable, "0.41.0", "nvidia", &"b".repeat(64))).unwrap();
+        let freed = remove_engines(&engines, false).unwrap();
+        assert!(freed > 0, "{freed}");
+        assert!(!aside.exists(), "the set-aside engine carries the marker, so the setup removes it");
+        assert!(theirs.join("keep.txt").is_file(), "a `*.replaced` folder without the marker is not the setup's to delete");
     }
 
     #[test]

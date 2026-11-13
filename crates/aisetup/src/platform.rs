@@ -15,7 +15,8 @@ pub enum RuntimePlatform {
     /// Windows portable build (the current implementation).
     #[default]
     WindowsPortable,
-    /// macOS ARM64 managed runtime (defined for future platform support; CPU mode is explicit).
+    /// macOS ARM64 managed runtime: the Apple Silicon build, installable once the host's
+    /// unified memory qualifies ([`crate::probe::MIN_QUALIFIED_UNIFIED_MEMORY_MB`]).
     MacosArm64,
 }
 
