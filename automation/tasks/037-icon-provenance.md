@@ -1,6 +1,6 @@
 # Icon licence and attribution say how the crystal art was made
 
-Erik's report: the crystal art is his, made in rounds with an AI image generator. He drew the first version, ChatGPT polished it, he edited that result and art-directed corrections, and ChatGPT polished those edits. The Mac tile and the two small-size SVGs were then made for SilicaLayer with Claude. The current text says "Original artwork… supplied by Erik Kristianson… No third-party material", which hides the AI steps. The licence and the attribution table must state them plainly.
+Erik's report (credit him by his GitHub handle, erikerikerik, never his full name): the crystal art is his, made in rounds with an AI image generator. He drew the first version, ChatGPT polished it, he edited that result and art-directed corrections, and ChatGPT polished those edits. The Mac tile and the two small-size SVGs were then made for SilicaLayer with Claude. The current text says "Original artwork… supplied by [his full name]… No third-party material", which hides the AI steps and uses his full name. The licence and the attribution table must state the steps plainly and name him only as `erikerikerik`.
 
 Scope:
 
@@ -8,17 +8,19 @@ Scope:
 
   ```
   The SilicaLayer app icon: a glowing crystal on three translucent layers. The crystal art is by
-  Erik Kristianson. He drew the first version; ChatGPT (an AI image generator) polished it; he
-  edited that result and art-directed corrections; ChatGPT polished those edits. The Mac tile and
-  the simplified small-size drawings (the two SVGs) were then made for SilicaLayer with Claude to
+  erikerikerik. He drew the first version; ChatGPT (an AI image generator) polished it; he edited
+  that result and art-directed corrections; ChatGPT polished those edits. The Mac tile and the
+  simplified small-size drawings (the two SVGs) were then made for SilicaLayer with Claude to
   match it. It replaces LayerShop's icon in this fork. Licensed like the rest of the project, to
   the extent it is covered by copyright, under either of
   ```
 
 - `ATTRIBUTION.md`, the `assets/app-icon/` row (about line 78): change only its third and fourth columns.
-  - Third column becomes: `Erik Kristianson (crystal art: his drawing, refined in rounds with ChatGPT under his direction and edits); SilicaLayer contributors with Claude (Mac tile and small-size drawing)`
+  - Third column becomes: `erikerikerik (crystal art: his drawing, refined in rounds with ChatGPT under his direction and edits); SilicaLayer contributors with Claude (Mac tile and small-size drawing)`
   - Fourth column becomes: `Human-drawn and AI-assisted, see [`assets/app-icon/LICENSE.txt`](assets/app-icon/LICENSE.txt)`
   - Leave the first, second and fifth columns as they are.
+
+After the edits, `git grep -n -i 'kristia[n]son'` must print nothing: his surname must not appear anywhere in the repository.
 
 No tests to add; this is text only.
 
