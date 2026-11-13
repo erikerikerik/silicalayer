@@ -530,7 +530,7 @@ pub enum Migrated {
     /// one is left exactly as it is, for whoever empties it by hand.
     UsedNew,
     /// The old folder was renamed to the new one, and the stored paths in the moved
-    /// `ai-setup.json` now name the new folder.
+    /// `ai-setup.json` and `preferences.json` now name the new folder.
     Renamed,
     /// The rename failed; the string says why, and the old folder is kept for this run.
     Failed(String),
@@ -571,7 +571,8 @@ fn migrate_macos_data_dir_from(home: &Path, kept: &OnceLock<PathBuf>) -> Migrate
 /// When `new_dir` doesn't exist and `old_dir` is a folder, `old_dir` is renamed to `new_dir`
 /// — one `rename` on the same volume, never a copy-and-delete, so settings, recovery files
 /// and Local AI data are never half-moved or lost — and the stored paths in the moved
-/// `ai-setup.json` are rewritten from the old folder to the new ([`rewrite_record_paths`]).
+/// `ai-setup.json` and `preferences.json` are rewritten from the old folder to the new
+/// ([`rewrite_record_paths`]).
 /// A new name already in use, a missing old folder, a link or file standing where the old
 /// folder should be, and a failed rename all leave every file exactly where it was.
 #[cfg(target_os = "macos")]
@@ -589,22 +590,26 @@ pub fn migrate_data_folder(new_dir: &Path, old_dir: &Path) -> Migrated {
     if let Err(e) = std::fs::rename(old_dir, new_dir) {
         return Migrated::Failed(format!("could not rename {} to {}: {e}", old_dir.display(), new_dir.display()));
     }
-    rewrite_record_paths(&new_dir.join("ai-setup.json"), &old_dir.to_string_lossy(), &new_dir.to_string_lossy());
+    let (old_prefix, new_prefix) = (old_dir.to_string_lossy(), new_dir.to_string_lossy());
+    rewrite_record_paths(&new_dir.join("ai-setup.json"), &old_prefix, &new_prefix);
+    rewrite_record_paths(&new_dir.join("preferences.json"), &old_prefix, &new_prefix);
     Migrated::Renamed
 }
 
-/// The Local AI record's size cap: `photocraft_aisetup::state::load` treats anything larger
-/// as no record, so it is not something a move should rewrite.
+/// The size cap for a file [`rewrite_record_paths`] rewrites, the Local AI record or the
+/// preferences: 1 MiB. `photocraft_aisetup::state::load` treats a record larger than this as
+/// no record, so a file larger than this is not something a move should rewrite.
 #[cfg(target_os = "macos")]
-const ASETUP_RECORD_MAX: u64 = 1 << 20;
+const REWRITE_MAX: u64 = 1 << 20;
 
-/// Point the moved `ai-setup.json`'s stored paths at the new folder. Best-effort: a record
-/// that can't be read or parsed — files the app itself treats as no record — is left exactly
-/// as it is; anything else that goes wrong is logged, never fatal to the move that happened.
+/// Point the moved `ai-setup.json`'s and `preferences.json`'s stored paths at the new folder.
+/// Best-effort: a file that can't be read or parsed — one the app itself treats as no record
+/// — is left exactly as it is; anything else that goes wrong is logged, never fatal to the
+/// move that happened.
 #[cfg(target_os = "macos")]
 fn rewrite_record_paths(path: &Path, old_prefix: &str, new_prefix: &str) {
     if let Err(e) = try_rewrite_record_paths(path, old_prefix, new_prefix) {
-        log::warn!("couldn't update the moved Local AI record {}: {e}", path.display());
+        log::warn!("couldn't update the moved paths in {}: {e}", path.display());
     }
 }
 
@@ -616,7 +621,7 @@ fn try_rewrite_record_paths(path: &Path, old_prefix: &str, new_prefix: &str) -> 
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Ok(()); // no record: nothing to fix
     };
-    if !meta.is_file() || meta.len() > ASETUP_RECORD_MAX {
+    if !meta.is_file() || meta.len() > REWRITE_MAX {
         return Err(format!("{} is not a record-sized regular file", path.display()));
     }
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;

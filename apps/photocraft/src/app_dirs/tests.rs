@@ -541,6 +541,41 @@ fn an_old_data_folder_moves_and_its_record_points_at_the_new_one() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The move rewrites the preferences' Local AI launch paths too: `python` and `folder` name
+/// absolute paths into the engine folder, and Local AI won't start when they still name the
+/// old one.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_moved_preferences_json_points_at_the_new_folder_too() {
+    let root = temp("migration-prefs");
+    let support = root.join("Library/Application Support");
+    let old = support.join("LayerShop");
+    let new = support.join("SilicaLyr");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(
+        old.join("preferences.json"),
+        format!(
+            "{{\"ai\": {{\"comfy_launch\": {{\"python\": \"{old}/LocalAI/engine/python/bin/python3\", \
+             \"folder\": \"{old}/LocalAI/engine\", \"args\": \"-s main.py\"}}}}, \
+             \"recentFiles\": [\"/Users/dev/Pictures/a.pcraft\"], \"unknownField\": 7}}",
+            old = old.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(migrate_data_folder(&new, &old), Migrated::Renamed);
+    let prefs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(new.join("preferences.json")).unwrap()).unwrap();
+    let launch = &prefs["ai"]["comfy_launch"];
+    assert_eq!(launch["python"].as_str(), Some(new.join("LocalAI/engine/python/bin/python3").to_str().unwrap()));
+    assert_eq!(launch["folder"].as_str(), Some(new.join("LocalAI/engine").to_str().unwrap()));
+    // What doesn't name the old folder stays exactly as it was: the args, a document outside
+    // the data folder, and a field this app does not know.
+    assert_eq!(launch["args"].as_str(), Some("-s main.py"));
+    assert_eq!(prefs["recentFiles"][0].as_str(), Some("/Users/dev/Pictures/a.pcraft"));
+    assert_eq!(prefs["unknownField"], 7);
+    assert!(!new.join("preferences.json.new").exists(), "the rewrite leaves no temp file");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_new_data_folder_is_left_as_it_is() {
