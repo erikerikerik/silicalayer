@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Check the macOS release artifacts exactly as users download them:
 #
-#   $DIST/photocraft-<version>-macos-<arch>.dmg       signed, notarized, ticket stapled
-#   $DIST/photocraft-cli-<version>-macos-<arch>.zip   unpacked here; the binary inside must be
+#   $DIST/silicalayr-<version>-macos-<arch>.dmg       signed, notarized, ticket stapled
+#   $DIST/silicalayr-cli-<version>-macos-<arch>.zip   unpacked here; the binary inside must be
 #                                                    Developer ID signed with the hardened runtime,
 #                                                    timestamped and notarized
 #
@@ -37,8 +37,8 @@ case "$ARCH" in
   *) echo "unknown --arch $ARCH" >&2; exit 2 ;;
 esac
 
-DMG="$DIST/photocraft-$VERSION-macos-$ARCH.dmg"
-CLI_ZIP="$DIST/photocraft-cli-$VERSION-macos-$ARCH.zip"
+DMG="$DIST/silicalayr-$VERSION-macos-$ARCH.dmg"
+CLI_ZIP="$DIST/silicalayr-cli-$VERSION-macos-$ARCH.zip"
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 STRICT=0
 if [[ "$IDENTITY" != "-" ]] && [[ -n "${APPLE_ID:-}" ]] && [[ -n "${APPLE_PASSWORD:-}" ]] && [[ -n "${APPLE_TEAM_ID:-}" ]]; then
@@ -94,9 +94,9 @@ trap 'rm -rf "$WORK"' EXIT
 # ---- CLI zip -----------------------------------------------------------------------------------
 echo "==> $(basename "$CLI_ZIP")"
 ditto -x -k "$CLI_ZIP" "$WORK/cli"
-CLI="$WORK/cli/photocraft-cli-$VERSION-macos-$ARCH/photocraft-cli"
+CLI="$WORK/cli/silicalayr-cli-$VERSION-macos-$ARCH/photocraft-cli"
 if [[ ! -x "$CLI" ]]; then
-  echo "error: $(basename "$CLI_ZIP") has no executable photocraft-cli-$VERSION-macos-$ARCH/photocraft-cli" >&2
+  echo "error: $(basename "$CLI_ZIP") has no executable silicalayr-cli-$VERSION-macos-$ARCH/photocraft-cli" >&2
   exit 1
 fi
 

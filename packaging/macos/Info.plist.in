@@ -37,13 +37,13 @@
     <string>nb</string>
   </array>
   <key>CFBundleDisplayName</key>
-  <string>PhotoCraft</string>
+  <string>SilicaLayr</string>
   <key>CFBundleName</key>
-  <string>PhotoCraft</string>
+  <string>SilicaLayr</string>
   <key>CFBundleExecutable</key>
-  <string>PhotoCraft</string>
+  <string>SilicaLayr</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.storyteller.photocraft</string>
+  <string>io.github.erikerikerik.silicalayr</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>
