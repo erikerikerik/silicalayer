@@ -68,6 +68,14 @@ pub(crate) fn check(app: &mut PhotocraftApp, _ctx: &egui::Context, params: Value
 }
 
 pub(crate) fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    // Without a check service there is nothing to poll, prompt for or start: SilicaLayer has no
+    // public release feed yet and must never offer upstream's, so the desktop app builds without
+    // one and no update check or dialog happens here at all. A release that reached the status by
+    // other means (automation) is not a prompt without a service either. Phase 6 adds a signed
+    // updater against SilicaLayer's own releases.
+    if app.session.updates.check.is_none() {
+        return;
+    }
     // `updates.status` also polls (automation may consume the result before this frame).
     app.session.updates.poll();
     if let Status::Available { release } = &app.session.updates.status
@@ -90,9 +98,6 @@ pub(crate) fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
             });
         }
     }
-    if app.session.updates.check.is_none() {
-        return;
-    }
     if !app.updates_rt.startup_checked {
         app.updates_rt.startup_checked = true;
         if app.session.prefs().general.automatically_check_updates && matches!(app.session.updates.status, Status::Idle) {
@@ -109,6 +114,12 @@ pub(crate) fn show(_app: &mut PhotocraftApp, _ctx: &egui::Context) {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    // No check service (SilicaLayer has no public release feed yet, and never shows upstream's):
+    // no update dialog or newer-release card is drawn, whatever the UI state holds. Phase 6 adds
+    // the signed updater against SilicaLayer's own releases.
+    if app.session.updates.check.is_none() {
+        return;
+    }
     let mut download: Option<String> = None;
     show_download_prompt(app, ctx, &mut download);
     if SELF_UPDATE {
@@ -249,6 +260,34 @@ mod tests {
         at(&mut failed, &ctx, 172800.0);
         assert_eq!(*calls.lock().unwrap(), 1);
         assert!(!failed.ui.updates_open, "an automatic failure stays quiet");
+    }
+
+    /// Task 025: SilicaLayer builds without a check service (there is no public release feed,
+    /// and upstream LayerShop's releases must never be offered as this fork's updates). Drawing
+    /// the app for several frames then starts no check, shows no update prompt and offers no
+    /// "Check for Updates" action, even with `automatically_check_updates` on.
+    #[test]
+    fn without_a_check_service_drawing_starts_nothing_and_shows_nothing() {
+        let mut app = PhotocraftApp::new(Session::new(), Services::default());
+        app.session.edit_prefs(|p| p.general.automatically_check_updates = true);
+        let ctx = egui::Context::default();
+        for frame in 0..5 {
+            at(&mut app, &ctx, frame as f64);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
+            output.textures_delta.clear();
+        }
+        assert_eq!(app.session.updates.status, Status::Idle, "no check starts without a check service");
+        assert!(!app.ui.updates_open, "no update dialog without a check service");
+        assert!(!menus::is_enabled(&app, "help.checkForUpdates"), "no Check for Updates action without a check service");
+        // Even a release result that reached the status by another path (automation) must not
+        // open the dialog or the newer-release card while no check service is wired.
+        app.session.updates.status = Status::Available { release: Release { version: "99.0.0".into(), url: "https://example.invalid/v99.0.0".into() } };
+        at(&mut app, &ctx, 6.0);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.ui.updates_open, "no update prompt without a check service");
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(app.updates_rt.download_prompt.is_none() && !app.updates_rt.updater.prompt_open(), "no newer-release card without a check service");
     }
 
     #[test]

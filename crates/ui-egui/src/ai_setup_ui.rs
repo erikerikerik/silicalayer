@@ -232,6 +232,12 @@ fn tr(s: &str) -> &str {
     crate::i18n::t(s)
 }
 
+/// True when this host is an Apple-silicon Mac, which decides the wizard's wording: the
+/// machine is a "Mac" with unified memory there, not a "PC" with a graphics card.
+fn on_mac() -> bool {
+    RuntimePlatform::host() == Some(RuntimePlatform::MacosArm64)
+}
+
 /// Menu ids handled here.
 pub fn handles(id: &str) -> bool {
     id == OPEN
@@ -570,15 +576,16 @@ pub fn installed_files(app: &PhotocraftApp) -> Option<std::collections::BTreeMap
     serde_json::from_value(files.clone()).ok()
 }
 
-/// The wizard's models, each with its main file (the first it lists) and its download size:
-/// `[{id, name, main, size}]`, for Manage Models to offer to install a model it lists.
+/// The wizard's models, each with its main file (the first it lists), its download size and its
+/// family: `[{id, name, main, size, family}]`, for Manage Models to offer to install a model it
+/// lists, and to tell which family a managed install can fetch.
 fn catalog(app: &PhotocraftApp) -> Vec<Value> {
     let Some(manifest) = &app.ui.ai_setup.manifest else { return Vec::new() };
     list(manifest, "/models")
         .iter()
         .map(|m| {
             let main = list(m, "/files").first().map_or("", |f| text(f, "/key").rsplit('/').next().unwrap_or(""));
-            json!({"id": text(m, "/id"), "name": text(m, "/name"), "main": main, "size": download_size(number(m, "/bytes"))})
+            json!({"id": text(m, "/id"), "name": text(m, "/name"), "main": main, "size": download_size(number(m, "/bytes")), "family": text(m, "/family")})
         })
         .collect()
 }
@@ -646,7 +653,14 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         app.ui.ai_setup.probe_job = None;
                         match result {
                             Some(found) => probed(app, found),
-                            None => app.ui.ai_setup.note = tr("This PC could not be checked. Press Check Again.").to_string(),
+                            None => {
+                                app.ui.ai_setup.note = tr(if on_mac() {
+                                    "This Mac could not be checked. Press Check Again."
+                                } else {
+                                    "This PC could not be checked. Press Check Again."
+                                })
+                                .to_string();
+                            }
                         }
                     }
                     1 => {
@@ -1599,7 +1613,7 @@ fn page_checking(app: &PhotocraftApp, ui: &mut egui::Ui) {
     let area = ui.available_rect_before_wrap();
     ui.allocate_rect(area, Sense::hover());
     let painter = ui.painter_at(area);
-    let title = painter.layout_no_wrap(tr("Checking your PC").to_string(), crate::theme::semibold(20.0), t.text);
+    let title = painter.layout_no_wrap(tr(if on_mac() { "Checking your Mac" } else { "Checking your PC" }).to_string(), crate::theme::semibold(20.0), t.text);
     let sub = painter.layout(
         tr("Nothing is changed: PhotoCraft only looks at what you have.").to_string(),
         egui::FontId::proportional(13.0),
@@ -1705,7 +1719,11 @@ fn choice(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             tr("Use My ComfyUI"),
             tr("Have one this check didn't find? Connect it. Only missing model files are downloaded."),
             tr("Install New ComfyUI"),
-            tr("A private copy with its own Python, set up for PhotoCraft. Nothing else on this PC is changed."),
+            tr(if on_mac() {
+                "A private copy with its own Python, set up for PhotoCraft. Nothing else on this Mac is changed."
+            } else {
+                "A private copy with its own Python, set up for PhotoCraft. Nothing else on this PC is changed."
+            }),
         )
     };
     let area = ui.available_rect_before_wrap();
@@ -2090,9 +2108,11 @@ fn page_models(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
     ui.add_space(8.0);
     let vram = app.ui.ai_setup.probe.as_ref().and_then(|p| p.get("vramGb")).and_then(Value::as_u64);
-    // On a small card the light preset's models come first, and say why.
+    // On a small card the light preset's models come first, and say why; on an Apple-silicon
+    // Mac it is the machine's own preset that is suggested, whatever its memory.
     let for_card: Vec<String> = match text(&manifest, "/suggested") {
         "light" => list(&manifest, "/presets/light/models").iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        "apple-silicon" => list(&manifest, "/presets/apple-silicon/models").iter().filter_map(Value::as_str).map(str::to_string).collect(),
         _ => Vec::new(),
     };
     // Files this app downloaded for its own engine are its to delete again.
@@ -2141,11 +2161,24 @@ fn page_models(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 link(app, ui, &licence_note(&model), text(&model, "/licence/url"));
                 if let (true, Some(gb)) = (for_card.contains(&id), vram) {
-                    ui.label(RichText::new(format!("{} {gb} GB {}", tr("suggested for your"), tr("card"))).color(t.accent_text).size(11.5));
+                    let label = if on_mac() {
+                        format!("{} {gb} GB {}", tr("suggested for your"), tr("Mac"))
+                    } else {
+                        format!("{} {gb} GB {}", tr("suggested for your"), tr("card"))
+                    };
+                    ui.label(RichText::new(label).color(t.accent_text).size(11.5));
                 }
                 match (text(&model, "/fit"), vram) {
                     ("tooLarge", Some(gb)) => {
-                        ui.label(RichText::new(format!("{} {gb} GB", tr("too large for your card:"))).color(t.warning).size(11.5));
+                        let label = if on_mac() {
+                            format!("{} {gb} GB {}", tr("too large for this Mac's"), tr("of memory"))
+                        } else {
+                            format!("{} {gb} GB", tr("too large for your card:"))
+                        };
+                        ui.label(RichText::new(label).color(t.warning).size(11.5));
+                    }
+                    ("untested", Some(_)) if on_mac() => {
+                        ui.label(RichText::new(tr("not tested on Macs")).color(t.text_faint).size(11.5));
                     }
                     ("untested", Some(gb)) => {
                         ui.label(RichText::new(format!("{} {gb} GB {}", tr("not tested on"), tr("cards"))).color(t.text_faint).size(11.5));
@@ -2273,8 +2306,11 @@ fn hf_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 who = format!("{who} {}", tr("(access token)"));
             }
             ui.label(small(&who, t.text_dim));
-            let out = action(ui, tr("Sign out"), t.text_dim)
-                .on_hover_text(tr("Forgets the sign-in on this PC. To disconnect the app from your account too, use Connected apps on Hugging Face"));
+            let out = action(ui, tr("Sign out"), t.text_dim).on_hover_text(tr(if on_mac() {
+                "Forgets the sign-in on this Mac. To disconnect the app from your account too, use Connected apps on Hugging Face"
+            } else {
+                "Forgets the sign-in on this PC. To disconnect the app from your account too, use Connected apps on Hugging Face"
+            }));
             if out.clicked() {
                 sign_out(app);
             }
@@ -2341,8 +2377,13 @@ fn hf_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             app.ui.ai_setup.token_open = !app.ui.ai_setup.token_open;
         }
         if hf_flag(app, "found") && !signed {
-            let r = action(ui, tr("Use the sign-in found on this PC"), t.accent)
-                .on_hover_text(tr("A Hugging Face token is saved on this PC (by huggingface-cli, or in HF_TOKEN). It is used only if you click here."));
+            let r = action(ui, tr(if on_mac() { "Use the sign-in found on this Mac" } else { "Use the sign-in found on this PC" }), t.accent).on_hover_text(
+                tr(if on_mac() {
+                    "A Hugging Face token is saved on this Mac (by huggingface-cli, or in HF_TOKEN). It is used only if you click here."
+                } else {
+                    "A Hugging Face token is saved on this PC (by huggingface-cli, or in HF_TOKEN). It is used only if you click here."
+                }),
+            );
             if r.clicked() {
                 use_found(app);
             }

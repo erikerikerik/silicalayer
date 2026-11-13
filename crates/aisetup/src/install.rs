@@ -457,6 +457,107 @@ fn apply_executable_permissions(staging: &Path, executables: &[String]) -> Resul
     Ok(())
 }
 
+/// The folder an engine a repair moved out of the way sits in while its replacement unpacks:
+/// `root` with [`runtime::REPLACED`] appended to its name, beside where the engine stands.
+fn replaced_of(root: &Path) -> PathBuf {
+    let mut name = root.as_os_str().to_os_string();
+    name.push(runtime::REPLACED);
+    PathBuf::from(name)
+}
+
+/// Remove an engine set aside for a repair, when its marker says this app put it there. A folder
+/// without the marker is not this app's and stays.
+fn clear_replaced(replaced: &Path) -> Result<()> {
+    if replaced.is_dir() && runtime::read_marker(replaced).is_some() {
+        std::fs::remove_dir_all(replaced).map_err(|e| Error::Disk(format!("Could not clear the engine set aside in `{}`: {e}.", replaced.display())))?;
+    }
+    Ok(())
+}
+
+/// Put a job's engine folder right before anything else looks at it. A repair interrupted between
+/// moving the old engine aside and unpacking its replacement leaves a [`runtime::REPLACED`]
+/// folder beside the empty space the engine belongs in: the old engine goes back. Where a new
+/// engine did arrive, that one stands and the set-aside folder, marked by this app, is its to
+/// delete. A folder without the marker is not this app's and stays.
+fn recover_replaced(layout: &Layout) {
+    let replaced = replaced_of(&layout.engine_root);
+    if !replaced.is_dir() || runtime::read_marker(&replaced).is_none() {
+        return;
+    }
+    if layout.engine_root.exists() {
+        let _ = clear_replaced(&replaced);
+    } else {
+        let _ = std::fs::rename(&replaced, &layout.engine_root);
+    }
+}
+
+/// The empty file that tells Spotlight to leave a folder alone.
+const NEVER_INDEX: &str = ".metadata_never_index";
+
+/// Tell macOS to leave a folder this app can rebuild by itself alone: `tmutil addexclusion`
+/// takes it out of Time Machine's way, and an empty `.metadata_never_index` out of Spotlight's.
+/// The engine is reproducible from its pinned, checksummed archive, so both are pure cost on
+/// the ~2 GB of Python and ComfyUI it unpacks. Neither is owed the install: on a machine that
+/// has no `tmutil`, on which it refuses, or on which the marker file cannot be written, the
+/// engine works just the same - so `run`'s answer, and any write error, stop here.
+fn exclude_from_backup_and_index(dir: &Path, run: &dyn Fn(&str, &[&str]) -> bool) {
+    let path = dir.to_string_lossy();
+    run("tmutil", &["addexclusion", path.as_ref()]);
+    let _ = std::fs::write(dir.join(NEVER_INDEX), b"");
+}
+
+/// Runs a system tool with its stdin, stdout and stderr all sent away, and answers only
+/// whether it exited zero: a tool that is missing or refuses is a plain `false`, never an error.
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn run_quietly(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// In the browser there are no system tools to run, so nothing to exclude a folder with: the
+/// answer no managed install could ever need there.
+#[cfg(all(not(test), target_arch = "wasm32"))]
+fn run_quietly(_: &str, _: &[&str]) -> bool {
+    false
+}
+
+/// In tests nothing is run at all: every call is recorded for [`process_calls`] to read back
+/// and answered as [`set_process_reply`] last said. The log is process-wide because a setup
+/// runs on its worker thread and the tests run in parallel - a rig's folders live in its own
+/// tempdir, so a test only ever counts the calls that name its own.
+#[cfg(test)]
+fn run_quietly(program: &str, args: &[&str]) -> bool {
+    PROCESS_CALLS.lock().unwrap_or_else(PoisonError::into_inner).push((program.to_string(), args.iter().map(|a| a.to_string()).collect()));
+    PROCESS_REPLY.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static PROCESS_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+static PROCESS_REPLY: AtomicBool = AtomicBool::new(true);
+
+/// What a system tool answers for the rest of the test run: a fake that refuses lets a test
+/// show the install carries on without it.
+#[cfg(test)]
+fn set_process_reply(ok: bool) {
+    PROCESS_REPLY.store(ok, Ordering::SeqCst);
+}
+
+/// Every system tool call made so far, in order: the program, then its arguments.
+#[cfg(test)]
+fn process_calls() -> Vec<(String, Vec<String>)> {
+    PROCESS_CALLS.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// Unpack the runtime archive into the engine folder, then delete the archive. A marked engine
+/// already standing there is moved aside rather than deleted, so a repair that fails or is
+/// cancelled puts it back (see the body).
 fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: &dyn Fn() -> bool) -> Result<()> {
     shared.set(index, StepState::Active, "");
     let asset = job.manifest.asset(&job.choices.variant)?;
@@ -473,21 +574,53 @@ fn unpack_step(job: &Job, layout: &Layout, shared: &Shared, index: usize, stop: 
         apply_executable_permissions(staging, &asset.executables)?;
         runtime::write_marker(staging, &marker)
     };
+    // The repair of a damaged engine: this step only runs when a file of the engine is missing,
+    // and a folder carrying this app's own marker is the one an earlier unpack of this setup
+    // filled - it is the setup's to replace. Rather than delete it and hope the fresh unpack
+    // comes off, it is moved aside under a name that says this setup set it aside, so a failed
+    // or stopped repair puts the old engine straight back instead of leaving the user with none.
+    // `unpack` still refuses any non-empty folder without that marker (it did not put it there).
+    let replaced = replaced_of(&layout.engine_root);
+    if runtime::read_marker(&layout.engine_root).is_some() {
+        // One still set aside from an earlier attempt is this setup's to clear first (the job's
+        // start normally has; this also covers a repair called without one).
+        clear_replaced(&replaced)?;
+        std::fs::rename(&layout.engine_root, &replaced)
+            .map_err(|e| Error::Disk(format!("Could not move the damaged engine out of `{}` to unpack a new one: {e}.", layout.engine_root.display())))?;
+    }
     let done =
         unpack::unpack(&layout.archive, &layout.engine_root, &Limits::default(), stop, &|done, total| shared.bytes(index, done.min(total), false), &finish);
     match done {
         Ok(_) => {
+            // The new engine stands in the old one's place: what it replaced is no longer wanted.
+            let _ = clear_replaced(&replaced);
             // 2 GB the engine no longer needs.
             let _ = std::fs::remove_file(&layout.archive);
+            // And the ~2 GB it is: Python and ComfyUI the machine can lay down again from the
+            // pinned, checksummed archive, so neither Time Machine nor Spotlight is to spend
+            // itself on them. The macOS managed engine only, and a polite ask: see the helper.
+            if job.choices.platform == RuntimePlatform::MacosArm64 {
+                exclude_from_backup_and_index(&layout.engine_root, &run_quietly);
+            }
             Ok(())
         }
-        Err(Error::Archive(why)) => {
-            // Its checksum was right when it arrived: damaged since, or not what was expected.
-            // Either way the next try starts from a fresh download.
-            let _ = std::fs::remove_file(&layout.archive);
-            Err(Error::Archive(why))
+        Err(e) => {
+            // The engine that stood here goes back, as long as nothing took its place while the
+            // new one failed to arrive. Should even that fail, the next job's start finds the
+            // set-aside folder and restores it; the error stays the one this attempt hit.
+            if replaced.is_dir() && runtime::read_marker(&replaced).is_some() && !layout.engine_root.exists() {
+                let _ = std::fs::rename(&replaced, &layout.engine_root);
+            }
+            match e {
+                // Its checksum was right when it arrived: damaged since, or not what was expected.
+                // Either way the next try starts from a fresh download.
+                Error::Archive(why) => {
+                    let _ = std::fs::remove_file(&layout.archive);
+                    Err(Error::Archive(why))
+                }
+                e => Err(e),
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -495,13 +628,45 @@ fn index_of(plan: &Plan, step: &Step) -> Option<usize> {
     plan.steps.iter().position(|s| s.step == *step)
 }
 
+/// The model folders as they stand now: the engine's own folder and the user's own folders
+/// (managed), or the server's listing the wizard captured plus what has been downloaded into
+/// the server's models folder (the user's own ComfyUI). A run lists this before its first
+/// download and again after the last one to tell what it made ready.
+fn model_folders(job: &Job, layout: &Layout, managed: bool) -> BTreeMap<String, Vec<String>> {
+    let mut folders =
+        if managed { runtime::list_all_models(&layout.models_dir, &layout.extra_models) } else { job.choices.server_files.clone().unwrap_or_default() };
+    if !managed {
+        // What was downloaded into the server's models folder is there too.
+        for (folder, names) in runtime::list_models(&layout.models_dir) {
+            let have = folders.entry(folder).or_default();
+            for name in names {
+                if !have.iter().any(|f| f.rsplit(['/', '\\']).next() == Some(name.as_str())) {
+                    have.push(name);
+                }
+            }
+        }
+    }
+    folders
+}
+
 fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
-    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk)?;
     let layout = Layout::new(&job.manifest, &job.choices)?;
-    shared.set_steps(&plan);
     let managed = job.choices.route == Route::Managed;
+    // First thing, before anything reads the engine folder: an engine a repair interrupted
+    // between setting it aside and unpacking its replacement goes back, or is cleared when the
+    // replacement arrived (see [`recover_replaced`]).
+    if managed {
+        recover_replaced(&layout);
+    }
+    let plan = plan::plan(&job.manifest, &job.choices, &RealDisk)?;
+    shared.set_steps(&plan);
     shared.message("Checking the folders");
     preflight(job, &plan, &layout, env.free_space)?;
+
+    // What stands in the models folders before anything is downloaded: the test image compares
+    // readiness after the run against this to find the models this run made ready (task 028).
+    // Only a run that renders a test image asks.
+    let folders_before = index_of(&plan, &Step::Verify).is_some().then(|| model_folders(job, &layout, managed));
 
     // ----- downloads, two at a time; the engine is unpacked as soon as its archive is there -----
     let downloads: Vec<(usize, &Planned)> = plan.steps.iter().enumerate().filter(|(_, s)| s.step.is_download() && !s.done && s.skipped.is_none()).collect();
@@ -622,19 +787,7 @@ fn run(env: &Env, job: &Job, shared: &Shared) -> Result<Outcome> {
         runtime::create_data_dirs(&layout)?;
     }
     shared.message("Setting up the models");
-    let mut folders =
-        if managed { runtime::list_all_models(&layout.models_dir, &layout.extra_models) } else { job.choices.server_files.clone().unwrap_or_default() };
-    if !managed {
-        // What was just downloaded into the server's models folder is there too.
-        for (folder, names) in runtime::list_models(&layout.models_dir) {
-            let have = folders.entry(folder).or_default();
-            for name in names {
-                if !have.iter().any(|f| f.rsplit(['/', '\\']).next() == Some(name.as_str())) {
-                    have.push(name);
-                }
-            }
-        }
-    }
+    let folders = model_folders(job, &layout, managed);
     let mut settings = job.settings.clone();
     let configured = match (&launch, managed) {
         (Some(launch), true) => configure::managed(&mut settings, &job.manifest, &url, launch, &folders),
@@ -706,7 +859,27 @@ local models can only run on the processor: open this setup again and continue i
             }
             return Err(e);
         }
-        let test_model = configure::test_model(&settings, &configured.ready).filter(|m| outcome.installed.contains(&m.id) || !managed);
+        // The models this run has just made ready: whole now, and not standing whole in the
+        // folders before it started (for a model the manifest does not know: not runnable
+        // before either). The engine counts as changed when this run unpacked it - a plan that
+        // called for the unpack really did run it, as any failure returned before here - and
+        // on the processor, whose run never renders and keeps its own note for any ready model.
+        let empty = BTreeMap::new();
+        let before = folders_before.as_ref().unwrap_or(&empty);
+        let whole_before = configure::installed(&job.manifest, before);
+        let ready_before = configure::runnable(&job.settings, before);
+        let new_ids: Vec<String> = configured
+            .ready
+            .iter()
+            .filter(|id| match job.manifest.model(id) {
+                Some(_) => !whole_before.contains(id),
+                None => !ready_before.contains(id),
+            })
+            .cloned()
+            .collect();
+        let engine_changed = managed && (job.choices.cpu || plan.steps.iter().any(|s| s.step == Step::UnpackRuntime && !s.done));
+        let test_model =
+            configure::test_model(&settings, &configured.ready, &new_ids, engine_changed).filter(|m| outcome.installed.contains(&m.id) || !managed);
         match test_model {
             // On the processor these models take far too long (and too much memory) for a test.
             Some(_) if managed && job.choices.cpu => {
@@ -760,9 +933,18 @@ on the processor these models take a very long time per image, if they fit in me
                 }
             }
             None => {
-                outcome.test_error =
-                    Some("The engine is installed and running. No model was installed whole, so there was nothing to render a test image with.".into());
-                shared.set(i, StepState::Done, "No model to test with");
+                if configured.ready.is_empty() {
+                    outcome.test_error =
+                        Some("The engine is installed and running. No model was installed whole, so there was nothing to render a test image with.".into());
+                    shared.set(i, StepState::Done, "No model to test with");
+                } else {
+                    // The task 028 rule: a run that added no new model and left the engine alone
+                    // has nothing a test image could prove.
+                    outcome.test_error = Some(
+                        "The engine is installed and running. This run added no new model and left the engine as it was, so no test image was rendered.".into(),
+                    );
+                    shared.set(i, StepState::Done, "Nothing new to test");
+                }
             }
         }
     }

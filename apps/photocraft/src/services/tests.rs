@@ -217,8 +217,11 @@ fn open_filters_keep_literal_extensions_on_windows_and_macos() {
 }
 
 #[test]
-fn native_services_provide_update_transport() {
-    assert!(native(None).check_updates.is_some());
+fn native_services_wire_no_update_transport() {
+    // Task 025: SilicaLayer has no public release feed yet, and upstream LayerShop's releases
+    // must never be offered as this fork's updates, so the app builds without an update check
+    // at all. Phase 6 adds a signed updater against SilicaLayer's own releases (see `crate::updates`).
+    assert!(native(None).check_updates.is_none());
 }
 
 #[test]

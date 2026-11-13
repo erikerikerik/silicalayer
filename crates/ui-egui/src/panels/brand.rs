@@ -1,8 +1,9 @@
 //! The product's identity in the UI: its name, and the mark at the left of the title bar.
 //!
-//! This fork ships as LayerShop. The code and the translation catalogs it inherits say
-//! "PhotoCraft"; [`display`] is the one place that turns that into [`NAME`] on the way to the
-//! screen, so neither the catalogs nor upstream's strings need editing.
+//! This fork ships as SilicaLyr: a fork of LayerShop, itself a fork of PhotoCraft. The code
+//! and the translation catalogs it inherits say "PhotoCraft", and the strings this fork's own
+//! code added say "LayerShop"; [`display`] is the one place that turns either into [`NAME`] on
+//! the way to the screen, so neither the catalogs nor upstream's strings need editing.
 //!
 //! The mark is the app icon (`assets/app-icon/`, see its README), where Photoshop shows its
 //! "Ps" tile. The PNG carries the icon's rounded corners; it is decoded once per context into a
@@ -14,26 +15,34 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use egui::{Color32, Context, Id, Rect, TextureHandle, TextureOptions, Ui, pos2};
 use photocraft_codecs::{ChannelLayout, SampleType};
 
-/// The product's name as users see it.
-pub const NAME: &str = "LayerShop";
+/// The product's name as users see it. The brand is spelled without the second "e"; machine
+/// names (crates, binaries, bundle ids) keep theirs and are not this constant's business.
+pub const NAME: &str = "SilicaLyr";
 
 /// The name the UI strings and their translations were written with.
 const SOURCE_NAME: &str = "PhotoCraft";
 
-/// The credit the About window gives the project this one is built from. Shown as written: it
+/// The name the project this one forks used, kept in the strings this fork's own code added.
+const PREDECESSOR_NAME: &str = "LayerShop";
+
+/// The credit the About window gives the projects this one is built from. Shown as written: it
 /// does not pass through [`display`], which would put this build's own name in it.
-pub const BASED_ON: &str = "Based on PhotoCraft by the ArtCraft team.";
+pub const BASED_ON: &str =
+    "Built on the PhotoCraft engine by the ArtCraft team, with workflows from LayerShop by Slavomir Durej. The Apple Silicon port is SilicaLyr's own.";
 
 /// At most this many distinct strings are rewritten and kept. UI strings that name the product
 /// number in the low hundreds; the cap is for text that turns out not to be a fixed UI string.
 const MAX_RENAMED: usize = 4096;
 
-/// `s` as this build shows it: with [`NAME`] where the string names the product. Strings that
-/// don't name it come back as they are. Each distinct string that does is rewritten once and
-/// kept for the life of the process, which is what lets this hand back a plain `&str` on the
-/// path every label takes every frame.
+/// `s` as this build shows it: with [`NAME`] where the string names the product, under either
+/// name it inherits ("PhotoCraft" from upstream, "LayerShop" from the fork this one forks).
+/// Strings that don't name it come back as they are. Each distinct string that does is
+/// rewritten once and kept for the life of the process, which is what lets this hand back a
+/// plain `&str` on the path every label takes every frame.
 pub fn display(s: &str) -> &str {
-    if NAME == SOURCE_NAME || !s.contains(SOURCE_NAME) {
+    // A string naming neither predecessor, and a build whose name already is both of them,
+    // come back as they are.
+    if (!s.contains(SOURCE_NAME) && !s.contains(PREDECESSOR_NAME)) || (NAME == SOURCE_NAME && NAME == PREDECESSOR_NAME) {
         return s;
     }
     static RENAMED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
@@ -44,7 +53,7 @@ pub fn display(s: &str) -> &str {
     if renamed.len() >= MAX_RENAMED {
         return s;
     }
-    let done: &'static str = Box::leak(s.replace(SOURCE_NAME, NAME).into_boxed_str());
+    let done: &'static str = Box::leak(s.replace(SOURCE_NAME, NAME).replace(PREDECESSOR_NAME, NAME).into_boxed_str());
     renamed.insert(s.to_string(), done);
     done
 }
@@ -108,6 +117,26 @@ mod tests {
         assert!(std::ptr::eq(display(plain), plain));
         // The same string is rewritten once.
         assert!(std::ptr::eq(display("Quit PhotoCraft"), display("Quit PhotoCraft")));
+    }
+
+    #[test]
+    fn display_renames_the_inherited_and_the_fork_names() {
+        // Upstream's name, and the name the fork this one forks left in its own strings.
+        assert_eq!(display("Restart PhotoCraft"), format!("Restart {NAME}"));
+        assert_eq!(display("LayerShop setup"), format!("{NAME} setup"));
+        // A string carrying both names comes out as the product's own name throughout.
+        assert_eq!(display("PhotoCraft workflows, kept by LayerShop"), format!("{NAME} workflows, kept by {NAME}"));
+        // Untouched strings are still handed back as they are, not copied.
+        let plain = "Local AI setup";
+        assert!(std::ptr::eq(display(plain), plain));
+    }
+
+    #[test]
+    fn the_about_credit_names_every_project_in_lineage() {
+        // BASED_ON is shown as written (About ▸ General hands it to the screen directly), so
+        // `display` must not have folded its sources' names into this build's own.
+        assert!(BASED_ON.contains(SOURCE_NAME) && BASED_ON.contains(PREDECESSOR_NAME), "{BASED_ON}");
+        assert!(BASED_ON.contains(NAME), "{BASED_ON}");
     }
 
     #[test]

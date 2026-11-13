@@ -824,13 +824,33 @@ mod native {
                 // CREATE_NO_WINDOW: no console window flashes up behind the app.
                 cmd.creation_flags(0x0800_0000);
             }
-            cmd.spawn().map_err(|e| Error::Config(format!("Could not start ComfyUI (`{python}`): {e}")))
+            // Unix: its own process group, so kill_tree's group signals reach everything
+            // it starts and never the app (see spawn_in_own_group).
+            #[cfg(unix)]
+            let spawned = spawn_in_own_group(&mut cmd);
+            #[cfg(not(unix))]
+            let spawned = cmd.spawn();
+            spawned.map_err(|e| Error::Config(format!("Could not start ComfyUI (`{python}`): {e}")))
         }
     }
 
+    /// Start `cmd` as the leader of its own new process group (Unix): `kill_tree`'s group
+    /// signals then reach everything ComfyUI starts (PyTorch workers, helper `python`s) and
+    /// never the app itself — without this its children would sit in the app's own group, and
+    /// a group signal would take the app down with them.
+    #[cfg(unix)]
+    pub(super) fn spawn_in_own_group(cmd: &mut Command) -> std::io::Result<Child> {
+        use std::os::unix::process::CommandExt;
+        // 0: a new group whose id is the child's own pid, as `kill -- -<pid>` looks it up.
+        cmd.process_group(0);
+        cmd.spawn()
+    }
+
     /// End `child` and the processes it started (a virtual environment's `python.exe` on Windows
-    /// is a launcher for the real interpreter, which would otherwise live on).
-    fn kill_tree(child: &mut Child) {
+    /// is a launcher for the real interpreter, which would otherwise live on; on Unix PyTorch
+    /// workers and helper `python`s would live on holding unified memory, and a bare SIGKILL
+    /// cuts ComfyUI off before it finishes writing).
+    pub(super) fn kill_tree(child: &mut Child) {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -842,6 +862,28 @@ mod native {
                 .creation_flags(0x0800_0000)
                 .status();
         }
+        #[cfg(unix)]
+        {
+            // The managed engine is spawned in its own process group (spawn_in_own_group), so
+            // a group signal reaches its children and can never name the app's group. Ask the
+            // whole group to shut down, give it ten seconds to, then end anyone still alive.
+            let group = format!("-{}", child.id());
+            let signal = |name: &str| {
+                let _ = Command::new("/bin/kill").args([name, "--", &group]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            };
+            signal("-TERM");
+            let began = std::time::Instant::now();
+            while began.elapsed() < Duration::from_secs(10) {
+                // The group's leader is gone (or cannot be polled): waiting is over.
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            signal("-KILL");
+        }
+        // Already dead after the group's SIGKILL on Unix; this ends only the child itself
+        // elsewhere. Either way, reap it so nothing of it is left.
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1650,6 +1692,126 @@ File \"C:\\e\\ComfyUI\\main.py\", line 254 in <module>\n";
             // No such process on the test machine: the arguments are still reported.
             let found = find_running(&up, "http://127.0.0.1:1").unwrap();
             assert_eq!(found.args, "main.py --enable-manager");
+        }
+
+        /// Does `/bin/kill -0` still find the process (a not-yet-reaped zombie counts)?
+        #[cfg(unix)]
+        fn alive(pid: u32) -> bool {
+            use std::process::{Command, Stdio};
+            Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+
+        /// Is the process gone for good? A killed child can be a zombie that `kill -0` still
+        /// finds for a moment before the system clears it away.
+        #[cfg(unix)]
+        fn gone_within(pid: u32, within: std::time::Duration) -> bool {
+            let began = std::time::Instant::now();
+            loop {
+                if !alive(pid) {
+                    return true;
+                }
+                if began.elapsed() >= within {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        /// The process group of `pid` (`ps -o pgid=`).
+        #[cfg(unix)]
+        fn group_of(pid: u32) -> Option<u32> {
+            let out = std::process::Command::new("ps").args(["-o", "pgid=", "-p", &pid.to_string()]).output().ok()?;
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        }
+
+        /// A small `/bin/sh` started exactly the way the managed engine is — through this
+        /// module's own `spawn_in_own_group` — that reacts to SIGTERM as told, records its
+        /// child `sleep`'s pid in `recorded`, and waits for it. An empty `term_action` means
+        /// SIGTERM is ignored, a disposition the `sleep` inherits.
+        #[cfg(unix)]
+        fn stand_in_shell(term_action: &str, recorded: &std::path::Path) -> std::process::Child {
+            use std::process::{Command, Stdio};
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(format!("trap '{term_action}' TERM; sleep 30 & echo $! > '{}'; wait", recorded.display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            super::super::native::spawn_in_own_group(&mut cmd).unwrap()
+        }
+
+        /// The pid of the stand-in's `sleep`, once it has written it.
+        #[cfg(unix)]
+        fn recorded_pid(recorded: &std::path::Path) -> u32 {
+            let began = std::time::Instant::now();
+            loop {
+                if let Ok(text) = std::fs::read_to_string(recorded)
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    return pid;
+                }
+                assert!(began.elapsed() < std::time::Duration::from_secs(10), "the stand-in never wrote `{}`", recorded.display());
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        #[cfg(unix)]
+        fn spawn_stand_in(name: &str, term_action: &str) -> (std::process::Child, std::path::PathBuf, u32) {
+            let recorded = std::env::temp_dir().join(format!("silica-stop-{name}-{}.pid", std::process::id()));
+            let _ = std::fs::remove_file(&recorded);
+            let child = stand_in_shell(term_action, &recorded);
+            let worker = recorded_pid(&recorded);
+            (child, recorded, worker)
+        }
+
+        /// The managed engine shuts its whole process group down gracefully: what it started
+        /// (here a `sleep`) goes with it instead of being orphaned and holding memory — a lone
+        /// SIGKILL to the Python process left it running for its full 30 seconds.
+        #[cfg(unix)]
+        #[test]
+        fn a_graceful_stop_sweeps_the_whole_process_group() {
+            let (mut child, recorded, worker) = spawn_stand_in("term", "exit 0");
+            let shell = child.id();
+            super::super::native::kill_tree(&mut child);
+            assert!(!alive(shell), "the stand-in outlived its stop");
+            assert!(gone_within(worker, std::time::Duration::from_secs(12)), "the sleep the group started survived the stop");
+            let _ = std::fs::remove_file(recorded);
+        }
+
+        /// A stand-in that ignores the group's SIGTERM (and `trap '' TERM` is an ignore, so its
+        /// `sleep` inherits it) is ended by the SIGKILL fallback, and the stop still returns on
+        /// its own within about twelve seconds.
+        #[cfg(unix)]
+        #[test]
+        fn a_stop_falls_back_to_sigkilling_the_group() {
+            let (mut child, recorded, worker) = spawn_stand_in("kill", "");
+            let shell = child.id();
+            let began = std::time::Instant::now();
+            super::super::native::kill_tree(&mut child);
+            let took = began.elapsed();
+            assert!(took < std::time::Duration::from_secs(12), "the stop waited {took:?} instead of falling back to SIGKILL");
+            assert!(!alive(shell), "the stand-in that ignores SIGTERM outlived its stop");
+            assert!(gone_within(worker, std::time::Duration::from_secs(5)), "the sleep that ignores SIGTERM survived the fallback");
+            let _ = std::fs::remove_file(recorded);
+        }
+
+        /// The engine starts in a process group of its own: a group signal aimed at it can
+        /// never reach the app.
+        #[cfg(unix)]
+        #[test]
+        fn the_engine_starts_in_a_process_group_of_its_own() {
+            let (mut child, recorded, _) = spawn_stand_in("pgid", "exit 0");
+            let group = group_of(child.id());
+            let ours = group_of(std::process::id());
+            super::super::native::kill_tree(&mut child);
+            let _ = std::fs::remove_file(recorded);
+            assert!(group.is_some_and(|group| ours.is_some_and(|ours| group != ours)), "the stand-in's group {group:?} is the test's own {ours:?}");
         }
     }
 }

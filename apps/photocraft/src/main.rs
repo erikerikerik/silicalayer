@@ -351,6 +351,11 @@ fn main() -> eframe::Result {
     photocraft_engine::malloc_tuning::apply();
     // Then, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
+    // SilicaLyr's own macOS data folder: move it out of the `LayerShop` name this fork used
+    // before the rebrand, once, before anything reads settings — the first `app_dirs::current`
+    // caches the folder for the rest of the run.
+    #[cfg(target_os = "macos")]
+    app_dirs::migrate_macos_data_dir();
     crash_guard::install_hook();
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(done) = craft_update::self_update::finish(&photocraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {

@@ -78,7 +78,7 @@ pub fn scan(settings: &mut Settings, folders: &BTreeMap<String, Vec<String>>) ->
 }
 
 /// The local models of `settings` that `folders` has the main file of.
-fn runnable(settings: &Settings, folders: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+pub(crate) fn runnable(settings: &Settings, folders: &BTreeMap<String, Vec<String>>) -> Vec<String> {
     settings.models.iter().filter(|m| m.provider.is_local() && m.enabled && detect::on_server(folders, m)).map(|m| m.id.clone()).collect()
 }
 
@@ -131,10 +131,19 @@ pub fn existing(settings: &mut Settings, manifest: &Manifest, url: &str, launch:
     out
 }
 
-/// The model the test image is rendered with: the first the panel offers that the setup made
-/// runnable and that generates from a prompt alone.
-pub fn test_model<'a>(settings: &'a Settings, ready: &[String]) -> Option<&'a Model> {
-    settings.models.iter().find(|m| m.provider.is_local() && m.enabled && m.can_generate() && ready.contains(&m.id))
+/// The model the test image is rendered with. A test image proves what this run changed: it
+/// tests a model the run has just made ready - the first id in `new_ids` (in settings order)
+/// that the panel offers, is runnable and generates from a prompt alone. With no new model, a
+/// run that installed, replaced or repaired the engine (`engine_changed`) still proves that,
+/// with the first ready model as before; a run that added nothing and left the engine alone
+/// has nothing to prove, and renders no test image at all.
+pub fn test_model<'a>(settings: &'a Settings, ready: &[String], new_ids: &[String], engine_changed: bool) -> Option<&'a Model> {
+    let offered = |m: &Model| m.provider.is_local() && m.enabled && m.can_generate() && ready.contains(&m.id);
+    settings
+        .models
+        .iter()
+        .find(|m| offered(m) && new_ids.contains(&m.id))
+        .or_else(|| engine_changed.then(|| settings.models.iter().find(|m| offered(m))).flatten())
 }
 
 #[cfg(test)]
@@ -176,7 +185,8 @@ mod tests {
         assert_eq!(s.models.len(), Settings::default().models.len());
         // Cloud models are not the engine's business.
         assert_eq!(s.models.iter().filter(|m| !m.provider.is_local()).cloned().collect::<Vec<_>>(), cloud_before);
-        assert_eq!(test_model(&s, &done.ready).map(|m| m.id.as_str()), Some("qwen-image-2-1"));
+        // A fresh install makes its one model new, and the engine new: it is the test image's model.
+        assert_eq!(test_model(&s, &done.ready, &["qwen-image-2-1".to_string()], true).map(|m| m.id.as_str()), Some("qwen-image-2-1"));
     }
 
     #[test]
@@ -260,7 +270,31 @@ mod tests {
         assert_eq!((done.added, done.repaired), (0, 1));
         assert_eq!((s.models.len(), s.models[0].family, s.models[0].id.as_str(), s.models[0].name.as_str()), (1, Family::QwenImage21, "old", "my qwen"));
         // No model can render the test image when none is ready.
-        assert!(test_model(&s, &[]).is_none());
+        assert!(test_model(&s, &[], &[], true).is_none());
         assert!(scan(&mut Settings::default(), &BTreeMap::new()) == Configured::default());
+    }
+
+    /// The bug of task 028: a user who already has Z-Image Turbo adds MOSS Image and got
+    /// another Z-Image Turbo render - the first ready model in settings order - while the
+    /// new model was never tested.
+    #[test]
+    fn the_test_image_tests_the_model_the_run_just_added() {
+        let mut s = Settings::default();
+        let done = managed(&mut s, manifest(), "http://127.0.0.1:8190", &launch(), &folders(&["z-image-turbo", "moss-image"]));
+        assert_eq!(done.ready, ["z-image-turbo", "moss-image"]);
+        // This run made MOSS Image ready (Z-Image Turbo was there before): MOSS Image is tested.
+        assert_eq!(test_model(&s, &done.ready, &["moss-image".to_string()], false).map(|m| m.id.as_str()), Some("moss-image"));
+        // Even with the engine changed, a new model comes first.
+        assert_eq!(test_model(&s, &done.ready, &["moss-image".to_string()], true).map(|m| m.id.as_str()), Some("moss-image"));
+    }
+
+    #[test]
+    fn a_run_that_added_nothing_and_touched_nothing_renders_no_test_image() {
+        let mut s = Settings::default();
+        let done = managed(&mut s, manifest(), "http://127.0.0.1:8190", &launch(), &folders(&["z-image-turbo", "moss-image"]));
+        // Nothing new, the engine as it was: there is nothing a test image could prove.
+        assert!(test_model(&s, &done.ready, &[], false).is_none());
+        // The same run with the engine repaired still renders, with the first ready model.
+        assert_eq!(test_model(&s, &done.ready, &[], true).map(|m| m.id.as_str()), Some("z-image-turbo"));
     }
 }
