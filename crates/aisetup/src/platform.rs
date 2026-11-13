@@ -6,7 +6,44 @@
 //! probe ([`crate::probe::Probe::variant`], [`crate::probe::Probe::can_install`])
 //! and the platform's own readiness, which is tracked in `docs/ai-setup.md`.
 
+use std::cell::Cell;
+
 use serde::{Deserialize, Serialize};
+
+// Test-only stand-in for [`RuntimePlatform::host`], set by
+// [`override_host_for_tests`]. The outer `Option` says whether an override is
+// installed at all; the inner one is the answer to report (`Some(None)` lets a
+// test pretend the machine has no managed build). Thread-local, so an override
+// never leaks into another thread's view of the host. An ordinary comment, not
+// a doc comment: rustdoc documents nothing on a `thread_local!` invocation, and
+// the gate denies `unused_doc_comments`.
+thread_local! {
+    static HOST_OVERRIDE: Cell<Option<Option<RuntimePlatform>>> = const { Cell::new(None) };
+}
+
+/// Answers [`RuntimePlatform::host`] with `host` until the returned guard drops,
+/// which restores whatever this thread saw before. `#[doc(hidden)]` and never
+/// called by production code: it exists so setup tests can check both the
+/// Windows and the macOS answers on one gate machine. The guard is per-thread,
+/// so tests that spawn worker threads calling `host()` must not use it.
+#[doc(hidden)]
+#[must_use = "the host override ends as soon as this guard drops"]
+pub fn override_host_for_tests(host: Option<RuntimePlatform>) -> HostOverride {
+    let previous = HOST_OVERRIDE.with(|cell| cell.replace(Some(host)));
+    HostOverride { previous }
+}
+
+/// Restores the previous host answer when dropped. See [`override_host_for_tests`].
+#[doc(hidden)]
+pub struct HostOverride {
+    previous: Option<Option<RuntimePlatform>>,
+}
+
+impl Drop for HostOverride {
+    fn drop(&mut self) {
+        HOST_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
 
 /// Launch platforms known to this setup: Windows portable build and macOS ARM64 managed runtime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +86,12 @@ impl RuntimePlatform {
     /// targets): setup must offer the externally-managed route instead, never
     /// plan or download a build for another platform.
     pub fn host() -> Option<Self> {
-        Self::host_from(std::env::consts::OS, std::env::consts::ARCH)
+        // Only ever answered when a test installs one; production sees `None`
+        // here and the real host facts decide, exactly as before.
+        match HOST_OVERRIDE.with(|cell| cell.get()) {
+            Some(answer) => answer,
+            None => Self::host_from(std::env::consts::OS, std::env::consts::ARCH),
+        }
     }
 
     /// The pure platform decision behind [`RuntimePlatform::host`], taking the
@@ -239,6 +281,30 @@ mod tests {
         assert_eq!(RuntimePlatform::host_from("linux", "aarch64"), None);
         // The live call must agree with the pure rule for this machine's own facts.
         assert_eq!(RuntimePlatform::host(), RuntimePlatform::host_from(std::env::consts::OS, std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn host_override_answers_the_host_call_until_the_guard_drops() {
+        let real = RuntimePlatform::host();
+        let win = Some(RuntimePlatform::WindowsPortable);
+        let mac = Some(RuntimePlatform::MacosArm64);
+        {
+            let _first = override_host_for_tests(win);
+            assert_eq!(RuntimePlatform::host(), win, "the override answers while it is installed");
+            {
+                // Guards nest: the inner answer applies, and the outer one returns when it drops.
+                let _second = override_host_for_tests(mac);
+                assert_eq!(RuntimePlatform::host(), mac);
+                {
+                    // An override can even pretend the machine has no managed build.
+                    let _third = override_host_for_tests(None);
+                    assert_eq!(RuntimePlatform::host(), None);
+                }
+                assert_eq!(RuntimePlatform::host(), mac, "the inner guard restores the outer answer");
+            }
+            assert_eq!(RuntimePlatform::host(), win, "dropping a guard restores the previous answer");
+        }
+        assert_eq!(RuntimePlatform::host(), real, "the real host returns once every guard has dropped");
     }
 
     #[test]

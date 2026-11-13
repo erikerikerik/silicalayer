@@ -63,49 +63,55 @@ fn the_wizard_is_in_the_file_menu_of_the_desktop_app_only() {
 
 #[test]
 fn opening_fills_in_the_folders_and_the_recommended_models() {
-    let (mut app, dir) = app(demo::Scale::Real);
-    open(&mut app);
-    let s = &app.ui.ai_setup;
-    assert!(s.open && s.page == Page::Pc && !s.existing);
-    assert_eq!(s.engine_dir, dir.path().join("engine").to_string_lossy());
-    assert_eq!(s.models_dir, dir.path().join("models").to_string_lossy());
-    // An Apple-silicon Mac opens on its own preset (task 015); everywhere else Recommended does.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let want = ("apple-silicon", vec!["z-image-turbo".to_string()]);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let want = ("recommended", vec!["qwen-image-2-1".to_string(), "z-image-turbo".to_string(), "flux-3-klein".to_string()]);
-    assert_eq!((s.preset.as_str(), s.models.clone()), want);
-    assert!(s.probe_job.is_none(), "an answer that is there is not asked for again");
-    // The presets: ticking by hand names the preset that results, or none. From the recommended
-    // trio, whatever this host opened on.
-    app.ui.ai_setup.models = preset_models(&app, "recommended");
-    name_preset(&mut app);
-    assert_eq!(app.ui.ai_setup.preset, "recommended");
-    toggle_model(&mut app, "flux-3-klein", false);
-    toggle_model(&mut app, "z-image-turbo", false);
-    assert_eq!(app.ui.ai_setup.preset, "starter");
-    toggle_model(&mut app, "krea-2-turbo", true);
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.len()), ("custom", 2));
-    toggle_model(&mut app, "krea-2-turbo", true);
-    assert_eq!(app.ui.ai_setup.models.len(), 2, "ticked once");
-    // Every screen draws, in every state it has here.
-    let c = ctx();
-    for existing in [false, true] {
-        app.ui.ai_setup.existing = existing;
-        for page in Page::ALL {
-            app.ui.ai_setup.page = page;
-            draw(&mut app, &c);
+    // A machine opens as the platform it is. Each pass opens the wizard as if this computer
+    // were one host, so the gate checks both answers wherever it runs.
+    for host in [RuntimePlatform::WindowsPortable, RuntimePlatform::MacosArm64] {
+        let _host = photocraft_aisetup::platform::override_host_for_tests(Some(host));
+        let (mut app, dir) = app(demo::Scale::Real);
+        open(&mut app);
+        let s = &app.ui.ai_setup;
+        assert!(s.open && s.page == Page::Pc && !s.existing);
+        assert_eq!(s.engine_dir, dir.path().join("engine").to_string_lossy());
+        assert_eq!(s.models_dir, dir.path().join("models").to_string_lossy());
+        // An Apple-silicon Mac opens on its own preset (task 015); a PC opens on Recommended.
+        let want = if host == RuntimePlatform::MacosArm64 {
+            ("apple-silicon", vec!["z-image-turbo".to_string()])
+        } else {
+            ("recommended", vec!["qwen-image-2-1".to_string(), "z-image-turbo".to_string(), "flux-3-klein".to_string()])
+        };
+        assert_eq!((s.preset.as_str(), s.models.clone()), want);
+        assert!(s.probe_job.is_none(), "an answer that is there is not asked for again");
+        // The presets: ticking by hand names the preset that results, or none. From the recommended
+        // trio, whatever this host opened on.
+        app.ui.ai_setup.models = preset_models(&app, "recommended");
+        name_preset(&mut app);
+        assert_eq!(app.ui.ai_setup.preset, "recommended");
+        toggle_model(&mut app, "flux-3-klein", false);
+        toggle_model(&mut app, "z-image-turbo", false);
+        assert_eq!(app.ui.ai_setup.preset, "starter");
+        toggle_model(&mut app, "krea-2-turbo", true);
+        assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.len()), ("custom", 2));
+        toggle_model(&mut app, "krea-2-turbo", true);
+        assert_eq!(app.ui.ai_setup.models.len(), 2, "ticked once");
+        // Every screen draws, in every state it has here.
+        let c = ctx();
+        for existing in [false, true] {
+            app.ui.ai_setup.existing = existing;
+            for page in Page::ALL {
+                app.ui.ai_setup.page = page;
+                draw(&mut app, &c);
+            }
         }
+        // The plan for the choices was asked of the engine, and names what is left out.
+        app.ui.ai_setup.existing = false;
+        app.ui.ai_setup.page = Page::Models;
+        app.ui.ai_setup.models = preset_models(&app, "recommended");
+        draw(&mut app, &c);
+        let plan = app.ui.ai_setup.plan.clone().unwrap();
+        assert_eq!(plan["models"].as_array().unwrap().iter().filter(|m| !m["skipped"].is_null()).count(), 1, "FLUX.3 Klein needs a sign-in");
+        assert!(plan["downloadBytes"].as_u64().unwrap() > 30_000_000_000);
+        assert!(!dir.path().join("engine").exists(), "looking changes nothing");
     }
-    // The plan for the choices was asked of the engine, and names what is left out.
-    app.ui.ai_setup.existing = false;
-    app.ui.ai_setup.page = Page::Models;
-    app.ui.ai_setup.models = preset_models(&app, "recommended");
-    draw(&mut app, &c);
-    let plan = app.ui.ai_setup.plan.clone().unwrap();
-    assert_eq!(plan["models"].as_array().unwrap().iter().filter(|m| !m["skipped"].is_null()).count(), 1, "FLUX.3 Klein needs a sign-in");
-    assert!(plan["downloadBytes"].as_u64().unwrap() > 30_000_000_000);
-    assert!(!dir.path().join("engine").exists(), "looking changes nothing");
 }
 
 /// A machine with little memory starts on the preset suggested for it: Light on a small card,
@@ -113,47 +119,46 @@ fn opening_fills_in_the_folders_and_the_recommended_models() {
 /// answered when the wizard opens or answers after; a selection the user made stays theirs.
 #[test]
 fn a_small_card_starts_on_the_suggested_preset() {
-    let small = |dir: &std::path::Path| {
-        let mut found = demo::probe(dir);
-        found["vramGb"] = json!(8);
-        found
-    };
-    // What an 8 GB machine opens on: Light below the card rule, the Apple-silicon set on a Mac.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let (want, want_first) = ("apple-silicon", "z-image-turbo");
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let (want, want_first) = ("light", "moss-image");
-    let want_models = vec![want_first.to_string()];
-    let (mut app, dir) = app(demo::Scale::Real);
-    app.ui.ai_setup.probe = Some(small(dir.path()));
-    open(&mut app);
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models.clone()));
-    assert_eq!(list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models")[0]["id"], want_first);
-    let c = ctx();
-    app.ui.ai_setup.page = Page::Models;
-    draw(&mut app, &c);
-    assert_eq!(app.ui.ai_setup.plan.as_ref().unwrap()["models"][0]["id"], want_first);
+    // A machine starts as the platform it is. Each pass runs the wizard as if this computer
+    // were one host, so the gate checks both answers wherever it runs.
+    for host in [RuntimePlatform::WindowsPortable, RuntimePlatform::MacosArm64] {
+        let _host = photocraft_aisetup::platform::override_host_for_tests(Some(host));
+        let small = |dir: &std::path::Path| {
+            let mut found = demo::probe(dir);
+            found["vramGb"] = json!(8);
+            found
+        };
+        // What an 8 GB machine opens on: Light below the card rule, the Apple-silicon set on a Mac.
+        let (want, want_first) = if host == RuntimePlatform::MacosArm64 { ("apple-silicon", "z-image-turbo") } else { ("light", "moss-image") };
+        let want_models = vec![want_first.to_string()];
+        let (mut app, dir) = app(demo::Scale::Real);
+        app.ui.ai_setup.probe = Some(small(dir.path()));
+        open(&mut app);
+        assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models.clone()));
+        assert_eq!(list(app.ui.ai_setup.manifest.as_ref().unwrap(), "/models")[0]["id"], want_first);
+        let c = ctx();
+        app.ui.ai_setup.page = Page::Models;
+        draw(&mut app, &c);
+        assert_eq!(app.ui.ai_setup.plan.as_ref().unwrap()["models"][0]["id"], want_first);
 
-    // Opened before the probe answered: Recommended on a card that is not known to be small,
-    // until the answer comes — on a Mac the answer was never the question, and its own preset
-    // stands either way.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let before = "apple-silicon";
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let before = "recommended";
-    let (mut app, dir) = app_without_probe();
-    open(&mut app);
-    assert_eq!(app.ui.ai_setup.preset, before);
-    probed(&mut app, small(dir.path()));
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models));
+        // Opened before the probe answered: Recommended on a card that is not known to be small,
+        // until the answer comes — on a Mac the answer was never the question, and its own preset
+        // stands either way.
+        let before = if host == RuntimePlatform::MacosArm64 { "apple-silicon" } else { "recommended" };
+        let (mut app, dir) = app_without_probe();
+        open(&mut app);
+        assert_eq!(app.ui.ai_setup.preset, before);
+        probed(&mut app, small(dir.path()));
+        assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), (want, want_models));
 
-    // Ticked by hand first: the answer changes nothing.
-    let (mut app, dir) = app_without_probe();
-    open(&mut app);
-    toggle_model(&mut app, "krea-2-turbo", true);
-    let chosen = app.ui.ai_setup.models.clone();
-    probed(&mut app, small(dir.path()));
-    assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), ("custom", chosen));
+        // Ticked by hand first: the answer changes nothing.
+        let (mut app, dir) = app_without_probe();
+        open(&mut app);
+        toggle_model(&mut app, "krea-2-turbo", true);
+        let chosen = app.ui.ai_setup.models.clone();
+        probed(&mut app, small(dir.path()));
+        assert_eq!((app.ui.ai_setup.preset.as_str(), app.ui.ai_setup.models.clone()), ("custom", chosen));
+    }
 }
 
 /// [`app`] before this PC was looked at.
@@ -503,7 +508,6 @@ fn galleys<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a str>) {
 
 /// Painted text of the checking screen, drawn directly: through `window` the job poll would
 /// end the stand-in look before its first frame.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn checking_words(app: &PhotocraftApp, c: &egui::Context) -> String {
     let mut out = c.run_ui(Default::default(), |ui| page_checking(app, ui));
     // A fresh context's first frame uploads the font atlas; egui panics if that delta is dropped.
@@ -515,68 +519,99 @@ fn checking_words(app: &PhotocraftApp, c: &egui::Context) -> String {
     texts.join("\n")
 }
 
-/// On an Apple-silicon Mac the wizard talks about the machine as a Mac with unified memory,
-/// never as a PC with a graphics card: the checking screen, its failure note, the install card
-/// and the Hugging Face sign-in rows say "Mac", the model rows suggest and discount memory in
-/// gigabytes ("suggested for your 24 GB Mac"), and an untested model says it is not tested on
-/// Macs. The fits come through `ai.setup.manifest` for the demo machine's 24 GB, as a Mac sees
-/// them. Gated like the tests that keep the Windows wording, which every host checks unchanged.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// The wizard talks about the machine as what it is: an Apple-silicon Mac as a Mac with
+/// unified memory, a PC as a PC with a graphics card: the checking screen, its failure note
+/// and the install card name the machine, the model rows suggest and discount memory in
+/// gigabytes ("suggested for your 24 GB Mac", "…your 24 GB card"), and an untested model
+/// says it is not tested there. The fits come through `ai.setup.manifest` for the demo
+/// machine's 24 GB, as that host sees them. Each pass runs as one host, so the gate checks
+/// both wordings wherever it runs. The shipped manifest has no model with a known minimum
+/// above 24 GB, and for a PC 24 GB is neither small nor untested: the rows that would show
+/// those answers are set on the list by hand, so one machine shows every kind of row.
 #[test]
-fn the_mac_wording_says_mac_not_pc() {
-    let (mut app, dir) = app_without_probe();
-    let c = ctx();
-    // The first look, while it runs: the checking screen's own title.
-    app.ui.ai_setup.probe_job = Some(u64::MAX);
-    open(&mut app);
-    assert!(first_look(&app), "the checking screen only shows while the first look runs");
-    let words = checking_words(&app, &c);
-    assert!(words.contains("Checking your Mac"), "the checking screen says Mac:\n{words}");
-    // The check answering with nothing: the job poll ends it and its note blames the Mac.
-    app.ui.ai_setup.probe_job = Some(u64::MAX);
-    let words = drawn_words(&mut app, &c);
-    assert_eq!(app.ui.ai_setup.note, "This Mac could not be checked. Press Check Again.");
-    assert!(words.contains("This Mac could not be checked. Press Check Again."), "the failure note says Mac:\n{words}");
-    // What this machine offers: the install card promises not to touch the rest of the Mac.
-    app.ui.ai_setup.note.clear();
-    app.ui.ai_setup.probe = Some(demo::probe(dir.path()));
-    let words = drawn_words(&mut app, &c);
-    assert!(words.contains("Nothing else on this Mac is changed."), "the install card says Mac:\n{words}");
-    // The model rows speak of the Mac's memory. Their fits come from the engine for these
-    // 24 GB; the shipped manifest has no model with a known minimum above them, so the
-    // tooLarge answer is set on the list by hand to show that wording too.
-    refresh_manifest(&mut app);
-    if let Some(models) = app.ui.ai_setup.manifest.as_mut().and_then(|m| m["models"].as_array_mut()) {
-        for model in models {
-            if model["id"] == "flux-3-klein" {
-                model["fit"] = json!("tooLarge");
+fn the_wording_names_the_machine_mac_or_pc() {
+    for host in [RuntimePlatform::WindowsPortable, RuntimePlatform::MacosArm64] {
+        let _host = photocraft_aisetup::platform::override_host_for_tests(Some(host));
+        let mac = host == RuntimePlatform::MacosArm64;
+        let (mut app, dir) = app_without_probe();
+        let c = ctx();
+        // The first look, while it runs: the checking screen's own title names the machine.
+        app.ui.ai_setup.probe_job = Some(u64::MAX);
+        open(&mut app);
+        assert!(first_look(&app), "the checking screen only shows while the first look runs");
+        let words = checking_words(&app, &c);
+        assert!(words.contains(if mac { "Checking your Mac" } else { "Checking your PC" }), "the checking screen names the machine:\n{words}");
+        // The check answering with nothing: the job poll ends it and its note blames the machine.
+        app.ui.ai_setup.probe_job = Some(u64::MAX);
+        let words = drawn_words(&mut app, &c);
+        let failure = if mac { "This Mac could not be checked. Press Check Again." } else { "This PC could not be checked. Press Check Again." };
+        assert_eq!(app.ui.ai_setup.note, failure);
+        assert!(words.contains(failure), "the failure note names the machine:\n{words}");
+        // What this machine offers: the install card promises not to touch the rest of it.
+        app.ui.ai_setup.note.clear();
+        app.ui.ai_setup.probe = Some(demo::probe(dir.path()));
+        let words = drawn_words(&mut app, &c);
+        let install_card = if mac { "Nothing else on this Mac is changed." } else { "Nothing else on this PC is changed." };
+        assert!(words.contains(install_card), "the install card names the machine:\n{words}");
+        // The model rows speak of the Mac's memory or the PC's card. Their fits come from the
+        // engine for these 24 GB: on a Mac only the Apple-silicon preset is `tested`; on a PC
+        // 24 GB cards have run everything. The tooLarge row is set by hand for both hosts,
+        // and on a PC the small-card answers (suggested by the light preset, and one model
+        // left untested) are set by hand too, so the PC shows the same kinds of row.
+        refresh_manifest(&mut app);
+        if let Some(m) = app.ui.ai_setup.manifest.as_mut() {
+            if !mac {
+                m["suggested"] = json!("light");
+            }
+            if let Some(models) = m["models"].as_array_mut() {
+                for model in models {
+                    if model["id"] == "flux-3-klein" {
+                        model["fit"] = json!("tooLarge");
+                    }
+                    if !mac && model["id"] == "moss-image" {
+                        model["fit"] = json!("untested");
+                    }
+                }
+            }
+        }
+        let fit = |id: &str| {
+            let m = app.ui.ai_setup.manifest.clone().unwrap_or_default();
+            list(&m, "/models").iter().find(|x| x["id"] == id).and_then(|x| x["fit"].as_str()).unwrap_or_default().to_string()
+        };
+        let want = if mac { ("tested", "untested") } else { ("tested", "tested") };
+        assert_eq!(
+            (fit("z-image-turbo").as_str(), fit("qwen-image-2-1").as_str()),
+            want,
+            "each host tests only what its own rule has run, whatever the cards say"
+        );
+        app.ui.ai_setup.page = Page::Models;
+        app.ui.ai_setup.existing = false;
+        toggle_model(&mut app, "flux-3-klein", true);
+        let _ = drawn_words(&mut app, &c); // asks the plan; its access check answers once
+        // A saved Hugging Face token offers itself as the sign-in found on this machine.
+        app.ui.ai_setup.hf = Some(json!({"signedIn": false, "found": true, "user": "", "via": "", "canSignIn": true}));
+        app.ui.ai_setup.access_key = access_key(&app);
+        let words = drawn_words(&mut app, &c);
+        if mac {
+            assert!(words.contains("suggested for your 24 GB Mac"), "a suggested model names the Mac:\n{words}");
+            assert!(words.contains("too large for this Mac's 24 GB of memory"), "a model that needs more blames the Mac's memory");
+            assert!(words.contains("not tested on Macs"), "an untested model says Macs");
+            // The found-token row ("Use the sign-in found on this Mac") draws only once the gated model's
+            // access check has answered, which this offline test can't arrange; its Mac wording is a plain
+            // `on_mac()` choice beside the rows checked here.
+            assert!(!words.contains("your card") && !words.contains("this PC"), "no card or PC wording on the rows: {words}");
+        } else {
+            assert!(words.contains("suggested for your 24 GB card"), "a suggested model names the card:\n{words}");
+            assert!(words.contains("too large for your card: 24 GB"), "a model that needs more blames the card");
+            assert!(words.contains("not tested on 24 GB cards"), "an untested model says cards");
+            // The PC counterpart of the Mac row above. "Machine" is not a Mac wording, so the
+            // check names the phrases only a Mac page uses, not the bare word.
+            let lower = words.to_lowercase();
+            for phrase in ["this mac", "your mac", "on macs", "gb mac", "mac's"] {
+                assert!(!lower.contains(phrase), "no Mac wording on the rows: {words}");
             }
         }
     }
-    let fit = |id: &str| {
-        let m = app.ui.ai_setup.manifest.clone().unwrap_or_default();
-        list(&m, "/models").iter().find(|x| x["id"] == id).and_then(|x| x["fit"].as_str()).unwrap_or_default().to_string()
-    };
-    assert_eq!(
-        (fit("z-image-turbo").as_str(), fit("qwen-image-2-1").as_str()),
-        ("tested", "untested"),
-        "a Mac tests only the Apple-silicon preset, whatever the cards say"
-    );
-    app.ui.ai_setup.page = Page::Models;
-    app.ui.ai_setup.existing = false;
-    toggle_model(&mut app, "flux-3-klein", true);
-    let _ = drawn_words(&mut app, &c); // asks the plan; its access check answers once
-    // A saved Hugging Face token offers itself as the sign-in found on this Mac.
-    app.ui.ai_setup.hf = Some(json!({"signedIn": false, "found": true, "user": "", "via": "", "canSignIn": true}));
-    app.ui.ai_setup.access_key = access_key(&app);
-    let words = drawn_words(&mut app, &c);
-    assert!(words.contains("suggested for your 24 GB Mac"), "a suggested model names the Mac:\n{words}");
-    assert!(words.contains("too large for this Mac's 24 GB of memory"), "a model that needs more blames the Mac's memory");
-    assert!(words.contains("not tested on Macs"), "an untested model says Macs");
-    // The found-token row ("Use the sign-in found on this Mac") draws only once the gated model's
-    // access check has answered, which this offline test can't arrange; its Mac wording is a plain
-    // `on_mac()` choice beside the rows checked here.
-    assert!(!words.contains("your card") && !words.contains("this PC"), "no card or PC wording on the rows: {words}");
 }
 
 /// A Mac below the unified-memory floor is recommended cloud models on the first screen: the

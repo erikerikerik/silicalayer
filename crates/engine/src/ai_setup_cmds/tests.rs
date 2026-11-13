@@ -172,60 +172,68 @@ mod native {
 
     #[test]
     fn without_the_desktop_app_nothing_installs_and_everything_answers() {
-        let mut s = Session::new();
-        for id in ["ai.setup.probe", "ai.setup.plan", "ai.setup.start", "ai.setup.repair", "ai.setup.remove"] {
-            let e = s.execute(id, json!({"models": ["qwen-image-2-1"], "engine": true})).unwrap_err().to_string();
-            assert!(e.contains("needs the desktop app"), "{id}: {e}");
-            assert!(!s.is_enabled(id), "{id}");
+        // A machine answers as the platform it is. Each pass runs the whole flow as if this
+        // computer were one host, so the gate checks both answers wherever it runs.
+        for host in [photocraft_aisetup::platform::RuntimePlatform::WindowsPortable, photocraft_aisetup::platform::RuntimePlatform::MacosArm64] {
+            let _host = photocraft_aisetup::platform::override_host_for_tests(Some(host));
+            let apple = host == photocraft_aisetup::platform::RuntimePlatform::MacosArm64;
+            let mut s = Session::new();
+            for id in ["ai.setup.probe", "ai.setup.plan", "ai.setup.start", "ai.setup.repair", "ai.setup.remove"] {
+                let e = s.execute(id, json!({"models": ["qwen-image-2-1"], "engine": true})).unwrap_err().to_string();
+                assert!(e.contains("needs the desktop app"), "{id}: {e}");
+                assert!(!s.is_enabled(id), "{id}");
+            }
+            // What can be installed is no secret: the bundled manifest, with its totals.
+            // An Apple-silicon Mac suggests its own preset whatever the memory; an overridden
+            // host answers as that platform, so both rules are checked wherever the test runs.
+            let m = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
+            assert_eq!(m["comfy"]["version"], "0.43.0");
+            assert_eq!(m["models"].as_array().unwrap().len(), 10);
+            assert_eq!(
+                (m["presets"]["starter"]["bytes"].as_u64(), m["presets"]["recommended"]["models"].as_array().map(Vec::len)),
+                (Some(18_520_930_264), Some(3))
+            );
+            let qwen = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "qwen-image-2-1").unwrap();
+            // It has been run on 24 GB cards; on a Mac only the Apple-silicon preset is ever
+            // `tested`, so this one is `untested` there whatever the memory.
+            let qwen_fit = if apple { "untested" } else { "tested" };
+            assert_eq!(
+                (qwen["id"].as_str(), qwen["installed"].as_bool(), qwen["fit"].as_str(), qwen["licence"]["commercial"].as_bool()),
+                (Some("qwen-image-2-1"), Some(false), Some(qwen_fit), Some(false))
+            );
+            // Each says which ComfyUI it needs: FIBO 2 the one the setup installs. It is offered, not
+            // ticked: no preset but Everything has it.
+            assert_eq!(qwen["minComfy"], "0.37.0");
+            let fibo = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "fibo-2-dev").unwrap();
+            assert_eq!(
+                (fibo["minComfy"].as_str(), fibo["licence"]["commercial"].as_bool(), fibo["gated"].as_bool()),
+                (Some("0.43.0"), Some(false), Some(false))
+            );
+            for preset in ["light", "starter", "recommended"] {
+                assert!(!m["presets"][preset]["models"].as_array().unwrap().iter().any(|id| id == "fibo-2-dev"), "{preset}");
+            }
+            // The Apple-silicon preset holds the one model qualified on MPS, everywhere the
+            // manifest ships; only a Mac is suggested to start on it.
+            assert_eq!(m["presets"]["apple-silicon"]["models"], json!(["z-image-turbo"]));
+            assert_eq!(m["suggested"], if apple { "apple-silicon" } else { "recommended" });
+            // A smaller card than any it has run on: not tested, and it says so instead of guessing.
+            // It starts on the light preset, its model listed first — on an Apple-silicon Mac on
+            // its own preset instead, first too, whatever the memory.
+            let small = s.execute("ai.setup.manifest", json!({"vramGb": 8})).unwrap();
+            let want = if apple { ("apple-silicon", "z-image-turbo") } else { ("light", "moss-image") };
+            assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some(want.0), Some(want.1)));
+            assert_eq!(small["presets"]["light"]["models"], json!(["moss-image"]));
+            let moss = small["models"].as_array().unwrap().iter().find(|x| x["id"] == "moss-image").unwrap();
+            assert_eq!(moss["fit"], "untested");
+            assert_eq!(small["models"][1]["id"], "qwen-image-2-1");
+            let unknown = s.execute("ai.setup.manifest", json!({})).unwrap();
+            let want = if apple { "apple-silicon" } else { "recommended" };
+            assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some(want), Some("untested")));
+            let status = s.execute("ai.setup.status", json!({})).unwrap();
+            assert_eq!((status["available"].as_bool(), status["state"].as_str(), status["running"].as_bool()), (Some(false), Some("none"), Some(false)));
+            assert_eq!(s.execute("ai.setup.cancel", json!({})).unwrap()["stopping"], false);
+            assert!(!poll(&mut s) && s.ai_setup.seq() == 0 && s.ai_setup.last().is_none());
         }
-        // What can be installed is no secret: the bundled manifest, with its totals.
-        // An Apple-silicon Mac suggests its own preset whatever the memory; the test runs on
-        // the machine it is checked out on, so that decides which rule the answers follow.
-        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-        let m = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
-        assert_eq!(m["comfy"]["version"], "0.43.0");
-        assert_eq!(m["models"].as_array().unwrap().len(), 10);
-        assert_eq!(
-            (m["presets"]["starter"]["bytes"].as_u64(), m["presets"]["recommended"]["models"].as_array().map(Vec::len)),
-            (Some(18_520_930_264), Some(3))
-        );
-        let qwen = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "qwen-image-2-1").unwrap();
-        // It has been run on 24 GB cards; on a Mac only the Apple-silicon preset is ever
-        // `tested`, so this one is `untested` there whatever the memory.
-        let qwen_fit = if apple { "untested" } else { "tested" };
-        assert_eq!(
-            (qwen["id"].as_str(), qwen["installed"].as_bool(), qwen["fit"].as_str(), qwen["licence"]["commercial"].as_bool()),
-            (Some("qwen-image-2-1"), Some(false), Some(qwen_fit), Some(false))
-        );
-        // Each says which ComfyUI it needs: FIBO 2 the one the setup installs. It is offered, not
-        // ticked: no preset but Everything has it.
-        assert_eq!(qwen["minComfy"], "0.37.0");
-        let fibo = m["models"].as_array().unwrap().iter().find(|x| x["id"] == "fibo-2-dev").unwrap();
-        assert_eq!((fibo["minComfy"].as_str(), fibo["licence"]["commercial"].as_bool(), fibo["gated"].as_bool()), (Some("0.43.0"), Some(false), Some(false)));
-        for preset in ["light", "starter", "recommended"] {
-            assert!(!m["presets"][preset]["models"].as_array().unwrap().iter().any(|id| id == "fibo-2-dev"), "{preset}");
-        }
-        // The Apple-silicon preset holds the one model qualified on MPS, everywhere the
-        // manifest ships; only a Mac is suggested to start on it.
-        assert_eq!(m["presets"]["apple-silicon"]["models"], json!(["z-image-turbo"]));
-        assert_eq!(m["suggested"], if apple { "apple-silicon" } else { "recommended" });
-        // A smaller card than any it has run on: not tested, and it says so instead of guessing.
-        // It starts on the light preset, its model listed first — on an Apple-silicon Mac on
-        // its own preset instead, first too, whatever the memory.
-        let small = s.execute("ai.setup.manifest", json!({"vramGb": 8})).unwrap();
-        let want = if apple { ("apple-silicon", "z-image-turbo") } else { ("light", "moss-image") };
-        assert_eq!((small["suggested"].as_str(), small["models"][0]["id"].as_str()), (Some(want.0), Some(want.1)));
-        assert_eq!(small["presets"]["light"]["models"], json!(["moss-image"]));
-        let moss = small["models"].as_array().unwrap().iter().find(|x| x["id"] == "moss-image").unwrap();
-        assert_eq!(moss["fit"], "untested");
-        assert_eq!(small["models"][1]["id"], "qwen-image-2-1");
-        let unknown = s.execute("ai.setup.manifest", json!({})).unwrap();
-        let want = if apple { "apple-silicon" } else { "recommended" };
-        assert_eq!((unknown["suggested"].as_str(), unknown["models"][0]["fit"].as_str()), (Some(want), Some("untested")));
-        let status = s.execute("ai.setup.status", json!({})).unwrap();
-        assert_eq!((status["available"].as_bool(), status["state"].as_str(), status["running"].as_bool()), (Some(false), Some("none"), Some(false)));
-        assert_eq!(s.execute("ai.setup.cancel", json!({})).unwrap()["stopping"], false);
-        assert!(!poll(&mut s) && s.ai_setup.seq() == 0 && s.ai_setup.last().is_none());
     }
 
     /// On an Apple-silicon Mac the card numbers in the manifest say nothing about unified
@@ -263,12 +271,20 @@ mod native {
         assert_eq!(fit(z, Some(8), win, &apple), "untested");
         assert_eq!(fit(&big, Some(24), win, &apple), "tooLarge");
         assert_eq!((fit(z, Some(24), None, &apple), fit(z, Some(24), win, &[])), ("tested", "tested"));
-        // The same through the command, on the machine the test runs on.
+        // The same through the command, which asks the host itself. Each pass answers as if
+        // this computer were one host, so both fit rules are checked wherever the test runs.
         let mut s = Session::new();
-        let v = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
-        let want = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { (Some("tested"), Some("untested")) } else { (Some("tested"), Some("tested")) };
-        let got = |id: &str| v["models"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap()["fit"].as_str();
-        assert_eq!((got("z-image-turbo"), got("qwen-image-2-1")), want);
+        for host in [photocraft_aisetup::platform::RuntimePlatform::WindowsPortable, photocraft_aisetup::platform::RuntimePlatform::MacosArm64] {
+            let _host = photocraft_aisetup::platform::override_host_for_tests(Some(host));
+            let v = s.execute("ai.setup.manifest", json!({"vramGb": 24})).unwrap();
+            let want = if host == photocraft_aisetup::platform::RuntimePlatform::MacosArm64 {
+                (Some("tested"), Some("untested"))
+            } else {
+                (Some("tested"), Some("tested"))
+            };
+            let got = |id: &str| v["models"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap()["fit"].as_str();
+            assert_eq!((got("z-image-turbo"), got("qwen-image-2-1")), want, "{host:?} with 24 GB");
+        }
     }
 
     /// Task 017: the diagnostics report reads only: a session with no setup env, no record, no
