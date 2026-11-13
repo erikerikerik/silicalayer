@@ -37,13 +37,13 @@
     <string>nb</string>
   </array>
   <key>CFBundleDisplayName</key>
-  <string>SilicaLayr</string>
+  <string>SilicaLyr</string>
   <key>CFBundleName</key>
-  <string>SilicaLayr</string>
+  <string>SilicaLyr</string>
   <key>CFBundleExecutable</key>
-  <string>SilicaLayr</string>
+  <string>SilicaLyr</string>
   <key>CFBundleIdentifier</key>
-  <string>io.github.erikerikerik.silicalayr</string>
+  <string>io.github.erikerikerik.silicalyr</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>

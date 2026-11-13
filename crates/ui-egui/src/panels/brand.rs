@@ -1,6 +1,6 @@
 //! The product's identity in the UI: its name, and the mark at the left of the title bar.
 //!
-//! This fork ships as SilicaLayr: a fork of LayerShop, itself a fork of PhotoCraft. The code
+//! This fork ships as SilicaLyr: a fork of LayerShop, itself a fork of PhotoCraft. The code
 //! and the translation catalogs it inherits say "PhotoCraft", and the strings this fork's own
 //! code added say "LayerShop"; [`display`] is the one place that turns either into [`NAME`] on
 //! the way to the screen, so neither the catalogs nor upstream's strings need editing.
@@ -17,7 +17,7 @@ use photocraft_codecs::{ChannelLayout, SampleType};
 
 /// The product's name as users see it. The brand is spelled without the second "e"; machine
 /// names (crates, binaries, bundle ids) keep theirs and are not this constant's business.
-pub const NAME: &str = "SilicaLayr";
+pub const NAME: &str = "SilicaLyr";
 
 /// The name the UI strings and their translations were written with.
 const SOURCE_NAME: &str = "PhotoCraft";
@@ -28,7 +28,7 @@ const PREDECESSOR_NAME: &str = "LayerShop";
 /// The credit the About window gives the projects this one is built from. Shown as written: it
 /// does not pass through [`display`], which would put this build's own name in it.
 pub const BASED_ON: &str =
-    "Built on the PhotoCraft engine by the ArtCraft team, with workflows from LayerShop by Slavomir Durej. The Apple Silicon port is SilicaLayr's own.";
+    "Built on the PhotoCraft engine by the ArtCraft team, with workflows from LayerShop by Slavomir Durej. The Apple Silicon port is SilicaLyr's own.";
 
 /// At most this many distinct strings are rewritten and kept. UI strings that name the product
 /// number in the low hundreds; the cap is for text that turns out not to be a fixed UI string.
