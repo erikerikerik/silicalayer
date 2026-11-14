@@ -2,10 +2,12 @@ SilicaLayer app icon (silicalayer-1024.png, silicalayer-mac-1024.png, silicalaye
 silicalayer-small-tile.svg and every file derived from them in this directory:
 photocraft-1024.png, photocraft.icns, photocraft.ico, silicalayer-mark-128.png, hicolor/).
 
-Original artwork for SilicaLayer: a glowing crystal on three translucent layers. The crystal art
-was supplied by Erik Kristianson for this project; the simplified small-size drawing (the two
-SVGs) was drawn for SilicaLayer to match it. No third-party material. It replaces LayerShop's
-icon in this fork. Licensed like the rest of the project, under either of
+The SilicaLayer app icon: a glowing crystal on three translucent layers. The crystal art is by
+erikerikerik. He drew the first version; ChatGPT (an AI image generator) polished it; he edited
+that result and art-directed corrections; ChatGPT polished those edits. The Mac tile and the
+simplified small-size drawings (the two SVGs) were then made for SilicaLayer with Claude to
+match it. It replaces LayerShop's icon in this fork. Licensed like the rest of the project, to
+the extent it is covered by copyright, under either of
 
   * Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
   * MIT license (https://opensource.org/licenses/MIT)
