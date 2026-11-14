@@ -18,6 +18,7 @@ fi
 grep -F 'QUARANTINED="$STATE/quarantined"' "$ROOT/automation/silica-agent" >/dev/null
 # shellcheck disable=SC2016
 grep -F 'task_failure "gate failed after $MAX_REPAIRS repairs' "$ROOT/automation/silica-agent" >/dev/null
+grep -F 'format_changed "$RUN_LOG/format-$attempt.log"' "$ROOT/automation/silica-agent" >/dev/null
 grep -F 'status) status;;' "$ROOT/automation/silica-agent" >/dev/null
 grep -F 'cargo build -p photocraft' "$ROOT/automation/gate" >/dev/null
 printf 'runner checks passed\n'

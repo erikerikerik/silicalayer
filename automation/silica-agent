@@ -204,6 +204,18 @@ run_gate() {
   out=$1
   (cd "$ROOT" && /usr/bin/perl -e '$t = shift @ARGV; alarm $t; exec @ARGV' "$GATE_TIMEOUT" /bin/sh "$ROOT/$GATE") > "$out" 2>&1
 }
+format_changed() {
+  # Reformat only the Rust files this task changed, with the same rustfmt the gate checks with
+  # (same PATH order as automation/gate), so a layout-only miss never costs a repair round.
+  (
+    cd "$ROOT" || exit 0
+    PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    export PATH
+    changed=$(git diff --name-only --diff-filter=ACM HEAD -- '*.rs'; git ls-files --others --exclude-standard -- '*.rs')
+    # shellcheck disable=SC2086
+    [ -z "$changed" ] || rustfmt --edition 2024 --config skip_children=true $changed
+  ) > "$1" 2>&1 || true
+}
 secret_scan() {
   if git -C "$ROOT" diff --cached -U0 | grep -E '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,})' >/dev/null; then
     task_failure "possible secret detected in staged diff"
@@ -235,6 +247,7 @@ one_run() {
   attempt=0
   while :; do
     checkpoint gate "$attempt"
+    format_changed "$RUN_LOG/format-$attempt.log"
     if run_gate "$RUN_LOG/gate-$attempt.log"; then
       break
     fi
@@ -255,6 +268,7 @@ one_run() {
     task_failure "review changed supervisor policy, task definitions, or CI"
   fi
   checkpoint final-gate 0
+  format_changed "$RUN_LOG/format-final.log"
   run_gate "$RUN_LOG/final-gate.log" || task_failure "post-review gate failed; see $RUN_LOG"
   [ -n "$(git -C "$ROOT" status --porcelain)" ] || task_failure "task produced no change"
   git -C "$ROOT" add -A
