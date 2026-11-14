@@ -643,6 +643,17 @@ pub static CATALOG: &[(&[&str], &str, Option<&str>, &str)] = &[
     (&["Filter", "Other…"], "Maximum…", None, "filter.other.maximum"),
     (&["Filter", "Other…"], "Minimum…", None, "filter.other.minimum"),
     (&["Filter", "Other…"], "Offset…", None, "filter.other.offset"),
+    // AI: our top-level menu for the generative features (Photoshop's tree has no counterpart),
+    // between Filter and View. `ai.setup.open` is deliberately absent: ai_setup_ui::insert_menu_items
+    // adds it to the File menu with its dynamic label (Set Up Local AI… / Local AI Setup…) and
+    // skips that insertion once the id appears anywhere in the tree, so a second entry here would
+    // take it out of File and show a static label in its place.
+    (&["AI"], "Generate Image…", None, "ai.menu.create"),
+    (&["AI"], "Inpaint Selection…", None, "ai.menu.inpaint"),
+    (&["AI"], "Restyle Layer…", None, "ai.menu.restyle"),
+    (&["AI"], "---", None, "---"),
+    (&["AI"], "Style Presets…", None, "ai.menu.styles"),
+    (&["AI"], "Generative AI…", None, "edit.preferences.generativeAi"),
     (&["View", "Proof Setup"], "Custom…", None, "view.proofSetup.custom"),
     (&["View", "Proof Setup"], "---", None, "---"),
     (&["View", "Proof Setup"], "Working CMYK", None, "view.proofSetup.workingCmyk"),

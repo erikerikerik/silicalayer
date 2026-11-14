@@ -50,8 +50,8 @@ pub(crate) fn modal_allows(app: &PhotocraftApp, id: &str) -> bool {
     (app.ui.dialogs.is_empty() && app.ui.layers_panel_dialog.is_none() && app.discard.is_none()) || crate::shortcuts::NAV_COMMANDS.contains(&id)
 }
 
-/// Top-level menus in Photoshop order.
-pub const TOP_MENUS: [&str; 10] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"];
+/// Top-level menus in Photoshop order, with our AI menu between Filter and View.
+pub const TOP_MENUS: [&str; 11] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "AI", "View", "Window", "Help"];
 
 /// UI-level commands (handled by the shell rather than the engine): id, label, menu, shortcut.
 /// The table is the engine's ([`photocraft_engine::shell_commands::SHELL_COMMANDS`]), so the

@@ -6,8 +6,9 @@
 //! Mnemonics are underlined while Alt is held, the bar is focused or a menu was opened from the
 //! keyboard; a menu opened with the mouse shows none until Alt is pressed, as Windows does.
 //! They are assigned per menu level from the labels as shown (so translated), unique within
-//! the level: Photoshop's letters for the top menus where the label has them (F E I L Y S T V
-//! W H), else the first unused letter, word starts first. Only ASCII letters and digits are keys
+//! the level: Photoshop's letters for the top menus where the label has them (F E I L Y S T
+//! A V W H — the A is our AI menu's), else the first unused letter, word starts first. Only
+//! ASCII letters and digits are keys
 //! the keyboard reports as such, so a label without one (Japanese, Chinese…) shows its English
 //! label's letter after it, as Windows menus do in those languages: "文件(F)" ([`localized`]).
 //!
@@ -18,8 +19,9 @@ use egui::{Color32, Event, Id, Key, Modifiers, Stroke, Ui};
 
 use crate::menu_nav::Nav;
 
-/// Photoshop's mnemonics for the top menus (Windows), used where the shown label has the letter.
-pub const TOP_PREFERRED: [(&str, char); 10] = [
+/// Photoshop's mnemonics for the top menus (Windows), used where the shown label has the letter;
+/// the AI menu (not one of Photoshop's) prefers A, the letter its label leads with.
+pub const TOP_PREFERRED: [(&str, char); 11] = [
     ("File", 'F'),
     ("Edit", 'E'),
     ("Image", 'I'),
@@ -27,6 +29,7 @@ pub const TOP_PREFERRED: [(&str, char); 10] = [
     ("Type", 'Y'),
     ("Select", 'S'),
     ("Filter", 'T'),
+    ("AI", 'A'),
     ("View", 'V'),
     ("Window", 'W'),
     ("Help", 'H'),
@@ -458,9 +461,9 @@ mod tests {
 
     #[test]
     fn letters_are_unique_and_prefer_photoshop_s() {
-        let labels = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"];
+        let labels = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "AI", "View", "Window", "Help"];
         let preferred: Vec<Option<char>> = TOP_PREFERRED.iter().map(|(_, c)| Some(*c)).collect();
-        assert_eq!(assign(&labels, &preferred), "FEILYSTVWH".chars().map(Some).collect::<Vec<_>>());
+        assert_eq!(assign(&labels, &preferred), "FEILYSTAVWH".chars().map(Some).collect::<Vec<_>>());
         // Items: first letters first, then the next free letter of the word starts, then any.
         assert_eq!(
             assign(&["New…", "Open…", "Open Recent", "Close", "Close All", "Save", "Save As…"], &[]),

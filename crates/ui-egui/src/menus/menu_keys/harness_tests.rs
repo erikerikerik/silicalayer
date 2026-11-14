@@ -60,7 +60,7 @@ fn alt_focuses_the_bar_arrows_move_and_down_opens_the_lit_menu() {
     assert_eq!(Keys::current(&h.ctx).focus, Some(1), "→ moves to Edit");
     key(&mut h, egui::Key::ArrowLeft);
     key(&mut h, egui::Key::ArrowLeft);
-    assert_eq!(Keys::current(&h.ctx).focus, Some(9), "← wraps round to Help");
+    assert_eq!(Keys::current(&h.ctx).focus, Some(10), "← wraps round to Help");
     key(&mut h, egui::Key::ArrowRight);
     key(&mut h, egui::Key::ArrowRight);
     assert_eq!(Keys::current(&h.ctx).focus, Some(1));
@@ -616,7 +616,10 @@ fn a_menu_opened_while_typing_a_zoom_takes_its_keys() {
     assert!(crate::zoom_field::is_focused(&h.ctx), "the zoom field kept the keyboard");
     h.key_press(egui::Key::ArrowRight);
     h.run_steps(5);
-    assert!(h.query_by_label_contains("Zoom In").is_some(), "→ moved to View");
+    assert!(h.query_by_label_contains("Generate Image…").is_some(), "→ moved to AI");
+    h.key_press(egui::Key::ArrowRight);
+    h.run_steps(5);
+    assert!(h.query_by_label_contains("Zoom In").is_some(), "→ moved on to View");
     let row = Nav::current(&h.ctx).rows.first().and_then(|l| l.iter().find(|r| r.command.as_deref() == Some("view.zoomIn")).cloned());
     let c = row.and_then(|r| r.mnemonic).expect("Zoom In has a mnemonic");
     let zoom = h.state().0.ui.views[0].zoom;

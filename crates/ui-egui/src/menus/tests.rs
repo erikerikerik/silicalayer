@@ -129,6 +129,45 @@ fn color_to_alpha_sits_in_filter_other_after_offset() {
     assert!(!others.iter().any(|p| p.as_str() == "Other"), "no duplicate Other submenu: {others:?}");
 }
 
+/// The AI menu: between Filter and View, in the order the task gives, live throughout.
+#[test]
+fn ai_menu_sits_between_filter_and_view_with_live_items() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    let items = menu_items(&app);
+    let first = |top: &str| items.iter().position(|i| i.path.first().is_some_and(|p| p == top)).expect("menu");
+    let last = |top: &str| items.iter().rposition(|i| i.path.first().is_some_and(|p| p == top)).expect("menu");
+    assert!(last("Filter") < first("AI") && last("AI") < first("View"), "the AI menu must sit between Filter and View");
+    let labels: Vec<&str> = items.iter().filter(|i| i.path.first().is_some_and(|p| p == "AI")).map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, ["Generate Image…", "Inpaint Selection…", "Restyle Layer…", "---", "Style Presets…", "Generative AI…"]);
+    for (id, path) in [
+        ("ai.menu.create", ["AI"].as_slice()),
+        ("ai.menu.inpaint", ["AI"].as_slice()),
+        ("ai.menu.restyle", ["AI"].as_slice()),
+        ("ai.menu.styles", ["AI"].as_slice()),
+        ("edit.preferences.generativeAi", ["Edit", "Preferences"].as_slice()),
+    ] {
+        let item = items.iter().find(|i| i.id == id && i.path == path).unwrap_or_else(|| panic!("{id} missing from {:?}", path.join(" ▸ ")));
+        assert!(item.enabled, "{id} is live");
+        assert!(item.shortcut.is_none(), "{id} has no default shortcut");
+        assert!(is_live(id), "{id}");
+    }
+}
+
+/// AI ▸ Inpaint Selection… greys with no selection to inpaint, and comes back with one.
+#[test]
+fn inpaint_selection_follows_the_selection() {
+    let enabled = |app: &PhotocraftApp| app.session.active().is_some_and(|st| st.doc.selection.is_some());
+    let inpaint = |app: &PhotocraftApp| menu_items(app).into_iter().find(|i| i.id == "ai.menu.inpaint").unwrap().enabled;
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    assert!(!inpaint(&app), "no document: nothing to inpaint");
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    assert!(!inpaint(&app), "no selection: greyed");
+    app.run("select.rect", json!({"x": 4, "y": 4, "width": 8, "height": 8})).unwrap();
+    assert!(inpaint(&app), "a selection: live");
+    assert_eq!(inpaint(&app), enabled(&app));
+}
+
 #[test]
 fn menu_bar_labels_have_horizontal_padding_and_open_menus() {
     use egui_kittest::{Harness, kittest::Queryable};

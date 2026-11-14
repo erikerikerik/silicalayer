@@ -121,6 +121,38 @@ fn the_window_menu_item_shows_the_tab_and_reports_it() {
     assert_eq!(crate::dock::Group::Properties.tabs(true).get(TAB), Some(&"AI Gen"));
 }
 
+/// AI ▸ Generate Image… / Inpaint Selection… / Restyle Layer… / Style Presets…: each shows the
+/// panel on its tab and reports the mode; Inpaint follows the selection for its enabled state.
+#[test]
+fn the_ai_menu_items_show_the_panel_on_their_tabs() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    for (id, mode, want) in [
+        (MENU_CREATE, Mode::Create, "create"),
+        (MENU_INPAINT, Mode::Inpaint, "inpaint"),
+        (MENU_RESTYLE, Mode::Restyle, "restyle"),
+        (MENU_STYLES, Mode::Restyle, "restyle"),
+    ] {
+        assert!(crate::menus::is_live(id), "{id}");
+        assert!(crate::menu_catalog::CATALOG.iter().any(|m| m.3 == id && m.0 == ["AI"]), "{id} lives in the AI menu");
+        app.ui.panels.properties = false;
+        app.ui.ai_gen.mode = Mode::Create;
+        let r = crate::menus::invoke(&mut app, &ctx, id, json!({})).unwrap();
+        assert_eq!((app.ui.panels.properties, app.ui.dock_tabs.properties, app.ui.ai_gen.mode), (true, TAB, mode), "{id}");
+        assert_eq!(r["mode"].as_str(), Some(want), "{id}");
+    }
+    // The selection rule, as menu_items applies it to AI ▸ Inpaint Selection…: off with no
+    // document or selection, on with one; the other three are always live.
+    assert!(!is_enabled(&app, MENU_INPAINT), "no document");
+    app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+    assert!(!is_enabled(&app, MENU_INPAINT), "no selection");
+    app.run("select.rect", json!({"x": 4, "y": 4, "width": 8, "height": 8})).unwrap();
+    assert!(is_enabled(&app, MENU_INPAINT), "a selection");
+    for id in [PANEL, MENU_CREATE, MENU_RESTYLE, MENU_STYLES] {
+        assert!(is_enabled(&app, id), "{id} is not the selection's prisoner");
+    }
+}
+
 #[test]
 fn themes_that_float_properties_get_a_floating_panel() {
     let mut app = app();

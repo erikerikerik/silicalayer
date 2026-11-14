@@ -48,7 +48,7 @@ fn moved_items_leave_their_old_menus() {
     assert!(!ids(&by("Help").children).contains(&"help.about".to_string()));
     assert!(!ids(&by("Edit").children).contains(&"[Preferences]".to_string()));
     let titles: Vec<&str> = l.bar.menus.iter().map(|m| m.title.as_str()).collect();
-    assert_eq!(titles, [APP_NAME, "File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"]);
+    assert_eq!(titles, [APP_NAME, "File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "AI", "View", "Window", "Help"]);
 }
 
 /// PhotoCraft keeps Photoshop's ⌘H, ⌘M, ⌘W and ⌘, (Hide Layers): the system items give way.

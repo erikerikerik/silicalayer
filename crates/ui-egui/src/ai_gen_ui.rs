@@ -35,6 +35,14 @@ pub const PANEL: &str = "window.panel.aiGen";
 pub const LOAD_PROMPT: &str = "window.panel.aiGen.loadPrompt";
 /// How many images Generate makes: `{"count": 1..10}`, the batch menu beside it.
 pub const BATCH_MENU: &str = "window.panel.aiGen.batch";
+/// AI ▸ Generate Image…: the panel on the Create tab.
+pub const MENU_CREATE: &str = "ai.menu.create";
+/// AI ▸ Inpaint Selection…: the panel on the Inpaint tab; enabled with a selection.
+pub const MENU_INPAINT: &str = "ai.menu.inpaint";
+/// AI ▸ Restyle Layer…: the panel on the Restyle tab.
+pub const MENU_RESTYLE: &str = "ai.menu.restyle";
+/// AI ▸ Style Presets…: the Restyle tab, where the style strip is.
+pub const MENU_STYLES: &str = "ai.menu.styles";
 /// The tab's position in the Properties dock group (Properties | Adjustments | AI Gen).
 pub const TAB: usize = 2;
 /// The engine command the panel runs.
@@ -368,7 +376,13 @@ fn tr(s: &str) -> &str {
 
 /// Menu ids handled here (live menu items).
 pub fn handles(id: &str) -> bool {
-    id == PANEL
+    id == PANEL || matches!(id, MENU_CREATE | MENU_INPAINT | MENU_RESTYLE | MENU_STYLES)
+}
+
+/// AI ▸ Inpaint Selection… runs on the selection, so it lives only when the active document has
+/// one; the other ids this module handles open the panel and are always live.
+pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
+    id != MENU_INPAINT || app.session.active().is_some_and(|st| st.doc.selection.is_some())
 }
 
 /// The theme docks the Properties group (Pro); the others float the panel over the canvas.
@@ -417,6 +431,20 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
             None => active_layer(app).ok_or_else(|| "no active layer".to_string()),
         };
         return Some(layer.map(|layer| json!({"loaded": load_prompt(app, layer)})));
+    }
+    // AI ▸ Generate Image… / Inpaint Selection… / Restyle Layer… / Style Presets…: show the panel
+    // on the tab that does it. No prompt-box focus to ask for: the panel has no such mechanism.
+    if matches!(id, MENU_CREATE | MENU_INPAINT | MENU_RESTYLE | MENU_STYLES) {
+        let mode = match id {
+            MENU_INPAINT => Mode::Inpaint,
+            MENU_RESTYLE | MENU_STYLES => Mode::Restyle,
+            _ => Mode::Create,
+        };
+        app.ui.ai_gen.mode = mode;
+        if let Some(r) = menu(app, PANEL, &json!({"show": true})) {
+            return Some(r.and(Ok(json!({"mode": mode.label().to_lowercase()}))));
+        }
+        return None;
     }
     if id != PANEL {
         return None;

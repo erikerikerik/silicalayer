@@ -104,6 +104,12 @@ pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
     }
     crate::plugin_ui::insert_menu_items(app, &mut items);
     crate::ai_setup_ui::insert_menu_items(app, &mut items);
+    // AI ▸ Inpaint Selection… greys when there is no selection to inpaint: ai_gen_ui says so,
+    // and this is where a menu item's enabled state is decided (crate::menus::is_enabled keeps
+    // its ids live so clicks and search treat them as implemented commands).
+    if let Some(item) = items.iter_mut().find(|i| i.id == crate::ai_gen_ui::MENU_INPAINT) {
+        item.enabled &= crate::ai_gen_ui::is_enabled(app, &item.id);
+    }
     if let Some(mask) = app.session.active().and_then(|s| s.active_layer.and_then(|id| s.doc.layer(id))).and_then(|l| l.mask.as_ref())
         && let Some(item) = items.iter_mut().find(|i| i.id == "layer.layerMask.enabled")
     {
