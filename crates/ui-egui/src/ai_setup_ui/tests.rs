@@ -43,7 +43,8 @@ fn the_wizard_is_in_the_file_menu_of_the_desktop_app_only() {
     assert_eq!((items[at].label.as_str(), items[at].path.clone(), items[at].enabled), ("Set Up Local AI\u{2026}", vec!["File".to_string()], true));
     // A group of its own, above File Info.
     assert_eq!((items[at - 1].id.as_str(), items[at + 1].id.as_str(), items[at + 2].id.as_str()), ("---", "---", "file.fileInfo"));
-    assert_eq!(items.iter().filter(|i| i.id == OPEN).count(), 1);
+    // Once here, and once in the AI menu (task 039).
+    assert_eq!(items.iter().filter(|i| i.id == OPEN).count(), 2);
     assert!(crate::menus::is_live(OPEN));
     // Chosen from the menu, it opens on the first screen.
     let c = ctx();
@@ -59,6 +60,39 @@ fn the_wizard_is_in_the_file_menu_of_the_desktop_app_only() {
     assert!(!item.enabled);
     assert!(crate::menus::invoke(&mut without, &c, OPEN, json!({})).unwrap_err().contains("desktop app"));
     assert!(!without.ui.ai_setup.open);
+}
+
+/// AI ▸ also lists Local AI Setup… (task 039): the same item, with the same label and enabled
+/// state, directly after Style Presets… and right before Generative AI….
+#[test]
+fn the_wizard_is_in_the_ai_menu_too_between_styles_and_preferences() {
+    let (app, _dir) = app(demo::Scale::Small);
+    let items = crate::menus::menu_items(&app);
+    let at: Vec<usize> = items.iter().enumerate().filter(|(_, i)| i.id == OPEN).map(|(n, _)| n).collect();
+    assert_eq!(at.len(), 2, "once under File, once under AI");
+    let (file, ai) = (&items[at[0]], &items[at[1]]);
+    assert_eq!(file.path, ["File"]);
+    assert_eq!(ai.path, ["AI"]);
+    for item in [file, ai] {
+        assert_eq!(item.label, "Set Up Local AI\u{2026}");
+        assert!(item.enabled, "the desktop app can set up local AI");
+    }
+    // The AI entry sits right between Style Presets… and Generative AI…, with no separator.
+    assert_eq!(items[at[1] - 1].id, "ai.menu.styles");
+    assert_eq!(items[at[1] + 1].id, "edit.preferences.generativeAi");
+}
+
+/// With no Style Presets… entry in the list there is no AI menu to join: only the File entry
+/// and its separator are added.
+#[test]
+fn without_the_ai_menu_only_the_file_entry_is_added() {
+    let (app, _dir) = app(demo::Scale::Small);
+    let mut items = crate::menus::menu_items(&app);
+    items.retain(|i| i.id != OPEN && i.id != "ai.menu.styles");
+    insert_menu_items(&app, &mut items);
+    let entries: Vec<&crate::menus::MenuItem> = items.iter().filter(|i| i.id == OPEN).collect();
+    assert_eq!(entries.len(), 1, "just the File entry");
+    assert_eq!(entries[0].path, ["File"]);
 }
 
 #[test]
@@ -392,7 +426,10 @@ fn an_installed_setup_can_lose_a_model_or_everything_without_being_taken_for_a_n
     let c = ctx();
     open(&mut app);
     assert!(set_up(&app), "the record says it is installed");
-    assert_eq!(crate::menus::menu_items(&app).into_iter().find(|i| i.id == OPEN).unwrap().label, "Local AI Setup\u{2026}");
+    // Both the File and the AI entry (task 039) carry the installed label.
+    let menu = crate::menus::menu_items(&app);
+    let labels: Vec<&str> = menu.iter().filter(|i| i.id == OPEN).map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, ["Local AI Setup\u{2026}", "Local AI Setup\u{2026}"]);
     let summary = summary(&app);
     assert!(summary["text"].as_str().unwrap().contains("Installed: ComfyUI 0.43.0 \u{b7} 2 models"), "{summary}");
     assert_eq!((summary["installed"].as_bool(), summary["managed"].as_bool()), (Some(true), Some(true)));

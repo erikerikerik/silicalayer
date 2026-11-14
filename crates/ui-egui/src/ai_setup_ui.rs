@@ -490,26 +490,33 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
     Some(Ok(json!({"open": true, "page": app.ui.ai_setup.page.key()})))
 }
 
-/// File › Set Up Local AI…, in a group of its own above File Info. Not in the web build, which
-/// has no disk to install to.
+/// File › Set Up Local AI… (Local AI Setup… once set up), in a group of its own above File Info,
+/// and the same item again in the AI menu right after Style Presets… (task 039). One id may show
+/// in two menus: `edit.preferences.generativeAi` already does, and a click dispatches by id. Not
+/// in the web build, which has no disk to install to.
 pub fn insert_menu_items(app: &PhotocraftApp, items: &mut Vec<crate::menus::MenuItem>) {
     if cfg!(target_arch = "wasm32") || items.iter().any(|i| i.id == OPEN) {
         return;
     }
     let Some(at) = items.iter().position(|i| i.id == "file.fileInfo") else { return };
-    let path = vec!["File".to_string()];
     let label = if set_up(app) { "Local AI Setup…" } else { "Set Up Local AI…" };
-    let item = |id: &str, label: &str, enabled| crate::menus::MenuItem {
+    let item = |menu: &str, id: &str, label: &str, enabled| crate::menus::MenuItem {
         id: id.into(),
         label: label.into(),
-        path: path.clone(),
+        path: vec![menu.into()],
         shortcut: None,
         enabled,
         checked: None,
         color: None,
     };
-    items.insert(at, item("---", "---", false));
-    items.insert(at, item(OPEN, label, available(app)));
+    items.insert(at, item("File", "---", "---", false));
+    items.insert(at, item("File", OPEN, label, available(app)));
+    // AI ▸ the same item, between Style Presets… and Generative AI…, no separator. Its position
+    // is computed after the File insertion above, which shifts this one's index. Without an
+    // AI menu (no Style Presets… entry), nothing more is added.
+    if let Some(styles) = items.iter().position(|i| i.id == "ai.menu.styles") {
+        items.insert(styles + 1, item("AI", OPEN, label, available(app)));
+    }
 }
 
 /// What the Preferences page asks for: open the wizard (`open`), or on a screen that does one
