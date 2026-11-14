@@ -185,12 +185,80 @@ pub(super) fn sync_tooltips(app: &PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
+/// How long a new macOS system light/dark reading must hold before Appearance ▸ Auto follows it
+/// (seconds). macOS reports a transient dark reading while the screen locks or unlocks even in
+/// Light Mode, and the palette switched and switched back within a couple of frames.
+pub(super) const SYSTEM_THEME_SETTLE: f64 = 1.0;
+
+/// The system reading Appearance ▸ Auto may act on (rule 1 below), and, while a newer reading is
+/// still within its settle window, seconds until it matures (rule 3).
+///
+/// 1. The first reading ever, or the first after losing one (`accepted` == `None`), is acted on
+///    at once and becomes the accepted reading.
+/// 2. A reading matching the accepted one clears any pending one; the accepted reading stands.
+/// 3. A different reading is pending: it is accepted once `now - since >=` [`SYSTEM_THEME_SETTLE`]
+///    (it matured; it becomes the accepted reading), and until then the accepted reading stands
+///    and the returned wait is the remaining time.
+/// 4. A different reading with no pending one (or a pending one for some other reading) starts
+///    its settle window now: the accepted reading still stands, and the wait is the full window.
+///
+/// Pure so tests can drive the window without a running frame loop.
+pub(super) fn settle_system_theme(
+    accepted: &mut Option<Option<egui::Theme>>,
+    pending: &mut Option<(Option<egui::Theme>, f64)>,
+    reading: Option<egui::Theme>,
+    now: f64,
+) -> (Option<egui::Theme>, Option<f64>) {
+    // Rule 1: a fresh start (launch, or the app lost the system reading) acts at once.
+    let Some(current) = *accepted else {
+        *accepted = Some(reading);
+        *pending = None;
+        return (reading, None);
+    };
+    // Rule 2: the accepted reading is back (or still here): nothing is waiting.
+    if reading == current {
+        *pending = None;
+        return (current, None);
+    }
+    // Rules 3 and 4.
+    if let Some((waiting, since)) = *pending {
+        if waiting == reading {
+            if now - since >= SYSTEM_THEME_SETTLE {
+                *accepted = Some(reading);
+                *pending = None;
+                return (reading, None);
+            }
+            // Still inside the window: keep waiting, and keep the same pending start so the
+            // countdown does not restart every frame.
+            let left = (SYSTEM_THEME_SETTLE - (now - since)).clamp(0.0, SYSTEM_THEME_SETTLE);
+            return (current, Some(left));
+        }
+    }
+    // Rule 4: no pending reading, or a different one matured mid-window: it starts now.
+    *pending = Some((reading, now));
+    (current, Some(SYSTEM_THEME_SETTLE))
+}
+
 /// Resolve the saved appearance mode without changing it or either theme slot.
 pub(crate) fn sync_appearance(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // A restored or embedding-supplied pin must not suppress native appearance events.
     ctx.set_theme(egui::ThemePreference::System);
-    // The native service also covers Wayland sessions where winit has no system theme.
-    let selected = selected_theme(&app.session.prefs().interface, system_theme(app, ctx));
+    // The native service also covers Wayland sessions where winit has no system theme. In Auto
+    // the palette follows the *settled* reading: macOS reports a transient dark reading while
+    // the screen locks or unlocks even in Light Mode, and switching to it and back within a
+    // couple of frames looks like a glitch. Waiting keeps the accepted palette (the pre-lock
+    // look) on those frames; a reading that holds for the settle window is followed.
+    let now = ctx.input(|i| i.time);
+    // Read the system theme before borrowing the settle state: `system_theme` takes `&app`.
+    let reading = system_theme(app, ctx);
+    let (settled, wait) = settle_system_theme(&mut app.ui.system_theme_accepted, &mut app.ui.system_theme_pending, reading, now);
+    if let Some(wait) = wait {
+        // Re-check the moment the pending reading matures, off the paint path.
+        if let Some(duration) = std::time::Duration::try_from_secs_f64(wait).ok() {
+            ctx.request_repaint_after(duration);
+        }
+    }
+    let selected = selected_theme(&app.session.prefs().interface, settled);
     if app.ui.theme != selected {
         app.apply_theme(ctx, selected);
     }

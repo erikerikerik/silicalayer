@@ -184,6 +184,7 @@ fn preferences_settings_fill_the_dialog_down_to_the_buttons() {
     assert_eq!(super::settings_height(1400.0, 4.0, 30.0) - super::settings_height(600.0, 4.0, 30.0), 800.0);
     assert_eq!(super::settings_height(50.0, 4.0, 30.0), 160.0);
 }
+use super::appearance::{SYSTEM_THEME_SETTLE, settle_system_theme};
 use super::*;
 use std::sync::{Arc, Mutex};
 
@@ -308,8 +309,96 @@ fn ctrl_shift_f1_and_f2_darken_and_lighten_the_interface() {
     assert_eq!(app.ui.theme, ThemeKind::ProLightGray);
 }
 
+#[test]
+fn a_system_theme_reading_must_hold_for_the_settle_window_before_auto_follows_it() {
+    let dark = Some(egui::Theme::Dark);
+    let light = Some(egui::Theme::Light);
+
+    // Rule 1: the first reading is acted on at once, even a "no system theme" one.
+    let mut accepted = None;
+    let mut pending = None;
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, None, 0.0), (None, None));
+    assert_eq!(accepted, Some(None));
+    let mut accepted = None;
+    let mut pending = None;
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, dark, 0.0), (dark, None));
+    assert_eq!(accepted, Some(dark));
+    assert_eq!(pending, None);
+
+    // Rules 3 and 4: a different reading keeps the accepted palette until it has held for
+    // the full window; that lockscreen flicker must not repaint the interface twice.
+    let mut accepted = Some(dark);
+    let mut pending = None;
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, light, 0.0), (dark, Some(SYSTEM_THEME_SETTLE)));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, light, 0.9), (dark, Some(SYSTEM_THEME_SETTLE - 0.9)));
+    assert_eq!(pending.map(|(waiting, _)| waiting), Some(light));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, light, 1.0), (light, None));
+    assert_eq!(accepted, Some(light));
+    assert_eq!(pending, None);
+
+    // Rule 2: a reading flickers away and back within the window: the accepted palette
+    // never moved, and the pending change is gone.
+    let mut accepted = Some(dark);
+    let mut pending = Some((light, 2.0));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, dark, 2.5), (dark, None));
+    assert_eq!(pending, None);
+
+    // The OS dropping its reading (what macOS does while locking) is a change too, and an
+    // equally transient one: none of it reaches the palette.
+    let mut accepted = Some(dark);
+    let mut pending = None;
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, None, 0.0), (dark, Some(SYSTEM_THEME_SETTLE)));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, dark, 0.5), (dark, None));
+    assert_eq!(pending, None);
+
+    // Rule 4 again: a pending reading replaced by a third one restarts the window.
+    let mut accepted = Some(dark);
+    let mut pending = Some((light, 0.0));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, None, 0.5), (dark, Some(SYSTEM_THEME_SETTLE)));
+    assert_eq!(pending, Some((None, 0.5)));
+
+    // The countdown shrinks so the caller can repaint exactly when the reading matures.
+    let mut accepted = Some(dark);
+    let mut pending = None;
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, light, 0.0).1, Some(SYSTEM_THEME_SETTLE));
+    assert_eq!(settle_system_theme(&mut accepted, &mut pending, light, 0.4).1, Some(SYSTEM_THEME_SETTLE - 0.4));
+}
+
+#[test]
+fn auto_appearance_waits_out_the_settle_window_before_switching_palettes() {
+    let (mut app, _) = app_with_store();
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, Default::default());
+    app.run("prefs.set", json!({"values": {"interface.appearanceMode": "auto", "interface.darkTheme": "proMedium", "interface.lightTheme": "proLight"}}))
+        .unwrap();
+    // The first reading is accepted at once.
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Light), 0.0);
+    assert_eq!(app.ui.theme, ThemeKind::ProLight);
+    // A flash of dark (the lockscreen reading) must not repaint the interface...
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Dark), 0.5);
+    assert_eq!(app.ui.theme, ThemeKind::ProLight);
+    // ...and a flash back clears the pending change entirely.
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Light), 1.0);
+    assert_eq!(app.ui.theme, ThemeKind::ProLight);
+    assert_eq!(app.ui.system_theme_pending, None);
+    // A reading that holds for the window is followed at its end.
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Dark), 2.0);
+    assert_eq!(app.ui.theme, ThemeKind::ProLight);
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Dark), 2.5);
+    assert_eq!(app.ui.theme, ThemeKind::ProLight);
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Dark), 3.0);
+    assert_eq!(app.ui.theme, ThemeKind::ProMedium);
+}
+
 fn appearance_frame(app: &mut PhotocraftApp, ctx: &egui::Context, appearance: Option<egui::Theme>) {
-    ctx.run_ui(egui::RawInput { system_theme: appearance, ..Default::default() }, |ui| tick(app, ui.ctx())).textures_delta.clear();
+    let now = ctx.input(|i| i.time);
+    appearance_frame_at(app, ctx, appearance, now);
+}
+
+/// Like `appearance_frame`, but moves the input clock to `now` (seconds). Appearance ▸ Auto
+/// settles a new system reading against that clock, so a test follows a change by advancing it.
+fn appearance_frame_at(app: &mut PhotocraftApp, ctx: &egui::Context, appearance: Option<egui::Theme>, now: f64) {
+    ctx.run_ui(egui::RawInput { system_theme: appearance, time: Some(now), ..Default::default() }, |ui| tick(app, ui.ctx())).textures_delta.clear();
 }
 
 fn assert_palette(ctx: &egui::Context, kind: ThemeKind) {
@@ -340,8 +429,14 @@ fn auto_appearance_follows_live_changes_without_saving_resolved_palettes() {
         let saved = store.lock().unwrap().clone().unwrap();
         assert_eq!(stored(&store)["interface"]["appearanceMode"], "auto");
         let gpu_style = canvas_style(&app);
+        // A changed reading switches only after it has held for the settle window (macOS
+        // flashes a dark reading while the screen locks or unlocks), so each change gets a
+        // frame inside the window and a settling frame a full window later.
+        let mut time = ctx.input(|i| i.time);
         for (appearance, expected) in [(Some(egui::Theme::Light), light), (Some(egui::Theme::Dark), dark), (Some(egui::Theme::Light), light), (None, dark)] {
-            appearance_frame(&mut app, &ctx, appearance);
+            appearance_frame_at(&mut app, &ctx, appearance, time);
+            time += SYSTEM_THEME_SETTLE;
+            appearance_frame_at(&mut app, &ctx, appearance, time);
             assert_palette(&ctx, expected);
             assert_eq!(app.ui.theme, expected);
             assert_eq!(app.session.prefs().interface, interface);
@@ -408,7 +503,10 @@ fn auto_appearance_replaces_a_restored_egui_dark_pin() {
     appearance_frame(&mut app, &ctx, Some(egui::Theme::Light));
     assert_eq!(ctx.options(|o| o.theme_preference), egui::ThemePreference::System);
     assert_palette(&ctx, ThemeKind::ProLight);
+    // The new reading holds for the settle window before Auto follows it.
     appearance_frame(&mut app, &ctx, Some(egui::Theme::Dark));
+    assert_palette(&ctx, ThemeKind::ProLight);
+    appearance_frame_at(&mut app, &ctx, Some(egui::Theme::Dark), SYSTEM_THEME_SETTLE);
     assert_palette(&ctx, ThemeKind::ProMedium);
     assert_eq!(app.session.prefs().interface.appearance_mode, AppearanceMode::Auto);
 }

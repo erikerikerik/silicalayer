@@ -458,6 +458,14 @@ pub struct UiState {
     pub dialogs: Vec<Dialog>,
     pub windows: Vec<DocWindow>,
     pub theme: crate::theme::ThemeKind,
+    /// The system light/dark reading Appearance ▸ Auto currently acts on, or `None` at startup
+    /// before the first reading. Runtime only; see `settle_system_theme`.
+    #[serde(skip)]
+    pub system_theme_accepted: Option<Option<egui::Theme>>,
+    /// A newer system reading that has not yet held for `SYSTEM_THEME_SETTLE` seconds
+    /// (the reading and the instant it arrived), and `None` while nothing is waiting.
+    #[serde(skip)]
+    pub system_theme_pending: Option<(Option<egui::Theme>, f64)>,
     pub workspace: String,
     pub palette_open: bool,
     pub dock_tabs: DockTabs,
@@ -646,6 +654,8 @@ impl Default for UiState {
             dialogs: Vec::new(),
             windows: Vec::new(),
             theme: crate::theme::ThemeKind::ProMedium,
+            system_theme_accepted: None,
+            system_theme_pending: None,
             workspace: "Essentials".into(),
             palette_open: false,
             dock_tabs: DockTabs::default(),
